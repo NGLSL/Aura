@@ -20,6 +20,7 @@
 | 术语 | 含义 |
 |------|------|
 | **Environment Block** | CreateProcess 传入的独立 Unicode 环境块；优先于 Hook 注入环境变量 |
+| **ENVBOX_INHERIT_CHILDREN** | Environment Block 内部标志（`1`/`0`）：子进程是否继承 Profile；对应 Application.inherit_children |
 | **Environment View** | 目标进程树读到的 Profile 环境（Locale/Region/Timezone/DNS/Env 等） |
 | **Virtual timezone, real timeline** | 只虚拟化时区与本地时间换算；UTC/FILETIME/Unix timestamp/Performance Counter/Tick Count 保持真实 |
 | **DNS View** | 虚拟化程序读取到的 DNS 配置（GetNetworkParams / GetAdaptersAddresses）；非透明 DNS 劫持。DnsMode：`Host` / `VirtualView` |

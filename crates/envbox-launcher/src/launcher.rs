@@ -36,6 +36,8 @@ pub struct LaunchRequest {
     pub working_directory: Option<PathBuf>,
     pub profile: EnvironmentProfile,
     pub instance_id: Uuid,
+    /// Child processes inherit the Environment Profile (Application.inherit_children).
+    pub inherit_children: bool,
 }
 
 pub struct LaunchedProcess {
@@ -165,6 +167,7 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
         Some(&req.profile),
         req.instance_id,
         req.profile.id,
+        req.inherit_children,
     );
 
     // PATH search uses the merged environment (Profile PATH overrides Host).

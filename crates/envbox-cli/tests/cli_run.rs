@@ -444,3 +444,186 @@ fn field_after(text: &str, key: &str) -> String {
         .trim()
         .to_string()
 }
+
+/// Ticket 06: probe --spawn-child parent/child share Profile view and instance id.
+#[test]
+fn run_probe_spawn_child_inherits_profile() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .arg("--spawn-child")
+        .output()
+        .expect("run probe --spawn-child");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let parent_at = stdout.find("=== PARENT PROBE ===").expect("parent block");
+    let child_at = stdout.find("=== CHILD PROBE ===").expect("child block");
+    assert!(parent_at < child_at);
+    let parent = &stdout[parent_at..child_at];
+    let child = &stdout[child_at..];
+
+    assert!(
+        stdout.matches("EnvBox Runtime Loaded").count() >= 2,
+        "parent+child runtime markers expected:\n{stdout}"
+    );
+
+    let p_inst = field_after(parent, "ENVBOX_INSTANCE_ID:");
+    let c_inst = field_after(child, "ENVBOX_INSTANCE_ID:");
+    assert_eq!(p_inst, c_inst, "instance id must be shared across the tree");
+    assert!(!p_inst.is_empty());
+    let p_prof = field_after(parent, "ENVBOX_PROFILE_ID:");
+    let c_prof = field_after(child, "ENVBOX_PROFILE_ID:");
+    assert_eq!(p_prof, c_prof);
+
+    for key in [
+        "GetUserDefaultGeoName:",
+        "GetUserDefaultLocaleName:",
+        "GetUserDefaultUILanguage:",
+        "GetDynamicTimeZoneInformation:",
+    ] {
+        assert_eq!(
+            field_after(parent, key),
+            field_after(child, key),
+            "parent/child mismatch for {key}"
+        );
+    }
+    assert_eq!(field_after(child, "GetUserDefaultGeoName:"), "US");
+    assert_eq!(field_after(child, "GetUserDefaultLocaleName:"), "en-US");
+    assert_eq!(
+        field_after(child, "GetDynamicTimeZoneInformation:"),
+        "Pacific Standard Time"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 06 matrix: cmd as intermediate still yields the same Profile view.
+#[test]
+fn run_cmd_to_probe_child_sees_profile() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id, "cmd", "/c"])
+        .arg(&probe)
+        .output()
+        .expect("run cmd /c probe");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("EnvBox Runtime Loaded"),
+        "grandchild not injected:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "GetUserDefaultGeoName:"),
+        "US",
+        "cmd child lost Profile:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "GetDynamicTimeZoneInformation:"),
+        "Pacific Standard Time",
+        "cmd child lost timezone view:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 06: inherit_children=false — child runs unvirtualized (Host values).
+#[test]
+fn run_no_inherit_children_leaves_child_unhooked() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args([
+            "run",
+            "--profile",
+            &profile_id,
+            "--no-inherit-children",
+        ])
+        .arg(&probe)
+        .arg("--spawn-child")
+        .output()
+        .expect("run no-inherit");
+    assert!(run.status.success(), "{run:?}");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let parent_at = stdout.find("=== PARENT PROBE ===").unwrap();
+    let child_at = stdout.find("=== CHILD PROBE ===").unwrap();
+    let parent = &stdout[parent_at..child_at];
+    let child = &stdout[child_at..];
+    // Parent is still virtualized (root injection).
+    assert_eq!(field_after(parent, "GetUserDefaultGeoName:"), "US");
+    // Child is not injected and not virtualized (Host values).
+    assert!(
+        !child.contains("EnvBox Runtime Loaded"),
+        "child should not be injected when inherit is off:\n{child}"
+    );
+    assert_ne!(
+        field_after(child, "GetUserDefaultGeoName:"),
+        "US",
+        "child should keep Host geo when inherit is off:\n{child}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 06 matrix (subset): powershell is used when present to prove
+/// CreateProcess family inheritance beyond probe/cmd. node/git/python covered
+/// in ticket 12 acceptance matrix.
+#[test]
+fn run_powershell_child_sees_profile_when_available() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let ps = ["powershell.exe", "pwsh.exe"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+        .or_else(|| {
+            std::env::var_os("SystemRoot").map(|root| {
+                std::path::PathBuf::from(root)
+                    .join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe")
+            })
+        });
+    let Some(ps) = ps.filter(|p| p.is_file()) else {
+        eprintln!("skip: powershell not present");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    // powershell -NoProfile -Command <probe>
+    let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&ps)
+        .args(["-NoProfile", "-Command"])
+        .arg(&probe)
+        .output()
+        .expect("run powershell probe");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("EnvBox Runtime Loaded"),
+        "powershell child not injected:\n{stdout}"
+    );
+    assert_eq!(field_after(&stdout, "GetUserDefaultGeoName:"), "US");
+    let _ = std::fs::remove_dir_all(&root);
+}

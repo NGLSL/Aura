@@ -6,11 +6,13 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Clone host environment, apply Profile overrides (case-insensitive keys), then EnvBox IDs.
+/// `inherit_children` controls child process Profile propagation (Application flag).
 pub fn build_environment_block(
     host: &HashMap<String, String>,
     profile: Option<&EnvironmentProfile>,
     instance_id: Uuid,
     profile_id: Uuid,
+    inherit_children: bool,
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = host.clone();
     if let Some(profile) = profile {
@@ -22,9 +24,17 @@ pub fn build_environment_block(
         }
     }
     let lower = |k: &str| k.to_ascii_lowercase();
-    env.retain(|k, _| lower(k) != "envbox_instance_id" && lower(k) != "envbox_profile_id");
+    env.retain(|k, _| {
+        lower(k) != "envbox_instance_id"
+            && lower(k) != "envbox_profile_id"
+            && lower(k) != "envbox_inherit_children"
+    });
     env.insert("ENVBOX_INSTANCE_ID".into(), instance_id.to_string());
     env.insert("ENVBOX_PROFILE_ID".into(), profile_id.to_string());
+    env.insert(
+        "ENVBOX_INHERIT_CHILDREN".into(),
+        if inherit_children { "1" } else { "0" }.into(),
+    );
     env
 }
 
@@ -79,17 +89,31 @@ mod tests {
             ("LANG".into(), "zh_CN.UTF-8".into()),
             ("PATH".into(), r"C:\Windows".into()),
         ]);
-        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil());
+        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true);
         assert_eq!(merged.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
         assert_eq!(merged.get("PATH").map(String::as_str), Some(r"C:\Windows"));
         assert!(merged.contains_key("ENVBOX_INSTANCE_ID"));
         assert!(merged.contains_key("ENVBOX_PROFILE_ID"));
+        assert_eq!(
+            merged.get("ENVBOX_INHERIT_CHILDREN").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn inherit_children_flag_written() {
+        let host = HashMap::new();
+        let merged = build_environment_block(&host, None, Uuid::nil(), Uuid::nil(), false);
+        assert_eq!(
+            merged.get("ENVBOX_INHERIT_CHILDREN").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]
     fn profile_override_is_case_insensitive() {
         let host = HashMap::from([("lang".into(), "zh_CN.UTF-8".into())]);
-        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil());
+        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true);
         // Exactly one LANG-ish key, value from profile.
         let langs: Vec<_> = merged
             .iter()

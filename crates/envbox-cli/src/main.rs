@@ -42,13 +42,14 @@ fn usage() -> ExitCode {
     eprintln!("  envbox app list");
     eprintln!("  envbox app add --name N (--command C | --executable P) --profile ID \\");
     eprintln!("     [--working-directory D] [--arg A]... [--inherit-children]");
-    eprintln!("  envbox run --profile <id> [--working-directory D] [--] <command> [args...]");
+    eprintln!("  envbox run --profile <id> [--working-directory D] [--no-inherit-children] [--] <command> [args...]");
     ExitCode::FAILURE
 }
 
 fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
     let mut profile_raw = String::new();
     let mut working_directory: Option<PathBuf> = None;
+    let mut no_inherit = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -60,6 +61,8 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         match key {
             "--profile" => profile_raw = take(&mut i).unwrap_or_default(),
             "--working-directory" => working_directory = take(&mut i).map(PathBuf::from),
+            "--no-inherit-children" => no_inherit = true,
+            "--inherit-children" => no_inherit = false,
             "--" => {
                 rest.extend_from_slice(&args[i + 1..]);
                 break;
@@ -115,6 +118,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         working_directory,
         profile: profile.clone(),
         instance_id: Uuid::new_v4(),
+        inherit_children: !no_inherit,
     };
 
     match envbox_launcher::launch(request) {

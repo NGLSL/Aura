@@ -17,6 +17,7 @@ struct RuntimeProfile {
   int has_ui;
   int has_region;
   int has_tz;
+  int inherit_children;
 };
 
 // Process-wide immutable profile after successful init. Never mutated later.
@@ -30,3 +31,6 @@ int EnvBoxLoadProfile();
 // Returns 1 and fills *out on success.
 int EnvBoxLookupTimeZone(const wchar_t* windows_id,
                          DYNAMIC_TIME_ZONE_INFORMATION* out);
+
+// Absolute path of this Runtime DLL (for child injection).
+const char* EnvBoxRuntimeDllPathA();

@@ -5,9 +5,14 @@
 
 static RuntimeProfile g_profile = {};
 static int g_loaded = 0;
+static char g_dll_path_a[MAX_PATH] = {};
 
 const RuntimeProfile* EnvBoxProfile() {
   return g_loaded ? &g_profile : nullptr;
+}
+
+const char* EnvBoxRuntimeDllPathA() {
+  return g_dll_path_a[0] ? g_dll_path_a : nullptr;
 }
 
 static int ReadEnvW(const wchar_t* name, wchar_t* buf, DWORD cap) {
@@ -94,14 +99,19 @@ static int FindProfileBlock(const char* data, size_t len, const char* profile_id
 }
 
 // Load from profiles.toml. Returns 1 only when the profile block is found and
-// at least one virtualized field is populated. Missing store or missing profile
-// is fatal when ENVBOX_CONFIG_ROOT is set (Startup Fail Policy).
+// all four virtualized fields are populated. Missing store or missing profile
+// is fatal (Startup Fail Policy) - never silent unvirtualized launch.
 static int LoadFromProfilesToml(const char* profile_id_utf8) {
   char root[MAX_PATH];
   DWORD n = GetEnvironmentVariableA("ENVBOX_CONFIG_ROOT", root, (DWORD)sizeof(root));
   if (n == 0 || n >= sizeof(root)) {
-    // No store path in env: Environment Block IDs only (legacy smoke path).
-    return 1;
+    // Match ConfigStore::default_root(): %LOCALAPPDATA%\EnvBox
+    char appdata[MAX_PATH] = {};
+    if (GetEnvironmentVariableA("LOCALAPPDATA", appdata, (DWORD)sizeof(appdata)) == 0) {
+      OutputDebugStringA("EnvBox: no ENVBOX_CONFIG_ROOT or LOCALAPPDATA\n");
+      return 0;
+    }
+    _snprintf_s(root, sizeof(root), _TRUNCATE, "%s\\EnvBox", appdata);
   }
 
   char path[MAX_PATH + 32];
@@ -202,6 +212,27 @@ int EnvBoxLoadProfile() {
     return 0;
   }
   ReadEnvW(L"ENVBOX_INSTANCE_ID", g_profile.instance_id, 64);
+
+  // Child process inheritance default: on (Application may disable).
+  wchar_t inherit[8] = {};
+  if (ReadEnvW(L"ENVBOX_INHERIT_CHILDREN", inherit, 8) &&
+      (inherit[0] == L'0' || inherit[0] == L'f' || inherit[0] == L'F')) {
+    g_profile.inherit_children = 0;
+  } else {
+    g_profile.inherit_children = 1;
+  }
+
+  // Remember this module's path for DetourUpdateProcessWithDll on children.
+  HMODULE self = nullptr;
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(&EnvBoxLoadProfile), &self)) {
+    wchar_t wpath[MAX_PATH] = {};
+    if (GetModuleFileNameW(self, wpath, MAX_PATH) > 0) {
+      WideCharToMultiByte(CP_ACP, 0, wpath, -1, g_dll_path_a, MAX_PATH,
+                          nullptr, nullptr);
+    }
+  }
 
   char id_utf8[64] = {};
   WideCharToMultiByte(CP_UTF8, 0, g_profile.profile_id, -1, id_utf8,

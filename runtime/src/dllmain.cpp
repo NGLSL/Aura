@@ -20,6 +20,7 @@ static int InstallAllHooks() {
   ok += EnvBoxInstallGeoHooks();
   ok += EnvBoxInstallLocaleHooks();
   ok += EnvBoxInstallLanguageHooks();
+  ok += EnvBoxInstallProcessHooks();
 
   LONG err = DetourTransactionCommit();
   if (err != NO_ERROR) {
@@ -28,7 +29,7 @@ static int InstallAllHooks() {
   }
   char msg[128];
   _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-              "EnvBox Runtime hooks installed=%d/4 (Fail Open per API)\n", ok);
+              "EnvBox Runtime hooks installed=%d/5 (Fail Open per API)\n", ok);
   OutputDebugStringA(msg);
   return 1;
 }
