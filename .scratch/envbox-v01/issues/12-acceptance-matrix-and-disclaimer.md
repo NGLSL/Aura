@@ -47,3 +47,9 @@ Parent: .scratch/envbox-v01/spec.md
 - SSH keys 未枚举断言（用户目录可访问已覆盖）
 - `caller_requested_suspended` 自动化仍后置
 - x86 Runtime 预留
+
+### 2026-09-24 post-review hard/wrong (general-14/15 on 09e98ee..583f16d)
+
+- Hard: `SpawnInjected` 的 `DetourCreateProcessWithDllExW` 失败路径补保存 `GetLastError` + 关闭可能残留的 PI 句柄（AGENTS.md Handle/错误契约）。
+- Wrong/partial 记入 residuals：acceptance 未跑 probe `--spawn-child`（cli_run 已覆盖）；Host vs US 非虚拟化字段仅可选 `SystemTimeAsFileTime`；DNS 未做 VirtualView contrast；my-claude 路径写死本机；矩阵未单列 notepad/node-agent 的 Host-unchanged 行。
+- Wrong: 单段合法 IANA（EST/MST/CET/HST）已放行（见 ticket 11）。

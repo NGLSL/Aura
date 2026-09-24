@@ -149,8 +149,15 @@ impl InstanceManager {
         let Some(handle) = self.instances.get(&id) else {
             return Err(InstanceError::NotFound(id));
         };
-        Ok(handle.child.job_stats()?.active_processes)
+        Ok(children_from_active_processes(
+            handle.child.job_stats()?.active_processes,
+        ))
     }
+}
+
+/// Job `active_processes` includes Root Process; story 19 reports children only.
+fn children_from_active_processes(active: u32) -> u32 {
+    active.saturating_sub(1)
 }
 
 /// Build LaunchRequest. Host → `profile: None` (no injection). Profile → `Some`.
@@ -283,6 +290,13 @@ mod tests {
             status_from_stats(&live, InstanceStatus::Stopping),
             InstanceStatus::Stopping
         );
+    }
+
+    #[test]
+    fn children_exclude_root_process() {
+        assert_eq!(children_from_active_processes(0), 0);
+        assert_eq!(children_from_active_processes(1), 0);
+        assert_eq!(children_from_active_processes(3), 2);
     }
 
     #[test]

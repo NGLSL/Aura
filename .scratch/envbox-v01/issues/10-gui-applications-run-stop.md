@@ -33,3 +33,7 @@ Parent: .scratch/envbox-v01/spec.md
 **Accepted V0.1 residuals（非 hard/wrong）**
 - Starting/Stopping 为状态机中间态；GUI 同步 run/stop，列表靠手动 Refresh 刷新（ticket 允许看到状态与子进程数；无自动轮询）。
 - `AppRunWith(Uuid)` 仍用 `nil` 表示 Host 菜单项（内部已映射 `RunTarget::Host`，不伪造 Profile）。
+
+### 2026-09-24 post-review hard/wrong (general-14/15 on 09e98ee..583f16d)
+
+- Wrong: `child_count` 曾把 Job `active_processes`（含 Root）标成 children → 改为 `children_from_active_processes`（`saturating_sub(1)`），仅 Root 时为 0。

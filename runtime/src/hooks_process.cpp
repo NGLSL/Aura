@@ -161,6 +161,19 @@ static BOOL SpawnInjected(
           lpThreadAttributes, bInheritHandles, flags, env_ptr,
           lpCurrentDirectory, lpStartupInfo, lpProcessInformation, dll,
           reinterpret_cast<PDETOUR_CREATE_PROCESS_ROUTINEW>(TrueCreateProcessW))) {
+    DWORD err = GetLastError();
+    if (lpProcessInformation != nullptr) {
+      if (lpProcessInformation->hThread != nullptr) {
+        CloseHandle(lpProcessInformation->hThread);
+        lpProcessInformation->hThread = nullptr;
+      }
+      if (lpProcessInformation->hProcess != nullptr) {
+        CloseHandle(lpProcessInformation->hProcess);
+        lpProcessInformation->hProcess = nullptr;
+      }
+      lpProcessInformation->dwProcessId = 0;
+    }
+    SetLastError(err);
     return FALSE;
   }
 

@@ -122,22 +122,20 @@ impl TimezoneProfile {
     }
 }
 
-/// IANA tz name: UTC/GMT or Area/Location (no Windows IDs like "Pacific Standard Time").
+/// IANA tz name: `/`-separated segments of [A-Za-z0-9_+-]
+/// (UTC/GMT, single-token zones like EST/CET/HST, Area/Location, Etc/GMT+1).
+/// Rejects Windows IDs like "Pacific Standard Time".
 fn looks_like_iana_id(id: &str) -> bool {
     let id = id.trim();
     if id.is_empty() || id.contains('\0') || id.contains('\\') || id.contains(' ') {
         return false;
     }
-    if id.eq_ignore_ascii_case("UTC") || id.eq_ignore_ascii_case("GMT") {
-        return true;
-    }
-    id.contains('/')
-        && id.split('/').all(|part| {
-            !part.is_empty()
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')
-        })
+    id.split('/').all(|part| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +305,15 @@ mod tests {
         let mut p = valid_profile();
         p.timezone.iana_id = "UTC".into();
         assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn single_token_iana_accepted() {
+        for name in ["EST", "MST", "CET", "HST", "GMT", "Etc/GMT+1"] {
+            let mut p = valid_profile();
+            p.timezone.iana_id = name.into();
+            assert!(p.validate().is_ok(), "must accept IANA {name:?}");
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ Parent: .scratch/envbox-v01/spec.md
 
 **Status:** resolved
 
-- [x] Profile 编辑：Region、Locale、UI Language、Timezone（Windows 枚举下拉）、DNS Host/Custom View、Environment Variables
+- [x] Profile 编辑：Region、Locale、UI Language、Timezone（Windows 枚举下拉）、DNS Host/VirtualView、Environment Variables
 - [x] 保存前校验，不合法不得写入
 - [x] Run With 菜单列出 Profile 与 Host；临时 Profile 不覆盖 Application.default_profile_id
 - [x] 与 CLI 使用同一 storage/launcher 契约
@@ -31,3 +31,8 @@ Parent: .scratch/envbox-v01/spec.md
 **Accepted V0.1 residuals**
 - `windows_id_to_iana` 为小型静态表（`Option`，无 fallback）；未映射区需手填 IANA。
 - Run With 菜单 `NamedId.id=Uuid::nil()` 仅作 UI 哨兵，领域上对应 `RunTarget::Host`。
+
+### 2026-09-24 post-review hard/wrong (general-14/15 on 09e98ee..583f16d)
+
+- Hard: checklist 术语 `Custom View` → `VirtualView`（CONTEXT.md）。
+- Wrong: `looks_like_iana_id` 放行单段合法 IANA（EST/MST/CET/HST/GMT 等）。
