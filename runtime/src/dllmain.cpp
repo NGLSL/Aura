@@ -21,6 +21,7 @@ static int InstallAllHooks() {
   ok += EnvBoxInstallLocaleHooks();
   ok += EnvBoxInstallLanguageHooks();
   ok += EnvBoxInstallDnsHooks();
+  ok += EnvBoxInstallRegistryHooks();
   ok += EnvBoxInstallProcessHooks();
 
   LONG err = DetourTransactionCommit();

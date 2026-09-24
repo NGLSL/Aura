@@ -32,6 +32,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/hooks_locale.cpp
   src/hooks_language.cpp
   src/hooks_dns.cpp
+  src/hooks_registry.cpp
   src/hooks_process.cpp
 )
 target_compile_features(${ENVBOX_RT_TARGET} PRIVATE cxx_std_17)

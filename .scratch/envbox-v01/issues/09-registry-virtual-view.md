@@ -6,10 +6,17 @@ Parent: .scratch/envbox-v01/spec.md
 
 **Blocked by:** 07 Locale / Language / 时区换算补全
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Hook `RegOpenKeyExW` / `RegQueryValueExW` / `RegGetValueW` 仅白名单命中
-- [ ] 白名单至少覆盖 `HKCU\Control Panel\International` 与 `HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation`，以及 Probe 证实的必要相关路径
-- [ ] 白名单外请求与 Windows 行为一致
-- [ ] Probe 能对比 Host/Profile 的相关注册表读值
-- [ ] 不扩大为完整 Registry virtualization
+- [x] Hook `RegOpenKeyExW` / `RegQueryValueExW` / `RegGetValueW` 仅白名单命中
+- [x] 白名单至少覆盖 `HKCU\Control Panel\International` 与 `HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation`，以及 Probe 证实的必要相关路径
+- [x] 白名单外请求与 Windows 行为一致
+- [x] Probe 能对比 Host/Profile 的相关注册表读值
+- [x] 不扩大为完整 Registry virtualization
+
+## Comments
+
+- Ticket 09 delivered. `hooks_registry.cpp` virtualizes **read** of known values under a whitelist only. Built-in: `HKCU\Control Panel\International` + `HKLM\...\TimeZoneInformation`; Profile `registry.whitelist_paths` are extras. Values: `LocaleName`/`Locale`, `TimeZoneKeyName`/`StandardName`/`DaylightName`/`Bias`/`StandardBias`/`DaylightBias`. Unknown values and all writes pass through. Not a Registry Sandbox.
+- Review fixes (hard/wrong): track **every** successful open (nested `RegOpenKeyExW` resolves); `CRITICAL_SECTION` around the HKEY map; size-query (`lpData==NULL`) returns `ERROR_SUCCESS` + size; `RegGetValueW` honors type mask + `RRF_ZEROONFAILURE`; whitelist path count off-by-one fixed; Host-contrast assert is conditional (en-US host safe).
+- Evidence: `cargo test --workspace` 61 passed — `run_probe_registry_virtual_view_shows_profile_values` (LocaleName/Locale/TimeZoneKeyName + nested open + non-whitelist pass-through), `run_probe_registry_outside_whitelist_matches_host`.
+- Deferred: Profile extra `whitelist_paths` have storage parse but no dedicated probe path (defaults cover acceptance). `RegOpenKeyExA` / `RegQueryValueA` not hooked (W-only V0.1).

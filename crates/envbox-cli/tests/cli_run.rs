@@ -310,7 +310,7 @@ fn run_leaves_host_probe_snapshot_unchanged() {
     let b = String::from_utf8_lossy(&before.stdout);
     let a = String::from_utf8_lossy(&after.stdout);
     // Host sections must match; Runtime Loaded line is process-local and may differ.
-    for section in ["=== GEO ===", "=== LOCALE ===", "=== LANGUAGE ===", "=== TIMEZONE ===", "=== DNS ==="] {
+    for section in ["=== GEO ===", "=== LOCALE ===", "=== LANGUAGE ===", "=== TIMEZONE ===", "=== DNS ===", "=== REGISTRY ==="] {
         let slice = |s: &str| {
             let start = s.find(section).unwrap_or(0);
             let rest = &s[start..];
@@ -817,6 +817,93 @@ fn run_probe_dns_host_mode_matches_host() {
         field_after(&host_out, "GetAdaptersAddresses:"),
         field_after(&run_out, "GetAdaptersAddresses:"),
         "Host DNS mode must not change GetAdaptersAddresses"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 09: Registry Virtual View shows Profile values on whitelist keys.
+#[test]
+fn run_probe_registry_virtual_view_shows_profile_values() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root); // en-US / Pacific Standard Time
+
+    let host = Command::new(&probe).output().expect("host probe");
+    assert!(host.status.success());
+    let host_out = String::from_utf8_lossy(&host.stdout).into_owned();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(run.status.success(), "{run:?}");
+    let run_out = String::from_utf8_lossy(&run.stdout);
+
+    assert_eq!(
+        field_after(&run_out, "HKCU_International_LocaleName:"),
+        "en-US"
+    );
+    assert_eq!(
+        field_after(&run_out, "HKCU_International_Locale:"),
+        "00000409"
+    );
+    assert_eq!(
+        field_after(&run_out, "HKLM_TimeZone_TimeZoneKeyName:"),
+        "Pacific Standard Time"
+    );
+    // Nested RegOpenKeyExW walk must also virtualize (not only one-shot RegGetValueW).
+    assert_eq!(
+        field_after(&run_out, "Nested_International_LocaleName:"),
+        "en-US"
+    );
+    // Profile value is the authority; Host may already be en-US on some machines.
+    let host_loc = field_after(&host_out, "HKCU_International_LocaleName:");
+    if host_loc != "en-US" {
+        assert_ne!(
+            host_loc,
+            field_after(&run_out, "HKCU_International_LocaleName:"),
+            "expected Host vs Profile registry contrast"
+        );
+    }
+    // Non-whitelist stays Host.
+    assert_eq!(
+        field_after(&host_out, "HKLM_WindowsNT_CurrentVersion:"),
+        field_after(&run_out, "HKLM_WindowsNT_CurrentVersion:"),
+        "non-whitelist registry must pass through"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 09: non-whitelist registry reads stay on Host (not a Registry Sandbox).
+#[test]
+fn run_probe_registry_outside_whitelist_matches_host() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    let host = Command::new(&probe).output().expect("host probe");
+    assert!(host.status.success());
+    let host_out = String::from_utf8_lossy(&host.stdout).into_owned();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(run.status.success(), "{run:?}");
+    let run_out = String::from_utf8_lossy(&run.stdout);
+
+    assert_eq!(
+        field_after(&host_out, "HKLM_WindowsNT_CurrentVersion:"),
+        field_after(&run_out, "HKLM_WindowsNT_CurrentVersion:"),
+        "non-whitelist registry must match Host"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

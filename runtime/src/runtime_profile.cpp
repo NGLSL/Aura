@@ -268,6 +268,30 @@ static int LoadFromProfilesToml(const char* profile_id_utf8) {
     }
   }
 
+  // Registry Virtual View (ticket 09): optional extra whitelist_paths.
+  {
+    size_t rs = 0, re_ = 0;
+    if (FindTomlTable(block, blen, "[profiles.registry]", &rs, &re_)) {
+      const char* rblock = block + rs;
+      size_t rlen = re_ - rs;
+      char paths[ENVBOX_REG_MAX][64];
+      int n = ExtractTomlStringArray(rblock, rlen, "whitelist_paths", paths,
+                                     ENVBOX_REG_MAX, 64);
+      if (n < 0) {
+        OutputDebugStringA("EnvBox: registry whitelist overflow\n");
+        n = 0;
+      }
+      for (int i = 0; i < n; i++) {
+        if (g_profile.registry_path_count >= ENVBOX_REG_MAX) {
+          break;
+        }
+        Utf8ToWide(paths[i],
+                   g_profile.registry_paths[g_profile.registry_path_count], 128);
+        g_profile.registry_path_count++;
+      }
+    }
+  }
+
   if (!g_profile.has_locale || !g_profile.has_ui || !g_profile.has_region ||
       !g_profile.has_tz) {
     OutputDebugStringA("EnvBox: profile block incomplete (need locale/ui/region/tz)\n");

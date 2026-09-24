@@ -8,6 +8,9 @@
 #ifndef ENVBOX_DNS_MAX
 #define ENVBOX_DNS_MAX 8
 #endif
+#ifndef ENVBOX_REG_MAX
+#define ENVBOX_REG_MAX 16
+#endif
 
 struct RuntimeProfile {
   wchar_t locale_name[85];
@@ -26,6 +29,9 @@ struct RuntimeProfile {
   int dns_mode;
   int dns_server_count;
   char dns_servers[ENVBOX_DNS_MAX][64];
+  // Registry Virtual View (ticket 09): extra whitelist_paths from Profile.
+  int registry_path_count;
+  wchar_t registry_paths[ENVBOX_REG_MAX][128];
 };
 
 // Process-wide immutable profile after successful init. Never mutated later.

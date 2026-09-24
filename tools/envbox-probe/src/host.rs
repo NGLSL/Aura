@@ -3,7 +3,7 @@
 
 use crate::{
     Field, HostSnapshot, Section, SECTION_DNS, SECTION_ENV, SECTION_GEO, SECTION_LANGUAGE,
-    SECTION_LOCALE, SECTION_TIMEZONE,
+    SECTION_LOCALE, SECTION_REGISTRY, SECTION_TIMEZONE,
 };
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -37,6 +37,7 @@ pub fn collect() -> HostSnapshot {
             collect_language(),
             collect_timezone(),
             collect_dns(),
+            collect_registry(),
             collect_env(),
         ],
     }
@@ -432,6 +433,136 @@ unsafe fn push_ip_string(
     let s = s.trim().to_string();
     if !s.is_empty() {
         out.push(s);
+    }
+}
+
+fn collect_registry() -> Section {
+    let mut fields = Vec::new();
+    push_reg_sz(
+        &mut fields,
+        "HKCU_International_LocaleName",
+        windows::Win32::System::Registry::HKEY_CURRENT_USER,
+        "Control Panel\\International",
+        "LocaleName",
+    );
+    push_reg_sz(
+        &mut fields,
+        "HKCU_International_Locale",
+        windows::Win32::System::Registry::HKEY_CURRENT_USER,
+        "Control Panel\\International",
+        "Locale",
+    );
+    push_reg_sz(
+        &mut fields,
+        "HKLM_TimeZone_TimeZoneKeyName",
+        windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation",
+        "TimeZoneKeyName",
+    );
+    push_reg_sz(
+        &mut fields,
+        "HKLM_TimeZone_StandardName",
+        windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation",
+        "StandardName",
+    );
+    // Nested open: HKCU\\Control Panel then International\\LocaleName via handle.
+    push_reg_nested(&mut fields, "Nested_International_LocaleName");
+    // Non-whitelist key must stay Host (not a Registry Sandbox).
+    push_reg_sz(
+        &mut fields,
+        "HKLM_WindowsNT_CurrentVersion",
+        windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+        "CurrentVersion",
+    );
+    Section {
+        title: SECTION_REGISTRY.to_string(),
+        fields,
+    }
+}
+
+fn push_reg_nested(fields: &mut Vec<Field>, name: &str) {
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER, KEY_READ,
+    };
+    let mut mid = windows::Win32::System::Registry::HKEY::default();
+    let mut leaf = windows::Win32::System::Registry::HKEY::default();
+    let sub1: Vec<u16> = "Control Panel\0".encode_utf16().collect();
+    let sub2: Vec<u16> = "International\0".encode_utf16().collect();
+    let val: Vec<u16> = "LocaleName\0".encode_utf16().collect();
+    let mut buf = [0u16; 128];
+    let mut size = (buf.len() * 2) as u32;
+    unsafe {
+        let s1 = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(sub1.as_ptr()),
+            0,
+            KEY_READ,
+            &mut mid,
+        );
+        if s1.0 != 0 {
+            fields.push(field(name, "<error-open1>"));
+            return;
+        }
+        let s2 = RegOpenKeyExW(
+            mid,
+            windows::core::PCWSTR(sub2.as_ptr()),
+            0,
+            KEY_READ,
+            &mut leaf,
+        );
+        if s2.0 != 0 {
+            let _ = RegCloseKey(mid);
+            fields.push(field(name, "<error-open2>"));
+            return;
+        }
+        let sq = RegQueryValueExW(
+            leaf,
+            windows::core::PCWSTR(val.as_ptr()),
+            None,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        );
+        let _ = RegCloseKey(leaf);
+        let _ = RegCloseKey(mid);
+        if sq.0 == 0 {
+            fields.push(field(name, wstr_from_until_nul(&buf)));
+        } else {
+            fields.push(field(name, "<error-query>"));
+        }
+    }
+}
+
+fn push_reg_sz(
+    fields: &mut Vec<Field>,
+    name: &str,
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+    value: &str,
+) {
+    use windows::Win32::System::Registry::{RegGetValueW, REG_VALUE_TYPE, RRF_RT_REG_SZ};
+    let sub: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let val: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = [0u16; 256];
+    let mut size = (buf.len() * 2) as u32;
+    let mut ty = REG_VALUE_TYPE(0);
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            windows::core::PCWSTR(sub.as_ptr()),
+            windows::core::PCWSTR(val.as_ptr()),
+            RRF_RT_REG_SZ,
+            Some(&mut ty as *mut REG_VALUE_TYPE),
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        )
+    };
+    if status.0 == 0 {
+        fields.push(field(name, wstr_from_until_nul(&buf)));
+    } else {
+        fields.push(field(name, "<error>"));
     }
 }
 

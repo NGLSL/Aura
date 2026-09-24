@@ -12,6 +12,7 @@ pub const SECTION_LANGUAGE: &str = "LANGUAGE";
 pub const SECTION_TIMEZONE: &str = "TIMEZONE";
 pub const SECTION_DNS: &str = "DNS";
 pub const SECTION_ENV: &str = "ENV";
+pub const SECTION_REGISTRY: &str = "REGISTRY";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
@@ -84,6 +85,7 @@ mod tests {
             SECTION_LANGUAGE,
             SECTION_TIMEZONE,
             SECTION_DNS,
+            SECTION_REGISTRY,
             SECTION_ENV,
         ] {
             assert!(
