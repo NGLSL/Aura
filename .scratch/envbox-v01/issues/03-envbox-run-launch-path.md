@@ -6,7 +6,7 @@ Parent: .scratch/envbox-v01/spec.md
 
 **Blocked by:** 02 Profile & Application 持久化 + 校验 + CLI List
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Command 解析：完整 EXE、PATH 上 `.exe`/`.com`/`.cmd`/`.bat`，`.cmd`/`.bat` 走 `%ComSpec% /d /s /c`
 - [x] Environment Block：Clone Host → Profile overrides → `ENVBOX_INSTANCE_ID`/`ENVBOX_PROFILE_ID`，Unicode CreateProcess
@@ -17,4 +17,6 @@ Parent: .scratch/envbox-v01/spec.md
 
 ## Comments
 
-- Ticket 03 delivered. `envbox run --profile <uuid|name>` launches with case-insensitive Profile env merge + ENVBOX_* IDs, Job Object (KILL_ON_CLOSE, terminate/stop), Fail Policy. Cmd/bat via ComSpec. Review fixes: ProcessHandle RAII, last_error after Win32 calls, file-only resolve, profile PATH for search, name lookup. `cargo test` 40 passed. Explicit CreateProcessW Unicode lpEnvironment reserved for ticket 04 injection path (std::process Command uses Unicode env on Windows today).
+- Ticket 03 delivered. `envbox run --profile <uuid|name>` launches with case-insensitive Profile env merge + ENVBOX_* IDs, Job Object (KILL_ON_CLOSE, terminate/stats), Fail Policy. Cmd/bat via ComSpec with correct quoting. Command resolve is file-only (rejects dirs/missing .cmd). PATH search uses merged Profile env.
+- Review fixes after two-axis review: CreateProcessW + real Unicode lpEnvironment; CREATE_SUSPENDED → assign job → Resume (no early-child race); SafeHandle RAII for process/thread/job; GetLastError captured immediately; full validate_profile on load; AGENTS.md notes name lookup. `cargo test --workspace` 42 passed.
+

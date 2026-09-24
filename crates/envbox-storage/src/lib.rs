@@ -67,7 +67,13 @@ impl ConfigStore {
     }
 
     pub fn load_profiles(&self) -> Result<ProfileDocument, StorageError> {
-        load_doc(self.profiles_path())
+        let doc: ProfileDocument = load_doc(self.profiles_path())?;
+        // Corrupt profiles must fail closed on read (L15).
+        for profile in &doc.profiles {
+            validate_profile(profile)?;
+            validate_timezone_windows_id(&profile.timezone.windows_id)?;
+        }
+        Ok(doc)
     }
 
     pub fn save_profiles(&self, doc: &ProfileDocument) -> Result<(), StorageError> {

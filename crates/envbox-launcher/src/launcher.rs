@@ -1,11 +1,14 @@
 //! LaunchRequest → LaunchedProcess. No Runtime injection in this ticket.
+//!
+//! CreateProcessW is used so the Unicode environment block is the real
+//! lpEnvironment payload (CREATE_SUSPENDED → Job assign → Resume).
 
 use crate::command::{resolve_command, CommandError, ResolvedCommand};
-use crate::environment::build_environment_block;
+use crate::environment::{build_environment_block, encode_environment_block};
 use crate::job::{InstanceJob, JobError};
 use envbox_core::{EnvironmentProfile, LaunchTarget};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,17 +42,59 @@ pub struct LaunchedProcess {
     pub profile_id: Uuid,
     pub job: InstanceJob,
     #[cfg(windows)]
-    pub child: std::process::Child,
+    process: win::SafeHandle,
+    /// Primary thread handle (RAII; kept until process exit).
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    thread: win::SafeHandle,
+    #[cfg(windows)]
+    waited: bool,
+}
+
+#[cfg(windows)]
+mod win {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+
+    pub fn last_error() -> u32 {
+        unsafe { GetLastError().0 }
+    }
+
+    pub struct SafeHandle(pub HANDLE);
+
+    impl Drop for SafeHandle {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
 }
 
 impl LaunchedProcess {
     pub fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
         #[cfg(windows)]
         {
-            return self.child.wait();
+            use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+            use std::os::windows::process::ExitStatusExt;
+
+            unsafe {
+                // WAIT_FAILED = 0xFFFFFFFF
+                if WaitForSingleObject(self.process.0, INFINITE).0 == 0xFFFF_FFFF {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut code = 0u32;
+                if GetExitCodeProcess(self.process.0, &mut code).is_err() {
+                    return Err(std::io::Error::last_os_error());
+                }
+                self.waited = true;
+                Ok(std::process::ExitStatus::from_raw(code))
+            }
         }
         #[cfg(not(windows))]
         {
+            let _ = &self.waited;
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "wait is windows-only",
@@ -59,11 +104,11 @@ impl LaunchedProcess {
 
     pub fn stop(&mut self) -> Result<(), LaunchError> {
         self.job.terminate()?;
-        #[cfg(windows)]
-        {
-            let _ = self.child.kill();
-        }
         Ok(())
+    }
+
+    pub fn job_stats(&self) -> Result<crate::job::JobStats, LaunchError> {
+        Ok(self.job.stats()?)
     }
 }
 
@@ -129,45 +174,160 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
             (resolved, req.arguments.clone())
         }
         LaunchTarget::Command { command } => {
-            // Split first token as the program; remaining CLI args stay in `arguments`.
             let resolved = resolve_command(command, path_env.as_deref())?;
             (resolved, req.arguments.clone())
         }
     };
 
     let mut job = InstanceJob::create()?;
-    let (program, args) = spawn_args(&resolved, &user_args, &req.profile)?;
+    let (program, args) = spawn_args(&resolved, &user_args, &env)?;
 
-    let mut cmd = std::process::Command::new(&program);
-    cmd.args(&args);
-    if let Some(dir) = &req.working_directory {
-        cmd.current_dir(dir);
-    }
-    cmd.env_clear();
-    for (k, v) in &env {
-        cmd.env(k, v);
-    }
+    let child = spawn_suspended(
+        &program,
+        &args,
+        req.working_directory.as_deref(),
+        &encode_environment_block(&env),
+    )?;
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| LaunchError::CreateProcess(err.to_string()))?;
-
-    let pid = child.id();
-    if let Err(err) = job.assign_pid(pid) {
-        let _ = child.kill();
+    if let Err(err) = job.assign_pid(child.pid) {
+        let _ = child.kill_raw();
         return Err(err.into());
     }
 
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::ResumeThread;
+        unsafe {
+            if ResumeThread(child.thread.0) == u32::MAX {
+                let code = win::last_error();
+                let _ = job.terminate();
+                return Err(LaunchError::CreateProcess(format!(
+                    "ResumeThread failed (GetLastError={code})"
+                )));
+            }
+        }
+    }
+
     Ok(LaunchedProcess {
-        pid,
+        pid: child.pid,
         instance_id: req.instance_id,
         profile_id: req.profile.id,
         job,
-        child,
+        #[cfg(windows)]
+        process: child.process,
+        #[cfg(windows)]
+        thread: child.thread,
+        #[cfg(windows)]
+        waited: false,
     })
 }
 
-fn classify_exe(path: &std::path::Path) -> Result<ResolvedCommand, LaunchError> {
+#[cfg(windows)]
+struct SpawnedChild {
+    pid: u32,
+    process: win::SafeHandle,
+    thread: win::SafeHandle,
+}
+
+#[cfg(windows)]
+impl SpawnedChild {
+    fn kill_raw(&self) -> Result<(), LaunchError> {
+        use windows::Win32::System::Threading::TerminateProcess;
+        unsafe {
+            let _ = TerminateProcess(self.process.0, 1);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn spawn_suspended(
+    program: &Path,
+    args: &[String],
+    working_directory: Option<&Path>,
+    env_block: &[u16],
+) -> Result<SpawnedChild, LaunchError> {
+    use windows::Win32::System::Threading::{
+        CreateProcessW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+    use windows::core::PCWSTR;
+
+    let mut cmdline = quote_arg(&program.display().to_string());
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_arg(a));
+    }
+    let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut cwd_w: Option<Vec<u16>> = working_directory.map(|d| {
+        d.display()
+            .to_string()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+
+    let mut si = STARTUPINFOW::default();
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi = PROCESS_INFORMATION::default();
+
+    unsafe {
+        let ok = CreateProcessW(
+            PCWSTR::null(),
+            windows::core::PWSTR(cmdline_w.as_mut_ptr()),
+            None,
+            None,
+            false,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            Some(env_block.as_ptr() as *const _),
+            cwd_w
+                .as_mut()
+                .map(|w| PCWSTR(w.as_ptr()))
+                .unwrap_or_else(PCWSTR::null),
+            &si,
+            &mut pi,
+        );
+        if ok.is_err() {
+            return Err(LaunchError::CreateProcess(format!(
+                "CreateProcessW failed (GetLastError={})",
+                win::last_error()
+            )));
+        }
+        Ok(SpawnedChild {
+            pid: pi.dwProcessId,
+            process: win::SafeHandle(pi.hProcess),
+            thread: win::SafeHandle(pi.hThread),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_suspended(
+    program: &Path,
+    args: &[String],
+    working_directory: Option<&Path>,
+    _env_block: &[u16],
+) -> Result<SpawnedChild, LaunchError> {
+    let _ = (program, args, working_directory);
+    Err(LaunchError::CreateProcess(
+        "CreateProcessW is Windows-only".into(),
+    ))
+}
+
+#[cfg(not(windows))]
+struct SpawnedChild {
+    pid: u32,
+}
+
+#[cfg(not(windows))]
+impl SpawnedChild {
+    fn kill_raw(&self) -> Result<(), LaunchError> {
+        Ok(())
+    }
+}
+
+fn classify_exe(path: &Path) -> Result<ResolvedCommand, LaunchError> {
     if !path.is_file() {
         return Err(CommandError::CommandNotFound(path.display().to_string()).into());
     }
@@ -176,47 +336,64 @@ fn classify_exe(path: &std::path::Path) -> Result<ResolvedCommand, LaunchError> 
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let via_comspec = ext == "cmd" || ext == "bat";
     Ok(ResolvedCommand {
         program: path.to_path_buf(),
-        via_comspec: ext == "cmd" || ext == "bat",
-        comspec_payload: (ext == "cmd" || ext == "bat")
-            .then(|| path.display().to_string()),
+        via_comspec,
+        comspec_payload: via_comspec.then(|| path.display().to_string()),
     })
 }
 
 fn spawn_args(
     resolved: &ResolvedCommand,
     user_args: &[String],
-    profile: &EnvironmentProfile,
+    env: &HashMap<String, String>,
 ) -> Result<(PathBuf, Vec<String>), LaunchError> {
     if resolved.via_comspec {
-        let comspec = profile
-            .environment
-            .get("ComSpec")
-            .or_else(|| profile.environment.get("COMSPEC"))
-            .cloned()
-            .or_else(|| std::env::var("ComSpec").ok())
-            .or_else(|| std::env::var("COMSPEC").ok())
+        let comspec = env
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("ComSpec"))
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("ComSpec").ok().or_else(|| std::env::var("COMSPEC").ok()))
             .ok_or(LaunchError::ComSpecMissing)?;
         let payload = resolved
             .comspec_payload
             .clone()
             .unwrap_or_else(|| resolved.program.display().to_string());
-        let mut line = quote_arg(&payload);
-        // drop outer quotes only if payload had none and no spaces — quote_arg handles it
-        if !payload.contains(' ') && !payload.contains('\t') && !payload.contains('"') {
-            line = payload.clone();
+        // cmd /s /c "…" — outer quotes required when payload or args have spaces.
+        let mut line = String::new();
+        let needs_outer = payload.contains(' ')
+            || payload.contains('\t')
+            || payload.contains('"')
+            || user_args.iter().any(|a| {
+                a.contains(' ') || a.contains('\t') || a.contains('"')
+            });
+        if needs_outer {
+            line.push('"');
         }
+        line.push_str(&quote_cmd_token(&payload));
         for arg in user_args {
             line.push(' ');
-            line.push_str(&quote_arg(arg));
+            line.push_str(&quote_cmd_token(arg));
         }
-        Ok((
-            PathBuf::from(comspec),
-            vec!["/d".into(), "/s".into(), "/c".into(), line],
-        ))
+        if needs_outer {
+            line.push('"');
+        }
+        Ok((PathBuf::from(comspec), vec!["/d".into(), "/s".into(), "/c".into(), line]))
     } else {
         Ok((resolved.program.clone(), user_args.to_vec()))
+    }
+}
+
+/// Quote for cmd.exe /c payload (not CreateProcess argv).
+fn quote_cmd_token(s: &str) -> String {
+    if s.is_empty() {
+        return "\"\"".into();
+    }
+    if s.contains(' ') || s.contains('\t') || s.contains('"') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
     }
 }
 
@@ -243,5 +420,28 @@ mod tests {
     fn quote_arg_embedded_quote() {
         let q = quote_arg("a\"b");
         assert!(q.starts_with('"') && q.ends_with('"'));
+    }
+
+    #[test]
+    fn quote_cmd_token_spaces() {
+        assert_eq!(quote_cmd_token(r"C:\a b\x.cmd"), r#""C:\a b\x.cmd""#);
+    }
+
+    #[test]
+    fn comspec_payload_quotes_path_with_spaces() {
+        let resolved = ResolvedCommand {
+            program: PathBuf::from(r"C:\Program Files\app\run.cmd"),
+            via_comspec: true,
+            comspec_payload: Some(r"C:\Program Files\app\run.cmd".into()),
+        };
+        let env = HashMap::from([("ComSpec".into(), r"C:\Windows\System32\cmd.exe".into())]);
+        let (prog, args) = spawn_args(&resolved, &["a b".into()], &env).unwrap();
+        assert!(prog.ends_with("cmd.exe"));
+        assert_eq!(args[0], "/d");
+        assert_eq!(args[2], "/c");
+        let line = &args[3];
+        assert!(line.starts_with('"') && line.ends_with('"'));
+        assert!(line.contains(r#"C:\Program Files\app\run.cmd"#));
+        assert!(line.contains("\"a b\""));
     }
 }

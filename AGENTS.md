@@ -45,6 +45,7 @@ cargo test
 .\target\debug\envbox.exe profile list
 .\target\debug\envbox.exe app list
 .\target\debug\envbox.exe run --profile us .\target\debug\envbox-probe.exe
+# --profile accepts UUID or exact name (e.g. us = profile named "us")
 ```
 
 验收关注：Probe 正常输出、Runtime DLL 载入、Host 系统配置完全不变。
