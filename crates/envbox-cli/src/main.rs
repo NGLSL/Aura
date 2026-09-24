@@ -1,7 +1,7 @@
 //! envbox CLI: define and inspect Applications and Environment Profiles.
 
 use envbox_core::{
-    Application, DnsMode, DnsProfile, EnvironmentProfile, LaunchTarget, LocaleProfile,
+    Application, AuditEvent, DnsMode, DnsProfile, EnvironmentProfile, LaunchTarget, LocaleProfile,
     RegistryProfile, TimezoneProfile,
 };
 use envbox_storage::{validate_application, validate_profile, ConfigStore};
@@ -26,6 +26,11 @@ fn main() -> ExitCode {
             Some("add") => cmd_app_add(&store, &args[2..]),
             _ => usage(),
         },
+        Some("audit") => match args.get(1).map(String::as_str) {
+            Some("show") => cmd_audit_show(&store, &args[2..]),
+            Some("export") => cmd_audit_export(&store, &args[2..]),
+            _ => usage(),
+        },
         Some("run") => cmd_run(&store, &args[1..]),
         _ => usage(),
     }
@@ -43,7 +48,230 @@ fn usage() -> ExitCode {
     eprintln!("  envbox app add --name N (--command C | --executable P) --profile ID \\");
     eprintln!("     [--working-directory D] [--arg A]... [--inherit-children] [--audit]");
     eprintln!("  envbox run --profile <id> [--working-directory D] [--no-inherit-children] [--audit] [--] <command> [args...]");
+    eprintln!("  envbox audit show <instance_id> [--summary]");
+    eprintln!("  envbox audit export [--out PATH]");
     ExitCode::FAILURE
+}
+
+fn parse_instance_id(raw: &str) -> Option<Uuid> {
+    let trimmed = raw.trim();
+    if let Ok(id) = Uuid::parse_str(trimmed) {
+        return Some(id);
+    }
+    // Accept simple hex (32 chars) as well.
+    Uuid::try_parse(trimmed).ok().or_else(|| {
+        let simple: String = trimmed.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if simple.len() == 32 {
+            Uuid::parse_str(&simple).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn cmd_audit_show(store: &ConfigStore, args: &[String]) -> ExitCode {
+    let mut instance_raw = String::new();
+    let mut summary = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--summary" => summary = true,
+            other if other.starts_with("--") => {
+                eprintln!("error: unknown flag {other:?}");
+                return ExitCode::FAILURE;
+            }
+            other => {
+                if !instance_raw.is_empty() {
+                    eprintln!("error: unexpected argument {other:?}");
+                    return ExitCode::FAILURE;
+                }
+                instance_raw = other.to_string();
+            }
+        }
+        i += 1;
+    }
+    if instance_raw.is_empty() {
+        eprintln!("error: audit show requires <instance_id>");
+        return ExitCode::FAILURE;
+    }
+    let Some(instance_id) = parse_instance_id(&instance_raw) else {
+        eprintln!("error: invalid instance id {instance_raw:?}");
+        return ExitCode::FAILURE;
+    };
+    let path = store.audit_path(&instance_id);
+    if !path.is_file() {
+        eprintln!(
+            "error: audit file not found for instance {instance_id}: {}",
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("error: cannot read {}: {err}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut events = Vec::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match AuditEvent::parse_json_line(line) {
+            Ok(ev) => events.push(ev),
+            Err(err) => {
+                eprintln!(
+                    "error: invalid audit line {} in {}: {err}",
+                    lineno + 1,
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if summary {
+        println!("instance\t{}", instance_id);
+        println!("events\t{}", events.len());
+        let mut by_api: HashMap<String, (usize, usize)> = HashMap::new();
+        for ev in &events {
+            let slot = by_api.entry(ev.api.clone()).or_insert((0, 0));
+            slot.0 += 1;
+            if ev.virtualized {
+                slot.1 += 1;
+            }
+        }
+        let mut keys: Vec<_> = by_api.into_iter().collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        println!("api\tcalls\tvirtualized");
+        for (api, (calls, virt)) in keys {
+            println!("{api}\t{calls}\t{virt}");
+        }
+    } else {
+        for ev in &events {
+            match ev.to_json_line() {
+                Ok(line) => println!("{line}"),
+                Err(err) => {
+                    eprintln!("error: serialize failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_audit_export(store: &ConfigStore, args: &[String]) -> ExitCode {
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) if !p.is_empty() => out = Some(PathBuf::from(p)),
+                    _ => {
+                        eprintln!("error: --out requires a path");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            other if other.starts_with("--") => {
+                eprintln!("error: unknown flag {other:?}");
+                return ExitCode::FAILURE;
+            }
+            other => {
+                eprintln!("error: unexpected argument {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 1;
+    }
+
+    let dir = store.audit_dir();
+    if !dir.is_dir() {
+        eprintln!("error: audit directory not found: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
+            .collect(),
+        Err(err) => {
+            eprintln!("error: cannot list {}: {err}", dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    files.sort();
+    if files.is_empty() {
+        eprintln!("error: no audit files in {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    // Merge all instance files. Valid lines only; invalid lines fail closed.
+    let mut merged = String::new();
+    for path in &files {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("error: cannot read {}: {err}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        for (lineno, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match AuditEvent::parse_json_line(line) {
+                Ok(ev) => match ev.to_json_line() {
+                    Ok(out_line) => {
+                        merged.push_str(&out_line);
+                        merged.push('\n');
+                    }
+                    Err(err) => {
+                        eprintln!("error: serialize failed in {}: {err}", path.display());
+                        return ExitCode::FAILURE;
+                    }
+                },
+                Err(err) => {
+                    eprintln!(
+                        "error: invalid audit line {} in {}: {err}",
+                        lineno + 1,
+                        path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+
+    match out {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            match std::fs::write(&path, &merged) {
+                Ok(()) => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("error: cannot write {}: {err}", path.display());
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        None => {
+            print!("{merged}");
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {

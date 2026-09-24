@@ -7,6 +7,7 @@ members = [
     "crates/envbox-cli",
     "crates/envbox-app",
     "tools/envbox-probe",
+    "tools/envbox-suspended-helper",
 ]
 
 [workspace.package]

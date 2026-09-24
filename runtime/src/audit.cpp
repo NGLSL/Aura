@@ -106,8 +106,9 @@ void EnvBoxAuditInit(const RuntimeProfile* pfl) {
   _snwprintf_s(path, MAX_PATH + 80, _TRUNCATE, L"%s\\%s.jsonl", dir,
                pfl->instance_id);
 
-  g_audit = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
-                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  // Share read+write so the Process Tree Instance can append to one file.
+  g_audit = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (g_audit == INVALID_HANDLE_VALUE) {
     return;  // Fail Open
   }

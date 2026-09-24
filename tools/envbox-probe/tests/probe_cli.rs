@@ -52,3 +52,28 @@ fn spawn_child_prints_parent_and_child_blocks() {
         "missing child block:\n{stdout}"
     );
 }
+
+/// Ticket 26: --resolve prints a stable RESOLVE section (getaddrinfo seam).
+#[test]
+fn resolve_flag_prints_getaddrinfo_section() {
+    let output = probe_exe()
+        .args(["--resolve", "localhost"])
+        .output()
+        .expect("run probe --resolve");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("=== RESOLVE ==="), "missing RESOLVE:\n{stdout}");
+    assert!(stdout.contains("getaddrinfo:"), "missing key:\n{stdout}");
+    // localhost must resolve to a loopback address on Host.
+    let value = stdout
+        .split("getaddrinfo:")
+        .nth(1)
+        .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    assert!(
+        value.contains("127.0.0.1") || value.contains("::1"),
+        "localhost should be loopback, got {value}"
+    );
+}

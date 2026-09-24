@@ -268,8 +268,9 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
             &encode_environment_block(&env),
         )?
     } else {
-        // Startup Fail Policy: runtime DLL must exist and inject; never launch un-hooked.
-        let runtime_dll = crate::injection::resolve_runtime_dll()?;
+        // Startup Fail Policy: runtime DLL must exist, match target arch, and
+        // inject; never launch un-hooked (tickets 04 / 30 / 31).
+        let runtime_dll = crate::injection::resolve_runtime_dll_for_target(&program)?;
         spawn_suspended(
             &program,
             &args,
@@ -397,10 +398,8 @@ fn spawn_suspended(
             std::ptr::null(),
         );
         if ok == 0 {
-            return Err(crate::injection::InjectError::DetourCreateProcess(
-                win::last_error(),
-            )
-            .into());
+            // Ticket 30/31: map elevation/integrity and bad-exe-format before return.
+            return Err(crate::injection::map_create_process_error(win::last_error()).into());
         }
         Ok(SpawnedChild {
             pid: pi.dwProcessId,

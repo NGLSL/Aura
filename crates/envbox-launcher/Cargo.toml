@@ -15,3 +15,4 @@ windows = { workspace = true }
 
 [dev-dependencies]
 envbox-core = { workspace = true }
+uuid = { workspace = true }

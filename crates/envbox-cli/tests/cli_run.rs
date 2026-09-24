@@ -956,6 +956,23 @@ fn run_audit_on_writes_instance_jsonl() {
         );
     }
     assert!(text.contains("\"virtualized\":true"), "virtualized hits:\n{text}");
+    // Profile-hit APIs must be virtualized:true; Host-only paths stay false.
+    for api in [
+        "GetUserDefaultGeoName",
+        "GetUserDefaultLocaleName",
+        "GetUserDefaultUILanguage",
+        "GetDynamicTimeZoneInformation",
+    ] {
+        assert!(
+            text.contains(&format!("\"api\":\"{api}\",\"virtualized\":true")),
+            "expected virtualized:true for {api}:\n{text}"
+        );
+    }
+    // Init is never a virtualization hit.
+    assert!(
+        text.contains("\"api\":\"EnvBoxAuditInit\",\"virtualized\":false"),
+        "init must be virtualized:false:\n{text}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

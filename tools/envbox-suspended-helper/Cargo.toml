@@ -1,0 +1,12 @@
+[package]
+name = "envbox-suspended-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "envbox-suspended-helper"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

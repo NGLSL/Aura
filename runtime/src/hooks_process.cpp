@@ -178,7 +178,13 @@ static BOOL SpawnInjected(
       lpProcessInformation->dwProcessId = 0;
     }
     SetLastError(err);
-    EnvBoxAuditEvent("CreateProcessW", 0, "inject-failed");
+    // Ticket 30: surface elevation/integrity vs generic inject failure (audit only).
+    if (err == ERROR_ELEVATION_REQUIRED || err == ERROR_ACCESS_DENIED ||
+        err == ERROR_PRIVILEGE_NOT_HELD) {
+      EnvBoxAuditEvent("CreateProcessW", 0, "inject-failed-elevation");
+    } else {
+      EnvBoxAuditEvent("CreateProcessW", 0, "inject-failed");
+    }
     return FALSE;
   }
 

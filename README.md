@@ -10,6 +10,10 @@ Windows process-level environment virtualization launcher. Target apps run on th
 
 EnvBox is not a sandbox. It does not isolate files, registry writes, network, or privileges. Do not use it as a security control.
 
+### Elevation / integrity
+
+Runtime injection is process-scoped and runs at EnvBox’s integrity level. A target that requires a **higher** integrity level (for example `requireAdministrator`) cannot be injected. Startup Fail Policy: EnvBox **refuses to start** the target rather than silently running it without virtualization. The error names `integrity/elevation` and states that the target must run at the **same integrity level as EnvBox or lower** — start EnvBox elevated when the target requires elevation. This is a compatibility limit, not a security control.
+
 ## Principles
 
 1. **Process-scoped** — changes apply only to one RuntimeInstance’s process tree
