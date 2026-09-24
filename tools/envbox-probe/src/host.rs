@@ -321,7 +321,11 @@ fn collect_dns() -> Section {
                 Some(addr),
                 &mut buflen,
             );
-            fields.push(field("GetAdaptersAddresses", format!("status={status}")));
+            if status == 0 {
+                fields.push(field("GetAdaptersAddresses", read_adapter_dns(addr)));
+            } else {
+                fields.push(field("GetAdaptersAddresses", format!("status={status}")));
+            }
         } else {
             fields.push(field("GetAdaptersAddresses", "<empty>"));
         }
@@ -346,6 +350,70 @@ unsafe fn read_dns_server_list(
         let node = &*next;
         push_ip_string(&mut servers, node);
         next = node.Next;
+    }
+    if servers.is_empty() {
+        "<none>".into()
+    } else {
+        servers.join(", ")
+    }
+}
+
+unsafe fn read_adapter_dns(
+    first: *mut windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH,
+) -> String {
+    if first.is_null() {
+        return "<null>".into();
+    }
+    let mut servers = Vec::new();
+    let mut adapter: *const windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH =
+        first;
+    while !adapter.is_null() {
+        let a = &*adapter;
+        let mut dns = a.FirstDnsServerAddress;
+        while !dns.is_null() {
+            let d = &*dns;
+            let sa = d.Address.lpSockaddr;
+            if !sa.is_null() {
+                let fam = (*sa).sa_family;
+                if fam == windows::Win32::Networking::WinSock::ADDRESS_FAMILY(2) {
+                    // AF_INET
+                    let v4 = &*(sa as *const windows::Win32::Networking::WinSock::SOCKADDR_IN);
+                    let ip = v4.sin_addr;
+                    let bytes = [
+                        (ip.S_un.S_addr & 0xff) as u8,
+                        ((ip.S_un.S_addr >> 8) & 0xff) as u8,
+                        ((ip.S_un.S_addr >> 16) & 0xff) as u8,
+                        ((ip.S_un.S_addr >> 24) & 0xff) as u8,
+                    ];
+                    // Network byte order: already big-endian in S_addr on Windows...
+                    // Use WSAAddressToString-free path: inet_ntoa style from network order.
+                    let s = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
+                    if !servers.contains(&s) {
+                        servers.push(s);
+                    }
+                } else if fam == windows::Win32::Networking::WinSock::ADDRESS_FAMILY(23) {
+                    // AF_INET6
+                    let v6 = &*(sa as *const windows::Win32::Networking::WinSock::SOCKADDR_IN6);
+                    let b = v6.sin6_addr.u.Byte;
+                    let s = format!(
+                        "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+                        u16::from_be_bytes([b[0], b[1]]),
+                        u16::from_be_bytes([b[2], b[3]]),
+                        u16::from_be_bytes([b[4], b[5]]),
+                        u16::from_be_bytes([b[6], b[7]]),
+                        u16::from_be_bytes([b[8], b[9]]),
+                        u16::from_be_bytes([b[10], b[11]]),
+                        u16::from_be_bytes([b[12], b[13]]),
+                        u16::from_be_bytes([b[14], b[15]]),
+                    );
+                    if !servers.contains(&s) {
+                        servers.push(s);
+                    }
+                }
+            }
+            dns = d.Next;
+        }
+        adapter = a.Next;
     }
     if servers.is_empty() {
         "<none>".into()

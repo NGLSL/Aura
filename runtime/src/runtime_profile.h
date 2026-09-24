@@ -5,6 +5,10 @@
 
 #include <windows.h>
 
+#ifndef ENVBOX_DNS_MAX
+#define ENVBOX_DNS_MAX 8
+#endif
+
 struct RuntimeProfile {
   wchar_t locale_name[85];
   wchar_t ui_language[85];
@@ -18,6 +22,10 @@ struct RuntimeProfile {
   int has_region;
   int has_tz;
   int inherit_children;
+  // DNS View (ticket 08): 0 = Host, 1 = VirtualView (DnsMode).
+  int dns_mode;
+  int dns_server_count;
+  char dns_servers[ENVBOX_DNS_MAX][64];
 };
 
 // Process-wide immutable profile after successful init. Never mutated later.

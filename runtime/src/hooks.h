@@ -21,3 +21,4 @@ int EnvBoxInstallGeoHooks();
 int EnvBoxInstallLocaleHooks();
 int EnvBoxInstallLanguageHooks();
 int EnvBoxInstallProcessHooks();
+int EnvBoxInstallDnsHooks();

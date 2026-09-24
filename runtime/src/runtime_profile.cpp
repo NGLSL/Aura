@@ -62,6 +62,74 @@ static void Utf8ToWide(const char* src, wchar_t* dst, size_t dst_cap) {
   dst[dst_cap - 1] = L'\0';
 }
 
+// Parse `key = [ "a", "b", ... ]` (single or multi-line) into char rows.
+// Returns count, or -1 when the array exceeds max_items (caller must Fail Open).
+static int ExtractTomlStringArray(const char* data, size_t len, const char* key,
+                                 char out[][64], int max_items,
+                                 size_t item_cap) {
+  size_t klen = strlen(key);
+  size_t i = 0;
+  while (i + klen < len) {
+    int at_line_start = (i == 0) || (data[i - 1] == '\n');
+    if (at_line_start && strncmp(data + i, key, klen) == 0) {
+      size_t j = i + klen;
+      while (j < len && (data[j] == ' ' || data[j] == '\t')) j++;
+      if (j < len && data[j] == '=') {
+        j++;
+        while (j < len && data[j] != '[') j++;
+        if (j >= len) return 0;
+        j++;  // skip '['
+        int count = 0;
+        while (j < len && data[j] != ']') {
+          while (j < len && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' ||
+                             data[j] == '\r' || data[j] == ',')) {
+            j++;
+          }
+          if (j < len && (data[j] == '"' || data[j] == '\'')) {
+            if (count >= max_items) {
+              return -1;  // overflow -> Fail Open (never silent truncate)
+            }
+            char q = data[j++];
+            size_t o = 0;
+            while (j < len && data[j] != q && o + 1 < item_cap) {
+              out[count][o++] = data[j++];
+            }
+            if (j < len && data[j] == q) j++;
+            out[count][o] = '\0';
+            if (o > 0) count++;
+          } else if (j < len && data[j] != ']') {
+            j++;
+          }
+        }
+        return count;
+      }
+    }
+    i++;
+  }
+  return 0;
+}
+
+// Scope to a TOML table header like "[profiles.dns]" through the next table.
+static int FindTomlTable(const char* data, size_t len, const char* header,
+                         size_t* out_start, size_t* out_end) {
+  size_t hlen = strlen(header);
+  const char* hit = strstr(data, header);
+  if (!hit) {
+    return 0;
+  }
+  size_t start = (size_t)(hit - data) + hlen;
+  size_t end = len;
+  for (size_t j = start; j < len; j++) {
+    if (data[j] == '[' && (j == 0 || data[j - 1] == '\n')) {
+      end = j;
+      break;
+    }
+  }
+  *out_start = start;
+  *out_end = end;
+  return 1;
+}
+
 // Find [[profiles]] block whose id = "<profile_id>".
 static int FindProfileBlock(const char* data, size_t len, const char* profile_id,
                             size_t* out_start, size_t* out_end) {
@@ -169,6 +237,35 @@ static int LoadFromProfilesToml(const char* profile_id_utf8) {
   }
   if (ExtractTomlString(block, blen, "iana_id", tmp, sizeof(tmp))) {
     Utf8ToWide(tmp, g_profile.tz_iana, 128);
+  }
+
+  // DNS View (ticket 08). Scope: [profiles.dns] only. Optional -> Host.
+  {
+    size_t ds = 0, de = 0;
+    if (FindTomlTable(block, blen, "[profiles.dns]", &ds, &de)) {
+      const char* dblock = block + ds;
+      size_t dlen = de - ds;
+      if (ExtractTomlString(dblock, dlen, "mode", tmp, sizeof(tmp))) {
+        if (_stricmp(tmp, "virtual_view") == 0 ||
+            _stricmp(tmp, "virtualview") == 0) {
+          g_profile.dns_mode = 1;
+        }
+      }
+      int n = ExtractTomlStringArray(dblock, dlen, "servers",
+                                    g_profile.dns_servers, ENVBOX_DNS_MAX, 64);
+      if (n < 0) {
+        // Overflow: Fail Open to Host for both DNS APIs (no silent truncate).
+        OutputDebugStringA("EnvBox: dns servers overflow, DNS View disabled\n");
+        g_profile.dns_mode = 0;
+        g_profile.dns_server_count = 0;
+      } else {
+        g_profile.dns_server_count = n;
+        if (g_profile.dns_mode == 1 && n == 0) {
+          OutputDebugStringA("EnvBox: virtual_view without servers, DNS View disabled\n");
+          g_profile.dns_mode = 0;
+        }
+      }
+    }
   }
 
   if (!g_profile.has_locale || !g_profile.has_ui || !g_profile.has_region ||

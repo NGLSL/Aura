@@ -719,3 +719,104 @@ fn run_powershell_child_sees_profile_when_available() {
     assert_eq!(field_after(&stdout, "GetUserDefaultGeoName:"), "US");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Ticket 08: DNS VirtualView shows Profile servers via GetNetworkParams and
+/// GetAdaptersAddresses. No traffic interception (read-only DNS View).
+#[test]
+fn run_probe_dns_virtual_view_shows_profile_servers() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let out = envbox_with_root(&root)
+        .args([
+            "profile",
+            "add",
+            "--name",
+            "US DNS",
+            "--locale",
+            "en-US",
+            "--ui-language",
+            "en-US",
+            "--region",
+            "US",
+            "--tz-windows",
+            "Pacific Standard Time",
+            "--tz-iana",
+            "America/Los_Angeles",
+            "--dns-mode",
+            "virtual_view",
+            "--dns",
+            "1.1.1.1",
+            "--dns",
+            "1.0.0.1",
+        ])
+        .output()
+        .expect("profile add dns");
+    assert!(out.status.success(), "{out:?}");
+    let profile_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(run.status.success(), "{run:?}");
+    let run_out = String::from_utf8_lossy(&run.stdout);
+
+    let net = field_after(&run_out, "GetNetworkParams:");
+    let mut net_set: Vec<&str> = net
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "<none>" && *s != "<null>")
+        .collect();
+    net_set.sort_unstable();
+    net_set.dedup();
+    assert_eq!(
+        net_set,
+        vec!["1.0.0.1", "1.1.1.1"],
+        "GetNetworkParams must be exactly Profile DNS (sorted), got {net}"
+    );
+    let adapters = field_after(&run_out, "GetAdaptersAddresses:");
+    assert!(
+        adapters.contains("1.1.1.1") && adapters.contains("1.0.0.1"),
+        "GetAdaptersAddresses should show Profile DNS, got {adapters}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 08: DnsMode Host keeps real Host DNS config (no virtualization).
+#[test]
+fn run_probe_dns_host_mode_matches_host() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root); // default DnsMode::Host
+
+    let host = Command::new(&probe).output().expect("host probe");
+    assert!(host.status.success());
+    let host_out = String::from_utf8_lossy(&host.stdout).into_owned();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(run.status.success(), "{run:?}");
+    let run_out = String::from_utf8_lossy(&run.stdout);
+
+    assert_eq!(
+        field_after(&host_out, "GetNetworkParams:"),
+        field_after(&run_out, "GetNetworkParams:"),
+        "Host DNS mode must not change GetNetworkParams"
+    );
+    assert_eq!(
+        field_after(&host_out, "GetAdaptersAddresses:"),
+        field_after(&run_out, "GetAdaptersAddresses:"),
+        "Host DNS mode must not change GetAdaptersAddresses"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -1,4 +1,4 @@
-// EnvBox Runtime - ticket 05: four core API hooks (timezone / geo / locale / UI lang).
+// EnvBox Runtime - domain hooks (timezone / geo / locale / UI lang / DNS / process).
 // Policy: Fail Open on hook errors; complete init failure is fatal (Startup Fail Policy).
 // Never call SetDynamicTimeZoneInformation; never hook real-time APIs.
 
@@ -20,6 +20,7 @@ static int InstallAllHooks() {
   ok += EnvBoxInstallGeoHooks();
   ok += EnvBoxInstallLocaleHooks();
   ok += EnvBoxInstallLanguageHooks();
+  ok += EnvBoxInstallDnsHooks();
   ok += EnvBoxInstallProcessHooks();
 
   LONG err = DetourTransactionCommit();
