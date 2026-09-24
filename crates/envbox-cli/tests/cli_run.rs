@@ -24,10 +24,11 @@ fn test_runtime_dll() -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("envbox-runtime64.dll"));
+            // Prefer target/debug over target/debug/deps (deps copy goes stale).
             if let Some(parent) = dir.parent() {
                 candidates.push(parent.join("envbox-runtime64.dll"));
             }
+            candidates.push(dir.join("envbox-runtime64.dll"));
         }
     }
     candidates.into_iter().find(|p| p.is_file())

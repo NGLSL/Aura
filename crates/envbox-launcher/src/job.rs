@@ -165,6 +165,18 @@ impl InstanceJob {
         }
         Ok(())
     }
+
+    /// Close the job handle. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` then stops
+    /// the Process Tree Instance (ticket 10 Stop contract — not TerminateJobObject).
+    pub fn close(&mut self) -> Result<(), JobError> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::HANDLE;
+            let handle = std::mem::replace(&mut self.handle, win::SafeHandle(HANDLE::default()));
+            drop(handle);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for InstanceJob {

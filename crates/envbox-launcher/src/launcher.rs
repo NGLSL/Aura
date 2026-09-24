@@ -34,7 +34,8 @@ pub struct LaunchRequest {
     pub launch: LaunchTarget,
     pub arguments: Vec<String>,
     pub working_directory: Option<PathBuf>,
-    pub profile: EnvironmentProfile,
+    /// `Some` = Environment Profile (inject Runtime). `None` = Host (no virtualization).
+    pub profile: Option<EnvironmentProfile>,
     pub instance_id: Uuid,
     /// Child processes inherit the Environment Profile (Application.inherit_children).
     pub inherit_children: bool,
@@ -106,14 +107,73 @@ impl LaunchedProcess {
         }
     }
 
-    pub fn stop(&mut self) -> Result<(), LaunchError> {
-        self.job.terminate()?;
-        Ok(())
+    /// Stop the Process Tree Instance by closing the Job handle
+    /// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), not TerminateJobObject.
+    pub fn stop(&mut self) -> Result<(), crate::job::JobError> {
+        self.job.close()
     }
 
     pub fn job_stats(&self) -> Result<crate::job::JobStats, LaunchError> {
         Ok(self.job.stats()?)
     }
+}
+
+/// Join argv for display/edit (CommandLineToArgvW-safe; inverse of `parse_args`).
+pub fn format_args(args: &[String]) -> String {
+    args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// Split a Windows argument string into argv (CommandLineToArgvW rules).
+/// Inverse of `format_args`; do not use `split_whitespace` (drops quoting).
+pub fn parse_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let mut n = 1usize;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    n += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    cur.extend(std::iter::repeat('\\').take(n / 2));
+                    chars.next();
+                    if n % 2 == 1 {
+                        cur.push('"');
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                    has_token = true;
+                } else {
+                    cur.extend(std::iter::repeat('\\').take(n));
+                    has_token = true;
+                }
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true;
+            }
+            c if !in_quotes && (c == ' ' || c == '\t') => {
+                if has_token {
+                    args.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        args.push(cur);
+    }
+    args
 }
 
 /// Quote one Windows argument for CreateProcess command line (CommandLineToArgvW rules).
@@ -152,9 +212,12 @@ fn host_environment() -> HashMap<String, String> {
 }
 
 pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
-    req.profile
-        .validate()
-        .map_err(|e| LaunchError::InvalidProfile(e.to_string()))?;
+    let host_mode = req.profile.is_none();
+    if let Some(profile) = &req.profile {
+        profile
+            .validate()
+            .map_err(|e| LaunchError::InvalidProfile(e.to_string()))?;
+    }
 
     if let Some(dir) = &req.working_directory {
         if !dir.is_dir() {
@@ -162,13 +225,19 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
         }
     }
 
-    let env = build_environment_block(
-        &host_environment(),
-        Some(&req.profile),
-        req.instance_id,
-        req.profile.id,
-        req.inherit_children,
-    );
+    let profile_id = req.profile.as_ref().map(|p| p.id).unwrap_or_default();
+    let env = if host_mode {
+        // Host: real host environment, no Profile overrides, no ENVBOX_* virtualization IDs.
+        host_environment()
+    } else {
+        build_environment_block(
+            &host_environment(),
+            req.profile.as_ref(),
+            req.instance_id,
+            profile_id,
+            req.inherit_children,
+        )
+    };
 
     // PATH search uses the merged environment (Profile PATH overrides Host).
     let path_env = env.get("PATH").cloned();
@@ -187,16 +256,25 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     let mut job = InstanceJob::create()?;
     let (program, args) = spawn_args(&resolved, &user_args, &env)?;
 
-    // Startup Fail Policy: runtime DLL must exist and inject; never launch un-hooked.
-    let runtime_dll = crate::injection::resolve_runtime_dll()?;
-
-    let child = spawn_suspended(
-        &program,
-        &args,
-        req.working_directory.as_deref(),
-        &encode_environment_block(&env),
-        &runtime_dll,
-    )?;
+    let child = if host_mode {
+        // Host Run: plain CreateProcess, no Runtime injection (true host view).
+        spawn_plain(
+            &program,
+            &args,
+            req.working_directory.as_deref(),
+            &encode_environment_block(&env),
+        )?
+    } else {
+        // Startup Fail Policy: runtime DLL must exist and inject; never launch un-hooked.
+        let runtime_dll = crate::injection::resolve_runtime_dll()?;
+        spawn_suspended(
+            &program,
+            &args,
+            req.working_directory.as_deref(),
+            &encode_environment_block(&env),
+            &runtime_dll,
+        )?
+    };
 
     if let Err(err) = job.assign_pid(child.pid) {
         // Startup Fail Policy: never leave a suspended Root Process behind.
@@ -209,16 +287,18 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
         return Err(err.into());
     }
 
-    #[cfg(windows)]
-    {
-        use windows::Win32::System::Threading::ResumeThread;
-        unsafe {
-            if ResumeThread(child.thread.0) == u32::MAX {
-                let code = win::last_error();
-                let _ = job.terminate();
-                return Err(LaunchError::CreateProcess(format!(
-                    "ResumeThread failed (GetLastError={code})"
-                )));
+    if !host_mode {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Threading::ResumeThread;
+            unsafe {
+                if ResumeThread(child.thread.0) == u32::MAX {
+                    let code = win::last_error();
+                    let _ = job.terminate();
+                    return Err(LaunchError::CreateProcess(format!(
+                        "ResumeThread failed (GetLastError={code})"
+                    )));
+                }
             }
         }
     }
@@ -226,7 +306,7 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     Ok(LaunchedProcess {
         pid: child.pid,
         instance_id: req.instance_id,
-        profile_id: req.profile.id,
+        profile_id,
         job,
         #[cfg(windows)]
         process: child.process,
@@ -325,6 +405,76 @@ fn spawn_suspended(
             thread: win::SafeHandle(pi.hThread),
         })
     }
+}
+
+#[cfg(windows)]
+fn spawn_plain(
+    program: &Path,
+    args: &[String],
+    working_directory: Option<&Path>,
+    env_block: &[u16],
+) -> Result<SpawnedChild, LaunchError> {
+    use windows::Win32::System::Threading::{
+        CreateProcessW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let mut cmdline = quote_arg(&program.display().to_string());
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_arg(a));
+    }
+    let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut cwd_w: Option<Vec<u16>> = working_directory.map(|d| {
+        d.display()
+            .to_string()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+    let mut si = STARTUPINFOW::default();
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        let ok = CreateProcessW(
+            PCWSTR::null(),
+            PWSTR(cmdline_w.as_mut_ptr()),
+            None,
+            None,
+            false,
+            CREATE_UNICODE_ENVIRONMENT,
+            Some(env_block.as_ptr() as *const _),
+            cwd_w
+                .as_mut()
+                .map(|w| PCWSTR(w.as_ptr()))
+                .unwrap_or_else(PCWSTR::null),
+            &mut si,
+            &mut pi,
+        );
+        if ok.is_err() {
+            return Err(LaunchError::CreateProcess(format!(
+                "CreateProcessW failed (GetLastError={})",
+                win::last_error()
+            )));
+        }
+        Ok(SpawnedChild {
+            pid: pi.dwProcessId,
+            process: win::SafeHandle(pi.hProcess),
+            thread: win::SafeHandle(pi.hThread),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_plain(
+    _program: &Path,
+    _args: &[String],
+    _working_directory: Option<&Path>,
+    _env_block: &[u16],
+) -> Result<SpawnedChild, LaunchError> {
+    Err(LaunchError::CreateProcess(
+        "CreateProcessW is Windows-only".into(),
+    ))
 }
 
 // FFI to Microsoft Detours (static lib linked in build.rs).
@@ -465,6 +615,32 @@ mod tests {
     fn quote_arg_embedded_quote() {
         let q = quote_arg("a\"b");
         assert!(q.starts_with('"') && q.ends_with('"'));
+    }
+
+    #[test]
+    fn parse_format_args_round_trip() {
+        let cases: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["foo".into()],
+            vec!["a b".into()],
+            vec!["".into()],
+            vec!["a\"b".into()],
+            vec!["a\\".into()],
+            vec!["--flag".into(), "value with space".into(), "".into()],
+            vec![r"C:\path with space\app.exe".into()],
+        ];
+        for args in cases {
+            let line = format_args(&args);
+            let back = parse_args(&line);
+            assert_eq!(back, args, "round-trip failed for {args:?} via {line:?}");
+        }
+    }
+
+    #[test]
+    fn parse_args_preserves_quoted_empty_and_spaces() {
+        assert_eq!(parse_args("a \"b c\" d"), vec!["a", "b c", "d"]);
+        assert_eq!(parse_args("\"\""), vec![""]);
+        assert_eq!(parse_args("\"a\\\"b\""), vec!["a\"b"]);
     }
 
     #[test]

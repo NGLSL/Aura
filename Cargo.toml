@@ -5,6 +5,7 @@ members = [
     "crates/envbox-storage",
     "crates/envbox-launcher",
     "crates/envbox-cli",
+    "crates/envbox-app",
     "tools/envbox-probe",
 ]
 
@@ -35,4 +36,5 @@ windows = { version = "0.58", features = [
     "Win32_System_Environment",
     "Win32_System_Registry",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
 ] }

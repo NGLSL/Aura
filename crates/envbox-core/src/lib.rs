@@ -112,8 +112,32 @@ impl TimezoneProfile {
                 "timezone ids must not contain NUL".into(),
             ));
         }
+        if !looks_like_iana_id(&self.iana_id) {
+            return Err(DomainError::InvalidProfile(format!(
+                "timezone.iana_id must be an IANA name (e.g. America/Los_Angeles), got {:?}",
+                self.iana_id
+            )));
+        }
         Ok(())
     }
+}
+
+/// IANA tz name: UTC/GMT or Area/Location (no Windows IDs like "Pacific Standard Time").
+fn looks_like_iana_id(id: &str) -> bool {
+    let id = id.trim();
+    if id.is_empty() || id.contains('\0') || id.contains('\\') || id.contains(' ') {
+        return false;
+    }
+    if id.eq_ignore_ascii_case("UTC") || id.eq_ignore_ascii_case("GMT") {
+        return true;
+    }
+    id.contains('/')
+        && id.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+')
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +293,20 @@ mod tests {
         let mut p = valid_profile();
         p.locale.locale_name = "  ".into();
         assert!(matches!(p.validate(), Err(DomainError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn windows_id_must_not_masquerade_as_iana() {
+        let mut p = valid_profile();
+        p.timezone.iana_id = "Pacific Standard Time".into();
+        assert!(matches!(p.validate(), Err(DomainError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn utc_is_valid_iana() {
+        let mut p = valid_profile();
+        p.timezone.iana_id = "UTC".into();
+        assert!(p.validate().is_ok());
     }
 
     #[test]

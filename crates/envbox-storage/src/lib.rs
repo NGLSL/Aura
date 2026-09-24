@@ -133,7 +133,7 @@ fn validate_timezone_windows_id(windows_id: &str) -> Result<(), DomainError> {
 fn windows_id_exists(windows_id: &str) -> bool {
     #[cfg(windows)]
     {
-        win_tz::enumerate_dynamic_timezone_ids()
+        enumerate_dynamic_timezone_ids()
             .iter()
             .any(|id| id.eq_ignore_ascii_case(windows_id))
     }
@@ -142,6 +142,44 @@ fn windows_id_exists(windows_id: &str) -> bool {
         // Non-Windows CI cannot enumerate Windows IDs; accept well-formed IDs.
         !windows_id.is_empty() && !windows_id.contains('\0')
     }
+}
+
+/// Windows timezone ID → IANA when known. `None` means unmapped — never invent.
+/// GUI/CLI must require a real `iana_id`; do not fall back to the Windows ID.
+pub fn windows_id_to_iana(windows_id: &str) -> Option<&'static str> {
+    let map = [
+        ("Pacific Standard Time", "America/Los_Angeles"),
+        ("Mountain Standard Time", "America/Denver"),
+        ("Central Standard Time", "America/Chicago"),
+        ("Eastern Standard Time", "America/New_York"),
+        ("China Standard Time", "Asia/Shanghai"),
+        ("Tokyo Standard Time", "Asia/Tokyo"),
+        ("GMT Standard Time", "Europe/London"),
+        ("W. Europe Standard Time", "Europe/Berlin"),
+        ("India Standard Time", "Asia/Kolkata"),
+        ("Singapore Standard Time", "Asia/Singapore"),
+        ("AUS Eastern Standard Time", "Australia/Sydney"),
+        ("Korea Standard Time", "Asia/Seoul"),
+        ("Taipei Standard Time", "Asia/Taipei"),
+        ("Arabian Standard Time", "Asia/Dubai"),
+        ("Israel Standard Time", "Asia/Jerusalem"),
+        ("Russian Standard Time", "Europe/Moscow"),
+        ("SA Pacific Standard Time", "America/Bogota"),
+        ("E. South America Standard Time", "America/Sao_Paulo"),
+        ("UTC", "UTC"),
+    ];
+    map.iter()
+        .find(|(w, _)| w.eq_ignore_ascii_case(windows_id))
+        .map(|(_, i)| *i)
+}
+
+/// Windows timezone IDs from host enumeration (Profile editor dropdown).
+#[cfg(windows)]
+pub use win_tz::enumerate_dynamic_timezone_ids;
+
+#[cfg(not(windows))]
+pub fn enumerate_dynamic_timezone_ids() -> Vec<String> {
+    vec!["Pacific Standard Time".into()]
 }
 
 #[cfg(windows)]
@@ -296,6 +334,25 @@ mod tests {
             validate_profile(&profile),
             Err(StorageError::Domain(_))
         ));
+    }
+
+    #[test]
+    fn windows_id_as_iana_is_rejected() {
+        let mut profile = sample_profile();
+        profile.timezone.iana_id = profile.timezone.windows_id.clone();
+        assert!(matches!(
+            validate_profile(&profile),
+            Err(StorageError::Domain(_))
+        ));
+    }
+
+    #[test]
+    fn windows_id_to_iana_is_option_without_fake_fallback() {
+        assert_eq!(
+            windows_id_to_iana("Pacific Standard Time"),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(windows_id_to_iana("Not A Real Zone"), None);
     }
 
     #[test]

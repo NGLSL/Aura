@@ -116,7 +116,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         },
         arguments: command_args.to_vec(),
         working_directory,
-        profile: profile.clone(),
+        profile: Some(profile.clone()),
         instance_id: Uuid::new_v4(),
         inherit_children: !no_inherit,
     };

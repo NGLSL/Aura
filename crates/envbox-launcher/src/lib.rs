@@ -4,11 +4,13 @@
 pub mod command;
 pub mod environment;
 pub mod injection;
+pub mod instance;
 pub mod job;
 pub mod launcher;
 
 pub use command::{resolve_command, ResolvedCommand};
 pub use environment::{build_environment_block, encode_environment_block};
 pub use injection::resolve_runtime_dll;
+pub use instance::{InstanceError, InstanceHandle, InstanceManager, RunTarget};
 pub use job::InstanceJob;
-pub use launcher::{launch, LaunchRequest, LaunchedProcess, LaunchError};
+pub use launcher::{format_args, launch, parse_args, LaunchError, LaunchRequest, LaunchedProcess};
