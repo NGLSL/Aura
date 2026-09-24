@@ -89,6 +89,7 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
   upsert(L"ENVBOX_PROFILE_ID", pfl->profile_id);
   upsert(L"ENVBOX_INSTANCE_ID", pfl->instance_id);
   upsert(L"ENVBOX_INHERIT_CHILDREN", pfl->inherit_children ? L"1" : L"0");
+  upsert(L"ENVBOX_AUDIT", pfl->audit ? L"1" : L"0");
 
   wchar_t root[MAX_PATH] = {};
   if (GetEnvironmentVariableW(L"ENVBOX_CONFIG_ROOT", root, MAX_PATH) > 0) {

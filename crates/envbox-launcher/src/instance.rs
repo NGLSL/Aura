@@ -177,6 +177,7 @@ fn build_launch_request(
         profile,
         instance_id,
         inherit_children,
+        audit: app.audit,
     }
 }
 
@@ -216,6 +217,7 @@ mod tests {
             arguments: vec!["/c".into(), "exit 0".into()],
             default_profile_id: profile_id,
             inherit_children: true,
+            audit: false,
         }
     }
 

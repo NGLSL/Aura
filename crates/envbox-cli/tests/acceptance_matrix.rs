@@ -309,6 +309,7 @@ fn acceptance_notepad_launch_and_stop() {
         arguments: vec![],
         default_profile_id: profile.id,
         inherit_children: true,
+        audit: false,
     };
 
     let mut mgr = InstanceManager::new();

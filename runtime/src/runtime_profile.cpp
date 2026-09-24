@@ -343,6 +343,14 @@ int EnvBoxLoadProfile() {
     g_profile.inherit_children = 1;
   }
 
+  // Audit Mode default: off (ticket 20). Exact "1" enables.
+  wchar_t audit[8] = {};
+  g_profile.audit =
+      (ReadEnvW(L"ENVBOX_AUDIT", audit, 8) && audit[0] == L'1' &&
+       audit[1] == L'\0')
+          ? 1
+          : 0;
+
   // Remember this module's path for DetourUpdateProcessWithDll on children.
   HMODULE self = nullptr;
   if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |

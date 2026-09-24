@@ -28,6 +28,9 @@
 | **Runtime（envbox-runtime）** | 注入目标进程的 Detours DLL；负责 API Hook 与子进程继承 |
 | **Fail Open** | 多数 Hook 失败时回退原 Windows API，兼容优先 |
 | **Job Object** | 用于生命周期跟踪/统计/一键停止；不是安全隔离边界 |
+| **Audit Mode** | 可选观测开关（默认关）：记录进程树读取过的地域相关 API；不改变虚拟化语义 |
+| **Audit Event** | 单条审计记录（JSONL）：API、pid/ppid/tid、是否虚拟化、非敏感摘要 |
+| **DNS routing** | VirtualView 下对解析入口的 per-process 路由；区别于只改配置视图的 DNS View |
 
 ## 启动与策略
 

@@ -41,8 +41,8 @@ fn usage() -> ExitCode {
     eprintln!("     [--dns IP]... [--env K=V]...");
     eprintln!("  envbox app list");
     eprintln!("  envbox app add --name N (--command C | --executable P) --profile ID \\");
-    eprintln!("     [--working-directory D] [--arg A]... [--inherit-children]");
-    eprintln!("  envbox run --profile <id> [--working-directory D] [--no-inherit-children] [--] <command> [args...]");
+    eprintln!("     [--working-directory D] [--arg A]... [--inherit-children] [--audit]");
+    eprintln!("  envbox run --profile <id> [--working-directory D] [--no-inherit-children] [--audit] [--] <command> [args...]");
     ExitCode::FAILURE
 }
 
@@ -50,6 +50,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
     let mut profile_raw = String::new();
     let mut working_directory: Option<PathBuf> = None;
     let mut no_inherit = false;
+    let mut audit = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -63,6 +64,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
             "--working-directory" => working_directory = take(&mut i).map(PathBuf::from),
             "--no-inherit-children" => no_inherit = true,
             "--inherit-children" => no_inherit = false,
+            "--audit" => audit = true,
             "--" => {
                 rest.extend_from_slice(&args[i + 1..]);
                 break;
@@ -119,6 +121,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         profile: Some(profile.clone()),
         instance_id: Uuid::new_v4(),
         inherit_children: !no_inherit,
+        audit,
     };
 
     match envbox_launcher::launch(request) {
@@ -322,6 +325,7 @@ fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
     let mut working_directory: Option<PathBuf> = None;
     let mut arguments: Vec<String> = Vec::new();
     let mut inherit_children = true;
+    let mut audit = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -345,6 +349,7 @@ fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
             }
             "--inherit-children" => inherit_children = true,
             "--no-inherit-children" => inherit_children = false,
+            "--audit" => audit = true,
             other => {
                 eprintln!("error: unknown flag {other:?}");
                 return ExitCode::FAILURE;
@@ -393,6 +398,7 @@ fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         arguments,
         default_profile_id,
         inherit_children,
+        audit,
     };
 
     if let Err(err) = validate_application(&app) {

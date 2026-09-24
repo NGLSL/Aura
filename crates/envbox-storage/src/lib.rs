@@ -66,6 +66,21 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Audit Mode sink directory (ticket 20).
+    pub fn audit_dir(&self) -> PathBuf {
+        self.root.join("audit")
+    }
+
+    /// One JSONL file per RuntimeInstance.
+    pub fn audit_path(&self, instance_id: &uuid::Uuid) -> PathBuf {
+        self.audit_dir().join(format!("{instance_id}.jsonl"))
+    }
+
+    pub fn ensure_audit_dir(&self) -> Result<(), StorageError> {
+        fs::create_dir_all(self.audit_dir())?;
+        Ok(())
+    }
+
     pub fn load_profiles(&self) -> Result<ProfileDocument, StorageError> {
         let doc: ProfileDocument = load_doc(self.profiles_path())?;
         // Corrupt profiles must fail closed on read (L15).
@@ -280,6 +295,7 @@ mod tests {
             arguments: vec![],
             default_profile_id: Uuid::nil(),
             inherit_children: true,
+            audit: false,
         }
     }
 
@@ -370,6 +386,17 @@ mod tests {
         assert!(text.contains("type = \"command\""), "launch tag:\n{text}");
         let loaded = store.load_applications().unwrap();
         assert_eq!(loaded.applications[0].name, "Claude Code");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_path_is_per_instance_jsonl() {
+        let dir = std::env::temp_dir().join(format!("envbox-test-audit-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&dir);
+        store.ensure_audit_dir().unwrap();
+        let id = Uuid::new_v4();
+        let path = store.audit_path(&id);
+        assert_eq!(path, dir.join("audit").join(format!("{id}.jsonl")));
         let _ = fs::remove_dir_all(&dir);
     }
 

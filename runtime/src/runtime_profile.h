@@ -25,6 +25,8 @@ struct RuntimeProfile {
   int has_region;
   int has_tz;
   int inherit_children;
+  // Audit Mode (ticket 20): 0 = off (default), 1 = write JSONL sink.
+  int audit;
   // DNS View (ticket 08): 0 = Host, 1 = VirtualView (DnsMode).
   int dns_mode;
   int dns_server_count;

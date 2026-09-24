@@ -39,6 +39,8 @@ pub struct LaunchRequest {
     pub instance_id: Uuid,
     /// Child processes inherit the Environment Profile (Application.inherit_children).
     pub inherit_children: bool,
+    /// Audit Mode (ticket 20): write JSONL audit trail for this instance.
+    pub audit: bool,
 }
 
 pub struct LaunchedProcess {
@@ -236,6 +238,7 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
             req.instance_id,
             profile_id,
             req.inherit_children,
+            req.audit,
         )
     };
 

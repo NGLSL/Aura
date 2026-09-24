@@ -33,6 +33,9 @@ pub struct Application {
     pub arguments: Vec<String>,
     pub default_profile_id: Uuid,
     pub inherit_children: bool,
+    /// Audit Mode default for this Application (ticket 20). CLI `--audit` forces on.
+    #[serde(default)]
+    pub audit: bool,
 }
 
 impl Application {
@@ -226,6 +229,33 @@ pub struct RuntimeInstance {
     pub status: InstanceStatus,
 }
 
+/// Audit Mode event schema v1 (ticket 20). One JSON object per line.
+/// Never carries file contents, tokens, or full environment blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub v: u32,
+    pub ts_utc: String,
+    pub pid: u32,
+    pub ppid: u32,
+    pub tid: u32,
+    pub api: String,
+    pub virtualized: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl AuditEvent {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn to_json_line(&self) -> Result<String, String> {
+        serde_json::to_string(self).map_err(|e| e.to_string())
+    }
+
+    pub fn parse_json_line(line: &str) -> Result<Self, String> {
+        serde_json::from_str(line.trim()).map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +358,7 @@ mod tests {
             arguments: vec![],
             default_profile_id: Uuid::nil(),
             inherit_children: true,
+            audit: false,
         };
         assert!(matches!(
             app.validate(),
@@ -344,6 +375,46 @@ mod tests {
         assert!(text.contains("type = \"command\""));
         let back: Wrap = toml::from_str(&text).unwrap();
         assert_eq!(back.0, target);
+    }
+
+    #[test]
+    fn audit_event_round_trips_json_line() {
+        let ev = AuditEvent {
+            v: AuditEvent::SCHEMA_VERSION,
+            ts_utc: "2026-09-24T12:00:00.000Z".into(),
+            pid: 10,
+            ppid: 2,
+            tid: 3,
+            api: "GetDynamicTimeZoneInformation".into(),
+            virtualized: true,
+            summary: Some("Pacific Standard Time".into()),
+        };
+        let line = ev.to_json_line().unwrap();
+        assert!(!line.contains('\n'));
+        let back = AuditEvent::parse_json_line(&line).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn audit_event_summary_optional() {
+        let ev = AuditEvent {
+            v: 1,
+            ts_utc: "2026-09-24T12:00:00.000Z".into(),
+            pid: 1,
+            ppid: 0,
+            tid: 1,
+            api: "EnvBoxAuditInit".into(),
+            virtualized: false,
+            summary: None,
+        };
+        let line = ev.to_json_line().unwrap();
+        assert!(!line.contains("summary"));
+        assert_eq!(AuditEvent::parse_json_line(&line).unwrap(), ev);
+    }
+
+    #[test]
+    fn audit_event_rejects_garbage() {
+        assert!(AuditEvent::parse_json_line("not-json").is_err());
     }
 
     #[derive(serde::Serialize, serde::Deserialize)]

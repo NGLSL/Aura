@@ -908,3 +908,68 @@ fn run_probe_registry_outside_whitelist_matches_host() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Ticket 20: Audit Mode on writes per-instance JSONL; default off writes nothing.
+#[test]
+fn run_audit_on_writes_instance_jsonl() {
+    let _dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &_dll)
+        .args(["run", "--profile", &profile_id, "--audit"])
+        .arg(&probe)
+        .output()
+        .expect("run probe --audit");
+    assert!(run.status.success(), "{run:?}");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let mut instance_id = String::new();
+    for part in stderr.split_whitespace() {
+        if let Some(rest) = part.strip_prefix("instance=") {
+            instance_id = rest.to_string();
+        }
+    }
+    assert!(!instance_id.is_empty(), "instance id missing in:\n{stderr}");
+
+    let audit_dir = root.join("audit");
+    let path = audit_dir.join(format!("{instance_id}.jsonl"));
+    assert!(path.is_file(), "audit file missing: {}", path.display());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"api\":\"EnvBoxAuditInit\""), "init event:\n{text}");
+    assert!(text.contains("\"v\":1"), "schema version:\n{text}");
+    // Wire contract: summary omitted only when absent; init has summary.
+    assert!(text.contains("\"summary\":\"schema=v1\""), "init summary:\n{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn run_without_audit_flag_writes_no_audit_file() {
+    let _dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &_dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(run.status.success(), "{run:?}");
+    let audit_dir = root.join("audit");
+    if audit_dir.is_dir() {
+        let files: Vec<_> = std::fs::read_dir(&audit_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(files.is_empty(), "unexpected audit files: {files:?}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

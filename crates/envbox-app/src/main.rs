@@ -87,6 +87,7 @@ enum Message {
     AppWorkDir(String),
     AppProfile(Uuid),
     AppInherit(bool),
+    AppAudit(bool),
     AppSelect(Uuid),
     AppSave,
     AppDelete,
@@ -139,6 +140,7 @@ struct AppDraft {
     work_dir: String,
     profile_id: Uuid,
     inherit: bool,
+    audit: bool,
 }
 
 impl AppDraft {
@@ -152,6 +154,7 @@ impl AppDraft {
             work_dir: String::new(),
             profile_id,
             inherit: true,
+            audit: false,
         }
     }
 }
@@ -245,6 +248,7 @@ impl EnvBoxApp {
             Message::AppWorkDir(v) => self.app_draft.work_dir = v,
             Message::AppProfile(id) => self.app_draft.profile_id = id,
             Message::AppInherit(v) => self.app_draft.inherit = v,
+            Message::AppAudit(v) => self.app_draft.audit = v,
             Message::AppSelect(id) => {
                 if let Some(app) = self.applications.iter().find(|a| a.id == id) {
                     self.app_draft = AppDraft {
@@ -266,6 +270,7 @@ impl EnvBoxApp {
                             .unwrap_or_default(),
                         profile_id: app.default_profile_id,
                         inherit: app.inherit_children,
+                        audit: app.audit,
                     };
                 }
             }
@@ -366,6 +371,7 @@ impl EnvBoxApp {
             arguments,
             default_profile_id: self.app_draft.profile_id,
             inherit_children: self.app_draft.inherit,
+            audit: self.app_draft.audit,
         };
         if let Err(err) = validate_application(&app) {
             self.status = format!("Save failed: {err}");
@@ -622,6 +628,7 @@ impl EnvBoxApp {
             pick_list(profile_labels, selected, |n: NamedId| Message::AppProfile(n.id)),
             checkbox("Child processes inherit profile", self.app_draft.inherit)
                 .on_toggle(Message::AppInherit),
+            checkbox("Audit Mode", self.app_draft.audit).on_toggle(Message::AppAudit),
             row![
                 button(text("Save")).on_press(Message::AppSave),
                 button(text("Delete")).on_press(Message::AppDelete),

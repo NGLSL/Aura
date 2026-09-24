@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 
+#include "audit.h"
 #include "detours.h"
 #include "hooks.h"
 #include "runtime_profile.h"
@@ -51,9 +52,12 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
       // Startup Fail Policy: do not run without a Profile.
       return FALSE;
     }
+    EnvBoxAuditInit(EnvBoxProfile());
     // Hooks may partially fail; process still starts (Fail Open).
     InstallAllHooks();
     SetEnvironmentVariableA("ENVBOX_RUNTIME_LOADED", "1");
+  } else if (reason == DLL_PROCESS_DETACH) {
+    EnvBoxAuditShutdown();
   }
   return TRUE;
 }
