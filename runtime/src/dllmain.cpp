@@ -1,76 +1,35 @@
-// EnvBox Runtime - ticket 04: Detours inject smoke (no API hooks yet).
-// Policy: Fail Open for future hooks; injection failure is handled by the launcher.
-// Complete Runtime init failure (no Profile identity) is fatal per Startup Fail Policy.
+// EnvBox Runtime - ticket 05: four core API hooks (timezone / geo / locale / UI lang).
+// Policy: Fail Open on hook errors; complete init failure is fatal (Startup Fail Policy).
+// Never call SetDynamicTimeZoneInformation; never hook real-time APIs.
 
 #include <windows.h>
 
 #include <stdio.h>
 
 #include "detours.h"
+#include "hooks.h"
+#include "runtime_profile.h"
 
-// Ticket 04 "Load Profile": resolve Profile identity from the Environment Block
-// and verify it against profiles.toml when ENVBOX_CONFIG_ROOT is present.
-// Immutable RuntimeProfile field parse + Install Hooks land in ticket 05+.
-struct LoadedProfile {
-  char profile_id[64];
-  char instance_id[64];
-  int loaded;
-};
+static int InstallAllHooks() {
+  DetourTransactionBegin();
+  DetourUpdateThread(GetCurrentThread());
 
-static LoadedProfile g_profile = {};
+  // Each install is independent (Fail Open per API).
+  int ok = 0;
+  ok += EnvBoxInstallTimeHooks();
+  ok += EnvBoxInstallGeoHooks();
+  ok += EnvBoxInstallLocaleHooks();
+  ok += EnvBoxInstallLanguageHooks();
 
-static int ReadEnvId(const char* name, char* buf, DWORD cap) {
-  DWORD n = GetEnvironmentVariableA(name, buf, cap);
-  if (n == 0 || n >= cap) {
-    buf[0] = '\0';
+  LONG err = DetourTransactionCommit();
+  if (err != NO_ERROR) {
+    // Commit already ended the transaction. Run un-hooked (Fail Open).
     return 0;
   }
-  return 1;
-}
-
-static int ProfileIdInProfilesToml(const char* profile_id) {
-  char root[MAX_PATH];
-  DWORD n = GetEnvironmentVariableA("ENVBOX_CONFIG_ROOT", root, (DWORD)sizeof(root));
-  if (n == 0 || n >= sizeof(root)) {
-    return 1;  // no store path in env; Environment Block IDs are authoritative
-  }
-  char path[MAX_PATH + 32];
-  _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\profiles.toml", root);
-  HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return 1;  // missing store: accept Environment Block identity
-  }
-  char data[65536];
-  DWORD read = 0;
-  BOOL ok = ReadFile(file, data, (DWORD)sizeof(data) - 1, &read, nullptr);
-  CloseHandle(file);
-  if (!ok) {
-    return 0;
-  }
-  data[read] = '\0';
-  return strstr(data, profile_id) != nullptr;
-}
-
-// Returns 1 on success (profile loaded), 0 on fatal init failure.
-static int LoadProfileFromEnv() {
-  if (!ReadEnvId("ENVBOX_PROFILE_ID", g_profile.profile_id,
-                 (DWORD)sizeof(g_profile.profile_id))) {
-    return 0;
-  }
-  ReadEnvId("ENVBOX_INSTANCE_ID", g_profile.instance_id,
-            (DWORD)sizeof(g_profile.instance_id));
-  if (!ProfileIdInProfilesToml(g_profile.profile_id)) {
-    return 0;
-  }
-
-  char msg[256];
+  char msg[128];
   _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-              "EnvBox Runtime Loaded profile=%s instance=%s (hooks deferred)\n",
-              g_profile.profile_id, g_profile.instance_id);
+              "EnvBox Runtime hooks installed=%d/4 (Fail Open per API)\n", ok);
   OutputDebugStringA(msg);
-  SetEnvironmentVariableA("ENVBOX_RUNTIME_LOADED", "1");
-  g_profile.loaded = 1;
   return 1;
 }
 
@@ -85,10 +44,13 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(instance);
     DetourRestoreAfterWith();
-    if (!LoadProfileFromEnv()) {
+    if (!EnvBoxLoadProfile()) {
       // Startup Fail Policy: do not run without a Profile.
       return FALSE;
     }
+    // Hooks may partially fail; process still starts (Fail Open).
+    InstallAllHooks();
+    SetEnvironmentVariableA("ENVBOX_RUNTIME_LOADED", "1");
   }
   return TRUE;
 }

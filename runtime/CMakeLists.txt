@@ -24,7 +24,14 @@ if(ENVBOX_WITH_DETOURS AND NOT DETOURS_ROOT)
   endif()
 endif()
 
-add_library(${ENVBOX_RT_TARGET} SHARED src/dllmain.cpp)
+add_library(${ENVBOX_RT_TARGET} SHARED
+  src/dllmain.cpp
+  src/runtime_profile.cpp
+  src/hooks_time.cpp
+  src/hooks_geo.cpp
+  src/hooks_locale.cpp
+  src/hooks_language.cpp
+)
 target_compile_features(${ENVBOX_RT_TARGET} PRIVATE cxx_std_17)
 target_compile_definitions(${ENVBOX_RT_TARGET} PRIVATE ENVBOX_RUNTIME=1 ENVBOX_ARCH=${ENVBOX_RT_ARCH})
 set_target_properties(${ENVBOX_RT_TARGET} PROPERTIES OUTPUT_NAME "${ENVBOX_RT_NAME}")

@@ -328,3 +328,119 @@ fn run_leaves_host_probe_snapshot_unchanged() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Ticket 05: four core APIs return Profile values under `envbox run`.
+/// Expected literals come from the Profile fixture (independent of Host).
+/// Also asserts the fields *changed* from the Host baseline (contrast).
+#[test]
+fn run_probe_four_core_apis_show_profile_values() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root); // US / en-US / Pacific Standard Time
+
+    let host = Command::new(&probe).output().expect("host probe");
+    assert!(host.status.success());
+    let host_out = String::from_utf8_lossy(&host.stdout).into_owned();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Independent Profile fixture literals (exact, not recomputed from Host).
+    assert_eq!(
+        field_after(&stdout, "GetUserDefaultGeoName:"),
+        "US",
+        "Geo not virtualized:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "GetUserDefaultLocaleName:"),
+        "en-US",
+        "Locale not virtualized:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "GetUserDefaultUILanguage:"),
+        "0x0409",
+        "UI language not virtualized:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "GetDynamicTimeZoneInformation:"),
+        "Pacific Standard Time",
+        "Timezone not virtualized:\n{stdout}"
+    );
+
+    // Host contrast: these four fields must differ from the Host baseline
+    // (or at least the run side equals the fixture, which differs from CN host).
+    for key in [
+        "GetUserDefaultGeoName:",
+        "GetUserDefaultLocaleName:",
+        "GetUserDefaultUILanguage:",
+        "GetDynamicTimeZoneInformation:",
+    ] {
+        let host_val = field_after(&host_out, key);
+        let run_val = field_after(&stdout, key);
+        assert_ne!(
+            host_val, run_val,
+            "expected Host vs Profile contrast for {key} (host={host_val})"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 05: non-virtualized fields stay on Host baseline (independent compare).
+#[test]
+fn run_probe_non_virtualized_fields_match_host() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+
+    let host = Command::new(&probe).output().expect("host probe");
+    assert!(host.status.success());
+    let host_out = String::from_utf8_lossy(&host.stdout).into_owned();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(run.status.success(), "{run:?}");
+    let run_out = String::from_utf8_lossy(&run.stdout);
+
+    for key in [
+        "GetSystemDefaultLocaleName:",
+        "GetSystemDefaultUILanguage:",
+        "GetUserGeoID:",
+        "GetUserDefaultLCID:",
+        "GetUserPreferredUILanguages:",
+        "GetNetworkParams:",
+    ] {
+        assert_eq!(
+            field_after(&host_out, key),
+            field_after(&run_out, key),
+            "non-virtualized {key} changed under Profile"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Value line following `Name:` in Probe text format.
+fn field_after(text: &str, key: &str) -> String {
+    let idx = text
+        .find(key)
+        .unwrap_or_else(|| panic!("missing key {key} in:\n{text}"));
+    let rest = &text[idx + key.len()..];
+    rest.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}

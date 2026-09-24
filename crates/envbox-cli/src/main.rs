@@ -120,7 +120,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
     match envbox_launcher::launch(request) {
         Ok(mut child) => {
             eprintln!(
-                "envbox: started pid={} instance={} profile={} (Runtime injected; API hooks land in ticket 05+)",
+                "envbox: started pid={} instance={} profile={} (Runtime + core hooks active)",
                 child.pid, child.instance_id, child.profile_id
             );
             match child.wait() {
