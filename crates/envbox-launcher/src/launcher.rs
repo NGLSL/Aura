@@ -1,7 +1,7 @@
-//! LaunchRequest → LaunchedProcess. No Runtime injection in this ticket.
+//! LaunchRequest → LaunchedProcess with Detours Runtime injection (ticket 04).
 //!
-//! CreateProcessW is used so the Unicode environment block is the real
-//! lpEnvironment payload (CREATE_SUSPENDED → Job assign → Resume).
+//! Sequence: resolve → env block → Job → DetourCreateProcessWithDllExW
+//! (CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT) → assign Job → Resume.
 
 use crate::command::{resolve_command, CommandError, ResolvedCommand};
 use crate::environment::{build_environment_block, encode_environment_block};
@@ -26,6 +26,8 @@ pub enum LaunchError {
     CreateProcess(String),
     #[error("comspec not set")]
     ComSpecMissing,
+    #[error(transparent)]
+    Inject(#[from] crate::injection::InjectError),
 }
 
 pub struct LaunchRequest {
@@ -182,15 +184,25 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     let mut job = InstanceJob::create()?;
     let (program, args) = spawn_args(&resolved, &user_args, &env)?;
 
+    // Startup Fail Policy: runtime DLL must exist and inject; never launch un-hooked.
+    let runtime_dll = crate::injection::resolve_runtime_dll()?;
+
     let child = spawn_suspended(
         &program,
         &args,
         req.working_directory.as_deref(),
         &encode_environment_block(&env),
+        &runtime_dll,
     )?;
 
     if let Err(err) = job.assign_pid(child.pid) {
-        let _ = child.kill_raw();
+        // Startup Fail Policy: never leave a suspended Root Process behind.
+        if let Err(kill_err) = child.kill_raw() {
+            return Err(LaunchError::CreateProcess(format!(
+                "job assign failed ({err}); also failed to terminate pid={}: {kill_err}",
+                child.pid
+            )));
+        }
         return Err(err.into());
     }
 
@@ -234,7 +246,12 @@ impl SpawnedChild {
     fn kill_raw(&self) -> Result<(), LaunchError> {
         use windows::Win32::System::Threading::TerminateProcess;
         unsafe {
-            let _ = TerminateProcess(self.process.0, 1);
+            if TerminateProcess(self.process.0, 1).is_err() {
+                return Err(LaunchError::CreateProcess(format!(
+                    "TerminateProcess failed (GetLastError={})",
+                    win::last_error()
+                )));
+            }
         }
         Ok(())
     }
@@ -246,12 +263,14 @@ fn spawn_suspended(
     args: &[String],
     working_directory: Option<&Path>,
     env_block: &[u16],
+    runtime_dll: &Path,
 ) -> Result<SpawnedChild, LaunchError> {
     use windows::Win32::System::Threading::{
-        CreateProcessW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-        STARTUPINFOW,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
     };
-    use windows::core::PCWSTR;
+    use windows::core::{PCWSTR, PWSTR};
+
+    let dll_ansi = crate::injection::dll_path_ansi(runtime_dll)?;
 
     let mut cmdline = quote_arg(&program.display().to_string());
     for a in args {
@@ -272,27 +291,30 @@ fn spawn_suspended(
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut pi = PROCESS_INFORMATION::default();
 
+    // DetourCreateProcessWithDllExW — CREATE_SUSPENDED then Resume after Job assign.
     unsafe {
-        let ok = CreateProcessW(
+        let ok = DetourCreateProcessWithDllExW(
             PCWSTR::null(),
-            windows::core::PWSTR(cmdline_w.as_mut_ptr()),
-            None,
-            None,
-            false,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            Some(env_block.as_ptr() as *const _),
+            PWSTR(cmdline_w.as_mut_ptr()),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            (CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT).0,
+            env_block.as_ptr() as *const _,
             cwd_w
                 .as_mut()
                 .map(|w| PCWSTR(w.as_ptr()))
                 .unwrap_or_else(PCWSTR::null),
-            &si,
+            &mut si,
             &mut pi,
+            dll_ansi.as_ptr(),
+            std::ptr::null(),
         );
-        if ok.is_err() {
-            return Err(LaunchError::CreateProcess(format!(
-                "CreateProcessW failed (GetLastError={})",
-                win::last_error()
-            )));
+        if ok == 0 {
+            return Err(crate::injection::InjectError::DetourCreateProcess(
+                win::last_error(),
+            )
+            .into());
         }
         Ok(SpawnedChild {
             pid: pi.dwProcessId,
@@ -302,16 +324,36 @@ fn spawn_suspended(
     }
 }
 
+// FFI to Microsoft Detours (static lib linked in build.rs).
+#[cfg(windows)]
+extern "system" {
+    fn DetourCreateProcessWithDllExW(
+        application_name: windows::core::PCWSTR,
+        command_line: windows::core::PWSTR,
+        process_attributes: *const core::ffi::c_void,
+        thread_attributes: *const core::ffi::c_void,
+        inherit_handles: i32,
+        creation_flags: u32,
+        environment: *const core::ffi::c_void,
+        current_directory: windows::core::PCWSTR,
+        startup_info: *mut windows::Win32::System::Threading::STARTUPINFOW,
+        process_information: *mut windows::Win32::System::Threading::PROCESS_INFORMATION,
+        dll_name: *const u8,
+        create_process_w: *const core::ffi::c_void,
+    ) -> i32;
+}
+
 #[cfg(not(windows))]
 fn spawn_suspended(
     program: &Path,
     args: &[String],
     working_directory: Option<&Path>,
     _env_block: &[u16],
+    _runtime_dll: &Path,
 ) -> Result<SpawnedChild, LaunchError> {
     let _ = (program, args, working_directory);
     Err(LaunchError::CreateProcess(
-        "CreateProcessW is Windows-only".into(),
+        "DetourCreateProcessWithDllExW is Windows-only".into(),
     ))
 }
 

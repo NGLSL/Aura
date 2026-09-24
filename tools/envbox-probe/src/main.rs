@@ -21,12 +21,38 @@ fn main() -> ExitCode {
 }
 
 fn print_parent() {
+    print_runtime_marker();
     let snapshot = collect_host_snapshot();
     println!("=== PARENT PROBE ===");
     print!("{}", snapshot.render());
 }
 
+/// Stable smoke marker when envbox-runtime is injected into this process (ticket 04).
+fn print_runtime_marker() {
+    if runtime_loaded() {
+        println!("EnvBox Runtime Loaded");
+    }
+}
+
+fn runtime_loaded() -> bool {
+    // Require the module to be mapped; env alone can false-positive from the Host.
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::core::w;
+        unsafe {
+            return GetModuleHandleW(w!("envbox-runtime64.dll")).is_ok()
+                || GetModuleHandleW(w!("envbox-runtime32.dll")).is_ok();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn print_child() {
+    print_runtime_marker();
     let snapshot = collect_host_snapshot();
     println!("=== CHILD PROBE ===");
     print!("{}", snapshot.render());
