@@ -1,0 +1,13 @@
+[package]
+name = "envbox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "envbox"
+path = "src/main.rs"
+
+[dependencies]
+envbox-core = { workspace = true }
+envbox-storage = { workspace = true }

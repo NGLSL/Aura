@@ -1,0 +1,10 @@
+[package]
+name = "envbox-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+envbox-core = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

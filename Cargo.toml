@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/envbox-core",
+    "crates/envbox-storage",
+    "crates/envbox-launcher",
+    "crates/envbox-cli",
+    "tools/envbox-probe",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/example/envbox"
+
+[workspace.dependencies]
+envbox-core = { path = "crates/envbox-core" }
+envbox-storage = { path = "crates/envbox-storage" }
+envbox-launcher = { path = "crates/envbox-launcher" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Time",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Environment",
+    "Win32_System_Registry",
+] }

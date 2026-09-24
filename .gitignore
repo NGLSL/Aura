@@ -1,0 +1,5 @@
+/target/
+*.user
+*.suo
+.vs/
+CMakeUserPresets.json
