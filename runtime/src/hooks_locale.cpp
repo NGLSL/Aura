@@ -4,7 +4,10 @@
 
 #include "hooks.h"
 
+#include <stdio.h>
 #include <wchar.h>
+
+#include "audit.h"
 
 static int(WINAPI* TrueGetUserDefaultLocaleName)(LPWSTR, int) =
     GetUserDefaultLocaleName;
@@ -35,8 +38,10 @@ static int WINAPI HookGetUserDefaultLocaleName(LPWSTR lpLocaleName,
                                                int cchLocaleName) {
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl != nullptr && pfl->has_locale) {
+    EnvBoxAuditEventW("GetUserDefaultLocaleName", 1, pfl->locale_name);
     return CopyProfileLocaleName(pfl->locale_name, lpLocaleName, cchLocaleName);
   }
+  EnvBoxAuditEvent("GetUserDefaultLocaleName", 0, nullptr);
   return TrueGetUserDefaultLocaleName(lpLocaleName, cchLocaleName);
 }
 
@@ -45,8 +50,10 @@ static int WINAPI HookGetSystemDefaultLocaleName(LPWSTR lpLocaleName,
   // Environment-consistent: same Profile locale as the user default.
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl != nullptr && pfl->has_locale) {
+    EnvBoxAuditEventW("GetSystemDefaultLocaleName", 1, pfl->locale_name);
     return CopyProfileLocaleName(pfl->locale_name, lpLocaleName, cchLocaleName);
   }
+  EnvBoxAuditEvent("GetSystemDefaultLocaleName", 0, nullptr);
   return TrueGetSystemDefaultLocaleName(lpLocaleName, cchLocaleName);
 }
 
@@ -60,12 +67,26 @@ static LCID ProfileLocaleLcid() {
 
 static LCID WINAPI HookGetUserDefaultLCID() {
   LCID lcid = ProfileLocaleLcid();
-  return lcid != 0 ? lcid : TrueGetUserDefaultLCID();
+  if (lcid != 0) {
+    char buf[16];
+    _snprintf_s(buf, _TRUNCATE, "0x%08x", (unsigned)lcid);
+    EnvBoxAuditEvent("GetUserDefaultLCID", 1, buf);
+    return lcid;
+  }
+  EnvBoxAuditEvent("GetUserDefaultLCID", 0, nullptr);
+  return TrueGetUserDefaultLCID();
 }
 
 static LCID WINAPI HookGetSystemDefaultLCID() {
   LCID lcid = ProfileLocaleLcid();
-  return lcid != 0 ? lcid : TrueGetSystemDefaultLCID();
+  if (lcid != 0) {
+    char buf[16];
+    _snprintf_s(buf, _TRUNCATE, "0x%08x", (unsigned)lcid);
+    EnvBoxAuditEvent("GetSystemDefaultLCID", 1, buf);
+    return lcid;
+  }
+  EnvBoxAuditEvent("GetSystemDefaultLCID", 0, nullptr);
+  return TrueGetSystemDefaultLCID();
 }
 
 // LOCALE_USER_DEFAULT (0x0400) / LOCALE_SYSTEM_DEFAULT (0x0800) map to Profile.
@@ -84,7 +105,14 @@ static LCID VirtualizeLcid(LCID lcid) {
 
 static int WINAPI HookGetLocaleInfoW(LCID Locale, LCTYPE LCType, LPWSTR lpLCData,
                                      int cchData) {
-  return TrueGetLocaleInfoW(VirtualizeLcid(Locale), LCType, lpLCData, cchData);
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  LCID v = VirtualizeLcid(Locale);
+  if (pfl != nullptr && pfl->has_locale && v != Locale) {
+    EnvBoxAuditEvent("GetLocaleInfoW", 1, "default-lcid-rewritten");
+  } else {
+    EnvBoxAuditEvent("GetLocaleInfoW", 0, nullptr);
+  }
+  return TrueGetLocaleInfoW(v, LCType, lpLCData, cchData);
 }
 
 // LOCALE_NAME_USER_DEFAULT is NULL; LOCALE_NAME_SYSTEM_DEFAULT is L"!".
@@ -102,8 +130,13 @@ static LPCWSTR VirtualizeLocaleName(LPCWSTR name, const RuntimeProfile* pfl) {
 static int WINAPI HookGetLocaleInfoEx(LPCWSTR lpLocaleName, LCTYPE LCType,
                                       LPWSTR lpLCData, int cchData) {
   const RuntimeProfile* pfl = EnvBoxProfile();
-  return TrueGetLocaleInfoEx(VirtualizeLocaleName(lpLocaleName, pfl), LCType,
-                             lpLCData, cchData);
+  LPCWSTR v = VirtualizeLocaleName(lpLocaleName, pfl);
+  if (v != lpLocaleName) {
+    EnvBoxAuditEventW("GetLocaleInfoEx", 1, pfl ? pfl->locale_name : L"");
+  } else {
+    EnvBoxAuditEvent("GetLocaleInfoEx", 0, nullptr);
+  }
+  return TrueGetLocaleInfoEx(v, LCType, lpLCData, cchData);
 }
 
 int EnvBoxInstallLocaleHooks() {

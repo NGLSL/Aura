@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "audit.h"
+
 static BOOL(WINAPI* TrueCreateProcessW)(
     LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
     LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION) = CreateProcessW;
@@ -143,6 +145,7 @@ static BOOL SpawnInjected(
   if (dll == nullptr) {
     // Startup Fail Policy: never create an unvirtualized child.
     SetLastError(ERROR_MOD_NOT_FOUND);
+    EnvBoxAuditEvent("CreateProcessW", 0, "no-runtime-dll");
     return FALSE;
   }
 
@@ -175,6 +178,7 @@ static BOOL SpawnInjected(
       lpProcessInformation->dwProcessId = 0;
     }
     SetLastError(err);
+    EnvBoxAuditEvent("CreateProcessW", 0, "inject-failed");
     return FALSE;
   }
 
@@ -188,9 +192,13 @@ static BOOL SpawnInjected(
       lpProcessInformation->hProcess = nullptr;
       lpProcessInformation->hThread = nullptr;
       SetLastError(err);
+      EnvBoxAuditEvent("CreateProcessW", 0, "inject-resume-failed");
       return FALSE;
     }
   }
+  // Never log command bodies or environment blocks (ticket 21).
+  EnvBoxAuditEvent("CreateProcessW", 1,
+                   caller_requested_suspended ? "inject-suspended" : "inject-resumed");
   return TRUE;
 }
 
@@ -204,10 +212,12 @@ static BOOL WINAPI HookCreateProcessW(
   if (pfl == nullptr) {
     // No profile: cannot virtualize; reject (Startup Fail Policy).
     SetLastError(ERROR_INVALID_DATA);
+    EnvBoxAuditEvent("CreateProcessW", 0, "no-profile");
     return FALSE;
   }
   if (!pfl->inherit_children) {
     // Application opted out of child propagation: plain create (root-only view).
+    EnvBoxAuditEvent("CreateProcessW", 0, "inherit-off-plain");
     return TrueCreateProcessW(lpApplicationName, lpCommandLine,
                               lpProcessAttributes, lpThreadAttributes,
                               bInheritHandles, dwCreationFlags, lpEnvironment,

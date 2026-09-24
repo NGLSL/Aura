@@ -121,9 +121,12 @@ void EnvBoxAuditEvent(const char* api, int virtualized, const char* summary) {
   if (!g_audit_on || api == nullptr) {
     return;
   }
+  // Preserve GetLastError across audit I/O (AGENTS.md; CreateProcessW contract).
+  DWORD last_err = GetLastError();
   AcquireSRWLockExclusive(&g_lock);
   if (g_audit == INVALID_HANDLE_VALUE) {
     ReleaseSRWLockExclusive(&g_lock);
+    SetLastError(last_err);
     return;
   }
   if (g_ppid == 0) {
@@ -160,6 +163,33 @@ void EnvBoxAuditEvent(const char* api, int virtualized, const char* summary) {
     FlushFileBuffers(g_audit);
   }
   ReleaseSRWLockExclusive(&g_lock);
+  SetLastError(last_err);
+}
+
+void EnvBoxAuditEventW(const char* api, int virtualized, const wchar_t* summary) {
+  if (!g_audit_on) {
+    EnvBoxAuditEvent(api, virtualized, nullptr);
+    return;
+  }
+  DWORD last_err = GetLastError();
+  if (summary == nullptr) {
+    EnvBoxAuditEvent(api, virtualized, nullptr);
+    SetLastError(last_err);
+    return;
+  }
+  char utf8[192];
+  utf8[0] = '\0';
+  int n = WideCharToMultiByte(CP_UTF8, 0, summary, -1, utf8, (int)sizeof(utf8),
+                              nullptr, nullptr);
+  if (n <= 0) {
+    // Truncate rather than drop the whole summary.
+    wchar_t clipped[96];
+    wcsncpy_s(clipped, summary, _TRUNCATE);
+    WideCharToMultiByte(CP_UTF8, 0, clipped, -1, utf8, (int)sizeof(utf8),
+                        nullptr, nullptr);
+  }
+  EnvBoxAuditEvent(api, virtualized, utf8);
+  SetLastError(last_err);
 }
 
 void EnvBoxAuditShutdown(void) {

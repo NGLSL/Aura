@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "audit.h"
+
 #ifndef MUI_LANGUAGE_ID
 #define MUI_LANGUAGE_ID 0x4
 #endif
@@ -49,13 +51,27 @@ static LANGID ProfileUiLangId() {
 
 static LANGID WINAPI HookGetUserDefaultUILanguage() {
   LANGID id = ProfileUiLangId();
-  return id != 0 ? id : TrueGetUserDefaultUILanguage();
+  if (id != 0) {
+    char buf[16];
+    _snprintf_s(buf, _TRUNCATE, "0x%04x", (unsigned)id);
+    EnvBoxAuditEvent("GetUserDefaultUILanguage", 1, buf);
+    return id;
+  }
+  EnvBoxAuditEvent("GetUserDefaultUILanguage", 0, nullptr);
+  return TrueGetUserDefaultUILanguage();
 }
 
 static LANGID WINAPI HookGetSystemDefaultUILanguage() {
   // Environment-consistent with user UI language.
   LANGID id = ProfileUiLangId();
-  return id != 0 ? id : TrueGetSystemDefaultUILanguage();
+  if (id != 0) {
+    char buf[16];
+    _snprintf_s(buf, _TRUNCATE, "0x%04x", (unsigned)id);
+    EnvBoxAuditEvent("GetSystemDefaultUILanguage", 1, buf);
+    return id;
+  }
+  EnvBoxAuditEvent("GetSystemDefaultUILanguage", 0, nullptr);
+  return TrueGetSystemDefaultUILanguage();
 }
 
 typedef BOOL(WINAPI* PreferredFn)(DWORD, PULONG, PZZWSTR, PULONG);
@@ -77,13 +93,14 @@ static std::wstring ProfileUiToken(DWORD dwFlags, bool* ok) {
 }
 
 // Profile token first, then unique host items (same form as dwFlags requests).
-static BOOL WINAPI HookPreferredUILanguages(PreferredFn true_fn, DWORD dwFlags,
-                                            PULONG pulNumLanguages,
+static BOOL WINAPI HookPreferredUILanguages(const char* api_name, PreferredFn true_fn,
+                                            DWORD dwFlags, PULONG pulNumLanguages,
                                             PZZWSTR pwszLanguagesBuffer,
                                             PULONG pcchLanguagesBuffer) {
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl == nullptr || !pfl->has_ui || pulNumLanguages == nullptr ||
       pcchLanguagesBuffer == nullptr) {
+    EnvBoxAuditEvent(api_name, 0, nullptr);
     return true_fn(dwFlags, pulNumLanguages, pwszLanguagesBuffer,
                    pcchLanguagesBuffer);
   }
@@ -96,6 +113,7 @@ static BOOL WINAPI HookPreferredUILanguages(PreferredFn true_fn, DWORD dwFlags,
     host.resize(host_size);
     ULONG size2 = host_size;
     if (!true_fn(dwFlags, &host_count, host.data(), &size2)) {
+      EnvBoxAuditEvent(api_name, 0, "fail-open");
       return true_fn(dwFlags, pulNumLanguages, pwszLanguagesBuffer,
                      pcchLanguagesBuffer);
     }
@@ -104,6 +122,7 @@ static BOOL WINAPI HookPreferredUILanguages(PreferredFn true_fn, DWORD dwFlags,
   bool token_ok = false;
   std::wstring head = ProfileUiToken(dwFlags, &token_ok);
   if (!token_ok) {
+    EnvBoxAuditEvent(api_name, 0, "fail-open");
     return true_fn(dwFlags, pulNumLanguages, pwszLanguagesBuffer,
                    pcchLanguagesBuffer);
   }
@@ -129,11 +148,13 @@ static BOOL WINAPI HookPreferredUILanguages(PreferredFn true_fn, DWORD dwFlags,
   if (pwszLanguagesBuffer == nullptr) {
     *pulNumLanguages = (ULONG)items.size();
     *pcchLanguagesBuffer = (ULONG)total;
+    EnvBoxAuditEventW(api_name, 1, head.c_str());
     return TRUE;
   }
   if (*pcchLanguagesBuffer < total) {
     *pulNumLanguages = (ULONG)items.size();
     *pcchLanguagesBuffer = (ULONG)total;
+    EnvBoxAuditEvent(api_name, 1, "insufficient-buffer");
     SetLastError(ERROR_INSUFFICIENT_BUFFER);
     return FALSE;
   }
@@ -142,6 +163,7 @@ static BOOL WINAPI HookPreferredUILanguages(PreferredFn true_fn, DWORD dwFlags,
   for (const auto& s : items) {
     if (remaining <= s.size()) {
       *pcchLanguagesBuffer = (ULONG)total;
+      EnvBoxAuditEvent(api_name, 1, "insufficient-buffer");
       SetLastError(ERROR_INSUFFICIENT_BUFFER);
       return FALSE;
     }
@@ -152,6 +174,7 @@ static BOOL WINAPI HookPreferredUILanguages(PreferredFn true_fn, DWORD dwFlags,
   *out = L'\0';
   *pulNumLanguages = (ULONG)items.size();
   *pcchLanguagesBuffer = (ULONG)total;
+  EnvBoxAuditEventW(api_name, 1, head.c_str());
   return TRUE;
 }
 
@@ -159,7 +182,8 @@ static BOOL WINAPI HookGetUserPreferredUILanguages(DWORD dwFlags,
                                                    PULONG pulNumLanguages,
                                                    PZZWSTR pwszLanguagesBuffer,
                                                    PULONG pcchLanguagesBuffer) {
-  return HookPreferredUILanguages(TrueGetUserPreferredUILanguages, dwFlags,
+  return HookPreferredUILanguages("GetUserPreferredUILanguages",
+                                  TrueGetUserPreferredUILanguages, dwFlags,
                                   pulNumLanguages, pwszLanguagesBuffer,
                                   pcchLanguagesBuffer);
 }
@@ -168,7 +192,8 @@ static BOOL WINAPI HookGetSystemPreferredUILanguages(DWORD dwFlags,
                                                      PULONG pulNumLanguages,
                                                      PZZWSTR pwszLanguagesBuffer,
                                                      PULONG pcchLanguagesBuffer) {
-  return HookPreferredUILanguages(TrueGetSystemPreferredUILanguages, dwFlags,
+  return HookPreferredUILanguages("GetSystemPreferredUILanguages",
+                                  TrueGetSystemPreferredUILanguages, dwFlags,
                                   pulNumLanguages, pwszLanguagesBuffer,
                                   pcchLanguagesBuffer);
 }
@@ -177,7 +202,8 @@ static BOOL WINAPI HookGetThreadPreferredUILanguages(DWORD dwFlags,
                                                      PULONG pulNumLanguages,
                                                      PZZWSTR pwszLanguagesBuffer,
                                                      PULONG pcchLanguagesBuffer) {
-  return HookPreferredUILanguages(TrueGetThreadPreferredUILanguages, dwFlags,
+  return HookPreferredUILanguages("GetThreadPreferredUILanguages",
+                                  TrueGetThreadPreferredUILanguages, dwFlags,
                                   pulNumLanguages, pwszLanguagesBuffer,
                                   pcchLanguagesBuffer);
 }
@@ -185,7 +211,8 @@ static BOOL WINAPI HookGetThreadPreferredUILanguages(DWORD dwFlags,
 static BOOL WINAPI HookGetProcessPreferredUILanguages(
     DWORD dwFlags, PULONG pulNumLanguages, PZZWSTR pwszLanguagesBuffer,
     PULONG pcchLanguagesBuffer) {
-  return HookPreferredUILanguages(TrueGetProcessPreferredUILanguages, dwFlags,
+  return HookPreferredUILanguages("GetProcessPreferredUILanguages",
+                                  TrueGetProcessPreferredUILanguages, dwFlags,
                                   pulNumLanguages, pwszLanguagesBuffer,
                                   pcchLanguagesBuffer);
 }

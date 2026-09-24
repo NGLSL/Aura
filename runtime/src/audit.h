@@ -12,5 +12,8 @@ void EnvBoxAuditInit(const RuntimeProfile* pfl);
 // Append one Audit Event. No-op when audit is off or sink is unavailable.
 void EnvBoxAuditEvent(const char* api, int virtualized, const char* summary);
 
+// Wide summary convenience (UTF-8 into the event). No-op when audit is off.
+void EnvBoxAuditEventW(const char* api, int virtualized, const wchar_t* summary);
+
 // Close sink. Safe to call multiple times.
 void EnvBoxAuditShutdown(void);

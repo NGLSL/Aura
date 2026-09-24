@@ -6,6 +6,8 @@
 
 #include <wchar.h>
 
+#include "audit.h"
+
 static DWORD(WINAPI* TrueGetDynamicTimeZoneInformation)(
     PDYNAMIC_TIME_ZONE_INFORMATION) = GetDynamicTimeZoneInformation;
 static DWORD(WINAPI* TrueGetTimeZoneInformation)(LPTIME_ZONE_INFORMATION) =
@@ -83,8 +85,10 @@ static DWORD WINAPI HookGetDynamicTimeZoneInformation(
   DYNAMIC_TIME_ZONE_INFORMATION info = {};
   if (p != nullptr && FillProfileDynamic(&info)) {
     *p = info;
+    EnvBoxAuditEventW("GetDynamicTimeZoneInformation", 1, info.TimeZoneKeyName);
     return TimeZoneIdFromInfo(&info);
   }
+  EnvBoxAuditEvent("GetDynamicTimeZoneInformation", 0, nullptr);
   return TrueGetDynamicTimeZoneInformation(p);
 }
 
@@ -93,21 +97,24 @@ static DWORD WINAPI HookGetTimeZoneInformation(
   DYNAMIC_TIME_ZONE_INFORMATION dyn = {};
   if (lpTimeZoneInformation != nullptr && FillProfileDynamic(&dyn)) {
     DynamicToClassic(&dyn, lpTimeZoneInformation);
+    EnvBoxAuditEventW("GetTimeZoneInformation", 1, dyn.TimeZoneKeyName);
     return TimeZoneIdFromInfo(&dyn);
   }
+  EnvBoxAuditEvent("GetTimeZoneInformation", 0, nullptr);
   return TrueGetTimeZoneInformation(lpTimeZoneInformation);
 }
 
 static BOOL WINAPI HookGetTimeZoneInformationForYear(
     USHORT wYear, PDYNAMIC_TIME_ZONE_INFORMATION pdtzi,
     LPTIME_ZONE_INFORMATION ptzi) {
-  // Virtualize the *current* zone (NULL pdtzi). Explicit zone queries pass through.
   if (pdtzi == nullptr) {
     DYNAMIC_TIME_ZONE_INFORMATION dyn = {};
     if (FillProfileDynamic(&dyn)) {
+      EnvBoxAuditEventW("GetTimeZoneInformationForYear", 1, dyn.TimeZoneKeyName);
       return TrueGetTimeZoneInformationForYear(wYear, &dyn, ptzi);
     }
   }
+  EnvBoxAuditEvent("GetTimeZoneInformationForYear", 0, nullptr);
   return TrueGetTimeZoneInformationForYear(wYear, pdtzi, ptzi);
 }
 
@@ -136,12 +143,27 @@ static const DYNAMIC_TIME_ZONE_INFORMATION* ProfileDynamicOrNull(
   return scratch;
 }
 
+// Null lpTimeZoneInformation means "use default zone": that path is virtualized
+// to Profile when has_tz. Explicit zone stays caller-owned (not virtualized).
+static void AuditTzConvert(const char* api, int null_zone, int used_profile,
+                           const wchar_t* tz_key) {
+  if (null_zone && used_profile) {
+    EnvBoxAuditEventW(api, 1, tz_key ? tz_key : L"tz-default");
+  } else {
+    EnvBoxAuditEvent(api, 0, nullptr);
+  }
+}
+
 static BOOL WINAPI HookSystemTimeToTzSpecificLocalTime(
     const TIME_ZONE_INFORMATION* lpTimeZoneInformation,
     const SYSTEMTIME* lpUniversalTime, LPSYSTEMTIME lpLocalTime) {
   TIME_ZONE_INFORMATION scratch = {};
   const TIME_ZONE_INFORMATION* z =
       ProfileClassicOrNull(lpTimeZoneInformation, &scratch);
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  AuditTzConvert("SystemTimeToTzSpecificLocalTime",
+                 lpTimeZoneInformation == nullptr, z != nullptr,
+                 (pfl != nullptr && pfl->has_tz) ? pfl->tz_windows : nullptr);
   return TrueSystemTimeToTzSpecificLocalTime(z, lpUniversalTime, lpLocalTime);
 }
 
@@ -151,6 +173,10 @@ static BOOL WINAPI HookSystemTimeToTzSpecificLocalTimeEx(
   DYNAMIC_TIME_ZONE_INFORMATION scratch = {};
   const DYNAMIC_TIME_ZONE_INFORMATION* z =
       ProfileDynamicOrNull(lpTimeZoneInformation, &scratch);
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  AuditTzConvert("SystemTimeToTzSpecificLocalTimeEx",
+                 lpTimeZoneInformation == nullptr, z != nullptr,
+                 (pfl != nullptr && pfl->has_tz) ? pfl->tz_windows : nullptr);
   return TrueSystemTimeToTzSpecificLocalTimeEx(z, lpUniversalTime, lpLocalTime);
 }
 
@@ -160,6 +186,10 @@ static BOOL WINAPI HookTzSpecificLocalTimeToSystemTime(
   TIME_ZONE_INFORMATION scratch = {};
   const TIME_ZONE_INFORMATION* z =
       ProfileClassicOrNull(lpTimeZoneInformation, &scratch);
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  AuditTzConvert("TzSpecificLocalTimeToSystemTime",
+                 lpTimeZoneInformation == nullptr, z != nullptr,
+                 (pfl != nullptr && pfl->has_tz) ? pfl->tz_windows : nullptr);
   return TrueTzSpecificLocalTimeToSystemTime(z, lpLocalTime, lpUniversalTime);
 }
 
@@ -169,6 +199,10 @@ static BOOL WINAPI HookTzSpecificLocalTimeToSystemTimeEx(
   DYNAMIC_TIME_ZONE_INFORMATION scratch = {};
   const DYNAMIC_TIME_ZONE_INFORMATION* z =
       ProfileDynamicOrNull(lpTimeZoneInformation, &scratch);
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  AuditTzConvert("TzSpecificLocalTimeToSystemTimeEx",
+                 lpTimeZoneInformation == nullptr, z != nullptr,
+                 (pfl != nullptr && pfl->has_tz) ? pfl->tz_windows : nullptr);
   return TrueTzSpecificLocalTimeToSystemTimeEx(z, lpLocalTime, lpUniversalTime);
 }
 

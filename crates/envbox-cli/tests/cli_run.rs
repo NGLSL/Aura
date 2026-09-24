@@ -942,6 +942,20 @@ fn run_audit_on_writes_instance_jsonl() {
     assert!(text.contains("\"v\":1"), "schema version:\n{text}");
     // Wire contract: summary omitted only when absent; init has summary.
     assert!(text.contains("\"summary\":\"schema=v1\""), "init summary:\n{text}");
+    // Hook recording (ticket 21): Probe exercises core virtualized APIs.
+    for api in [
+        "GetDynamicTimeZoneInformation",
+        "GetUserDefaultGeoName",
+        "GetUserDefaultLocaleName",
+        "GetUserDefaultUILanguage",
+        "GetNetworkParams",
+    ] {
+        assert!(
+            text.contains(&format!("\"api\":\"{api}\"")),
+            "expected audit hit for {api}:\n{text}"
+        );
+    }
+    assert!(text.contains("\"virtualized\":true"), "virtualized hits:\n{text}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

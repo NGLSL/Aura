@@ -6,6 +6,8 @@
 
 #include <wchar.h>
 
+#include "audit.h"
+
 #ifndef GEOCLASS_NATION
 #define GEOCLASS_NATION 16
 #endif
@@ -51,17 +53,21 @@ static int CopyProfileGeoName(const wchar_t* src, LPWSTR dst, int cch) {
 static int WINAPI HookGetUserDefaultGeoName(LPWSTR lpGeoName, int cchGeoName) {
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl != nullptr && pfl->has_region) {
+    EnvBoxAuditEventW("GetUserDefaultGeoName", 1, pfl->region);
     return CopyProfileGeoName(pfl->region, lpGeoName, cchGeoName);
   }
+  EnvBoxAuditEvent("GetUserDefaultGeoName", 0, nullptr);
   return TrueGetUserDefaultGeoName(lpGeoName, cchGeoName);
 }
 
 static GEOID WINAPI HookGetUserGeoID(GEOCLASS GeoClass) {
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl != nullptr && pfl->has_region && GeoClass == GEOCLASS_NATION) {
+    EnvBoxAuditEventW("GetUserGeoID", 1, pfl->region);
     // Unknown region -> GEOID_NOT_FOUND (0), never Host (would contradict GeoName).
     return GeoIdFromRegion(pfl->region);
   }
+  EnvBoxAuditEvent("GetUserGeoID", 0, nullptr);
   return TrueGetUserGeoID(GeoClass);
 }
 

@@ -17,6 +17,8 @@
 #include "hooks.h"
 #include "runtime_profile.h"
 
+#include "audit.h"
+
 static DWORD(WINAPI* TrueGetNetworkParams)(PFIXED_INFO, PULONG) =
     GetNetworkParams;
 static ULONG(WINAPI* TrueGetAdaptersAddresses)(ULONG, ULONG, PVOID,
@@ -112,9 +114,15 @@ static void BuildDnsView() {
 static DWORD WINAPI HookGetNetworkParams(PFIXED_INFO pFixedInfo,
                                          PULONG pOutBufLen) {
   DWORD status = TrueGetNetworkParams(pFixedInfo, pOutBufLen);
-  if (status != ERROR_SUCCESS || pFixedInfo == nullptr || !g_view_active) {
-    return status;  // Host mode / Fail Open
+  if (status != ERROR_SUCCESS || pFixedInfo == nullptr) {
+    EnvBoxAuditEvent("GetNetworkParams", 0, "fail-open");
+    return status;
   }
+  if (!g_view_active) {
+    EnvBoxAuditEvent("GetNetworkParams", 0, "dns-host");
+    return status;
+  }
+  EnvBoxAuditEvent("GetNetworkParams", 1, "dns-virtual-view");
   // Always replace (never leave Host list when VirtualView is active).
   // CurrentDnsServer points at the first Profile server or is cleared.
   pFixedInfo->CurrentDnsServer = nullptr;
@@ -156,9 +164,15 @@ static ULONG WINAPI HookGetAdaptersAddresses(
     PIP_ADAPTER_ADDRESSES AdapterAddresses, PULONG SizePointer) {
   ULONG status = TrueGetAdaptersAddresses(Family, Flags, Reserved,
                                           AdapterAddresses, SizePointer);
-  if (status != ERROR_SUCCESS || AdapterAddresses == nullptr || !g_view_active) {
+  if (status != ERROR_SUCCESS || AdapterAddresses == nullptr) {
+    EnvBoxAuditEvent("GetAdaptersAddresses", 0, "fail-open");
     return status;
   }
+  if (!g_view_active) {
+    EnvBoxAuditEvent("GetAdaptersAddresses", 0, "dns-host");
+    return status;
+  }
+  EnvBoxAuditEvent("GetAdaptersAddresses", 1, "dns-virtual-view");
   int count = 0;
   IP_ADAPTER_DNS_SERVER_ADDRESS* chain = ChainForFamily(Family, &count);
   for (PIP_ADAPTER_ADDRESSES a = AdapterAddresses; a != nullptr; a = a->Next) {

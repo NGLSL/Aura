@@ -14,6 +14,8 @@
 #include "hooks.h"
 #include "runtime_profile.h"
 
+#include "audit.h"
+
 #ifndef ENVBOX_REG_TRACK
 #define ENVBOX_REG_TRACK 512
 #endif
@@ -282,8 +284,12 @@ static LSTATUS WINAPI HookRegQueryValueExW(HKEY hKey, LPCWSTR lpValueName,
   if (LookupPath(hKey, path, 260) && IsWhitelisted(path)) {
     VirtualResult v = VirtualValue(path, lpValueName, lpType, lpData, lpcbData);
     if (v != kVirtualMiss) {
+      EnvBoxAuditEventW("RegQueryValueExW", 1,
+                        lpValueName ? lpValueName : L"(default)");
       return VirtualToStatus(v);
     }
+    EnvBoxAuditEventW("RegQueryValueExW", 0,
+                      lpValueName ? lpValueName : L"(default)");
   }
   return TrueRegQueryValueExW(hKey, lpValueName, lpReserved, lpType, lpData,
                               lpcbData);
@@ -312,10 +318,10 @@ static LSTATUS WINAPI HookRegGetValueW(HKEY hkey, LPCWSTR lpSubKey,
         if ((want & RRF_RT_REG_BINARY) && t == REG_BINARY) match = 1;
         if ((want & RRF_RT_REG_EXPAND_SZ) && t == REG_EXPAND_SZ) match = 1;
         if (!match) {
-          // Type mismatch: behave like Windows miss for this flag.
           if ((dwFlags & RRF_ZEROONFAILURE) && pvData && pcbData) {
             memset(pvData, 0, *pcbData);
           }
+          EnvBoxAuditEventW("RegGetValueW", 1, lpValue ? lpValue : L"(default)");
           return ERROR_UNSUPPORTED_TYPE;
         }
       }
@@ -324,8 +330,10 @@ static LSTATUS WINAPI HookRegGetValueW(HKEY hkey, LPCWSTR lpSubKey,
           pcbData) {
         memset(pvData, 0, *pcbData);
       }
+      EnvBoxAuditEventW("RegGetValueW", 1, lpValue ? lpValue : L"(default)");
       return st;
     }
+    EnvBoxAuditEventW("RegGetValueW", 0, lpValue ? lpValue : L"(default)");
   }
   return TrueRegGetValueW(hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData,
                           pcbData);
