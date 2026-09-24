@@ -3,6 +3,7 @@ name = "envbox-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "envbox-app"
@@ -13,4 +14,12 @@ envbox-core = { workspace = true }
 envbox-storage = { workspace = true }
 envbox-launcher = { workspace = true }
 uuid = { workspace = true }
-iced = { version = "0.13", features = ["tokio"] }
+iced = { version = "0.13", features = ["tokio", "image", "svg"] }
+iced_graphics = "0.13"
+image = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
+[build-dependencies]
+winres = "0.1"

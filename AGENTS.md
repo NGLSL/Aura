@@ -12,14 +12,19 @@ EnvBox 是 Windows 原生的进程级环境虚拟化启动器。目标程序直�
 
 ## 目录
 
-- `crates/envbox-app/`：Iced GUI（最后做）
+- `crates/envbox-app/`：Iced GUI
+  - `src/main.rs`：装配（窗口、主题、入口），不含业务
+  - `src/app.rs`：EnvBoxApp 状态与 update / save / run
+  - `src/views/`：三栏壳与各页渲染（nav / apps / profiles / instances / audit / settings / detail）
+  - `src/theme.rs`：色板与控件样式；`src/widgets.rs`：表单原语；`src/message.rs`：UI 消息
 - `crates/envbox-core/`：Application / Profile / RuntimeInstance 领域模型
 - `crates/envbox-storage/`：TOML 持久化与校验
 - `crates/envbox-launcher/`：命令解析、Environment Block、Job Object、注入
 - `crates/envbox-cli/`：`envbox run` 等命令行入口
 - `runtime/`：C++/Detours Runtime（`envbox-runtime32/64.dll`，按 hooks 分模块）
 - `tools/envbox-probe/`：环境探针，验收基准
-- `docs/`：领域词汇、ADR、开发文档
+- `icons/`：应用图标（多尺寸 PNG + icon.ico，规格对齐 Veya）
+- `docs/`：领域词汇、ADR、设计稿
 - `.scratch/`：本地 Markdown issue tracker（spec 与 tickets）
 
 ## 开发规则

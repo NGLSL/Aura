@@ -3,3 +3,7 @@
 *.suo
 .vs/
 CMakeUserPresets.json
+
+
+artifacts/
+.zcode/

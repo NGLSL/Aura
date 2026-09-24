@@ -12,6 +12,9 @@
 | **Process Tree Instance** | 隔离单位：Root Process 及其子进程树；不是可执行文件名 |
 | **Root Process** | EnvBox 直接创建的进程；后续子进程经注入继承 Profile |
 | **LaunchTarget** | 启动方式：完整/PATH 解析的 Executable，或 Command（含 `.cmd`/`.bat` wrapper） |
+| **Packaging** | 目标的打包模型：Win32 / Packaged Win32（Full Trust）/ AppContainer（UWP）/ PackagedUnknown。按 Package Identity 判断，不按目录 |
+| **AUMID** | AppUserModelId；打包应用的激活标识（`PackageFamilyName!ApplicationId`） |
+| **Injection Support** | Runtime 注入能力：Supported（挂起注入）/ Delayed（激活后注入）/ Unsupported（AppContainer 等，拒绝启动，不静默降级） |
 | **Host** | 宿主 Windows 系统配置与真实时间线；EnvBox 不得修改 Host |
 | **Probe（envbox-probe）** | 打印全部待虚拟化环境值的验收基准工具 |
 

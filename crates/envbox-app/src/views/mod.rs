@@ -1,0 +1,14 @@
+//! Iced views for the dark three-column shell.
+//! State lives in `crate::app`; this module only renders.
+
+mod apps;
+mod audit;
+mod detail;
+mod instances;
+mod nav;
+mod picker;
+mod profiles;
+mod settings;
+mod shell;
+
+pub use shell::view;

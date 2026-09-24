@@ -1,0 +1,170 @@
+//! Full-page audit log.
+
+use iced::widget::{button, column, container, row, scrollable, text};
+use iced::{Alignment, Element, Fill, Length, Padding};
+
+use crate::app::EnvBoxApp;
+use crate::font;
+use crate::icons::{icon, Icon};
+use crate::message::Message;
+use crate::theme::{self, BORDER, FAINT, INK, INK_2, MUTED, SUCCESS_BG, SUCCESS_TEXT};
+use crate::widgets::{badge, empty_state, primary_btn, secondary_btn};
+
+pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
+    use crate::message::Nav;
+
+    let total = app.audit_events.len();
+
+    let header = row![
+        column![
+            text("安全审计").size(24).color(INK).font(font::name_font()),
+            text(format!(
+                "实时观测台 · 共捕获 {} 条环境读取拦截事件 · 只读记录，不改变虚拟化语义",
+                total
+            ))
+            .size(12)
+            .color(MUTED)
+            .font(font::ui_font()),
+        ]
+        .spacing(4)
+        .width(Fill),
+        row![
+            button(
+                row![
+                    icon(Icon::Folder, INK_2, 12.0),
+                    text("打开日志目录").size(12).color(INK_2).font(font::ui_font())
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([7, 14]))
+            .style(secondary_btn)
+            .on_press(Message::OpenAuditDir),
+            button(
+                row![
+                    icon(Icon::Document, INK_2, 12.0),
+                    text("刷新日志").size(12).color(INK_2).font(font::ui_font())
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([7, 14]))
+            .style(secondary_btn)
+            .on_press(Message::AuditRefresh),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .align_y(Alignment::Center);
+
+    let content: Element<_> = if app.audit_events.is_empty() {
+        let guide_btn = button(
+            row![
+                icon(Icon::Play, INK, 11.0),
+                text("前往应用配置开启审计")
+                    .size(13)
+                    .color(INK)
+                    .font(font::name_font()),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .padding(Padding::from([9, 20]))
+        .style(primary_btn)
+        .on_press(Message::Nav(Nav::Apps));
+
+        empty_state(
+            Icon::Document,
+            "暂无环境调用拦截记录",
+            "在应用配置中勾选开启「审计环境读取 (Audit Mode)」，运行该应用时所有对 Windows 时区、区域、语言及 DNS 的敏感读取都将在此毫秒级记录。",
+            Some(guide_btn.into()),
+        )
+    } else {
+        let table_header = container(
+            row![
+                text("时间戳 (UTC)")
+                    .size(11)
+                    .color(FAINT)
+                    .font(font::ui_font())
+                    .width(Length::Fixed(90.0)),
+                text("进程 PID")
+                    .size(11)
+                    .color(FAINT)
+                    .font(font::ui_font())
+                    .width(Length::Fixed(75.0)),
+                text("系统 API 拦截调用与虚拟化返回结果")
+                    .size(11)
+                    .color(FAINT)
+                    .font(font::ui_font())
+                    .width(Fill),
+                text("判定状态")
+                    .size(11)
+                    .color(FAINT)
+                    .font(font::ui_font())
+                    .width(Length::Fixed(90.0)),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .padding(Padding::from([6, 14]))
+        .width(Fill);
+
+        let rows = app.audit_events.iter().rev().fold(
+            column![].spacing(6),
+            |col, ev| {
+                let summary = ev.summary.clone().unwrap_or_default();
+                let bg = if ev.virtualized { SUCCESS_BG } else { BORDER };
+                let fg = if ev.virtualized { SUCCESS_TEXT } else { MUTED };
+                let label = if ev.virtualized { "VIRTUALIZED" } else { "HOST PASS" };
+                let call_str = if summary.is_empty() {
+                    format!("{}()", ev.api)
+                } else {
+                    format!("{}() → {}", ev.api, summary)
+                };
+
+                let card = container(
+                    row![
+                        text(&ev.ts_utc)
+                            .size(11)
+                            .color(MUTED)
+                            .font(font::ui_font())
+                            .width(Length::Fixed(90.0)),
+                        text(format!("#{}", ev.pid))
+                            .size(11)
+                            .color(theme::ACCENT_TEXT)
+                            .font(font::ui_font())
+                            .width(Length::Fixed(75.0)),
+                        text(call_str)
+                            .size(12)
+                            .color(INK_2)
+                            .font(font::name_font())
+                            .width(Fill),
+                        badge(label, bg, fg),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([9, 14]))
+                .width(Fill)
+                .style(theme::inner_card_style);
+
+                col.push(card)
+            },
+        );
+
+        column![
+            table_header,
+            scrollable(rows)
+                .height(Fill)
+                .style(theme::dark_scrollable)
+        ]
+        .spacing(6)
+        .into()
+    };
+
+    column![header, content]
+        .spacing(16)
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
