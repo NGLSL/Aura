@@ -6,7 +6,7 @@ Parent: .scratch/envbox-v01/spec.md
 
 **Blocked by:** 10 GUI — Application 管理 + Run/Stop
 
-**Status:** done
+**Status:** resolved
 
 - [x] Profile 编辑：Region、Locale、UI Language、Timezone（Windows 枚举下拉）、DNS Host/Custom View、Environment Variables
 - [x] 保存前校验，不合法不得写入

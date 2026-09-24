@@ -29,6 +29,7 @@ enum Tab {
     Applications,
     Profiles,
     Instances,
+    About,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +548,7 @@ impl EnvBoxApp {
             tab_btn("Applications", Tab::Applications, self.tab),
             tab_btn("Profiles", Tab::Profiles, self.tab),
             tab_btn("Instances", Tab::Instances, self.tab),
+            tab_btn("About", Tab::About, self.tab),
         ]
         .spacing(8);
 
@@ -554,6 +556,7 @@ impl EnvBoxApp {
             Tab::Applications => self.view_applications(),
             Tab::Profiles => self.view_profiles(),
             Tab::Instances => self.view_instances(),
+            Tab::About => self.view_about(),
         };
 
         container(
@@ -687,6 +690,24 @@ impl EnvBoxApp {
             scrollable(form).width(Fill)
         ]
         .spacing(12)
+        .into()
+    }
+
+    fn view_about(&self) -> Element<'_, Message> {
+        column![
+            text("EnvBox").size(20),
+            text(
+                "EnvBox does not provide a security boundary; launched apps keep the current user’s filesystem and permissions."
+            )
+            .size(14),
+            text(
+                "Process-scoped environment virtualization only. Not a sandbox. Host configuration is never modified."
+            )
+            .size(14),
+            text("See README.md for security posture and scope.").size(14),
+        ]
+        .spacing(8)
+        .width(Fill)
         .into()
     }
 

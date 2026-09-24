@@ -6,7 +6,7 @@ Parent: .scratch/envbox-v01/spec.md
 
 **Blocked by:** 06 子进程传播（Process Tree Instance）
 
-**Status:** done
+**Status:** resolved
 
 - [x] Application 字段：Name、Launch type（Executable/Command）、路径/命令、Arguments、Working Directory、Default Profile、子进程继承开关
 - [x] Save / Run / Delete 可用；配置写入 storage

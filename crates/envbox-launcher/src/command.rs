@@ -18,11 +18,9 @@ pub struct ResolvedCommand {
     pub comspec_payload: Option<String>,
 }
 
-const PATH_EXTS: [&str; 5] = ["", ".exe", ".com", ".cmd", ".bat"];
-
 /// PATH resolution order: absolute/relative path, then PATH `.exe`/`.com`/`.cmd`/`.bat`.
 /// `.cmd`/`.bat` are wrapped with `%ComSpec% /d /s /c`.
-/// Only existing files are accepted (directories never resolve).
+/// Extension-less candidates must be PE images (npm shims are not; prefer `.cmd`).
 pub fn resolve_command(command: &str, path_env: Option<&str>) -> Result<ResolvedCommand, CommandError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -35,6 +33,8 @@ pub fn resolve_command(command: &str, path_env: Option<&str>) -> Result<Resolved
     }
 
     let search = path_env.unwrap_or("");
+    // Prefer explicit PE / script extensions over bare npm shims (no extension).
+    const PATH_EXTS: [&str; 5] = [".exe", ".com", ".cmd", ".bat", ""];
     for dir in std::env::split_paths(search) {
         for ext in PATH_EXTS {
             let name = if ext.is_empty() || trimmed.to_ascii_lowercase().ends_with(ext) {
@@ -44,12 +44,25 @@ pub fn resolve_command(command: &str, path_env: Option<&str>) -> Result<Resolved
             };
             let full = dir.join(&name);
             if full.is_file() {
+                if ext.is_empty() && !is_pe_image(&full) {
+                    continue;
+                }
                 return classify_path(&full, trimmed);
             }
         }
     }
 
     Err(CommandError::CommandNotFound(command.to_string()))
+}
+
+fn is_pe_image(path: &Path) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 2];
+    matches!(f.read_exact(&mut magic), Ok(())) && magic == *b"MZ"
 }
 
 fn classify_path(path: &Path, original: &str) -> Result<ResolvedCommand, CommandError> {
@@ -96,5 +109,23 @@ mod tests {
     fn missing_explicit_cmd_path_rejected() {
         let err = resolve_command(r"Z:\nope\not-there.cmd", Some("")).unwrap_err();
         assert!(matches!(err, CommandError::CommandNotFound(_)));
+    }
+
+    #[test]
+    fn prefers_cmd_wrapper_over_extensionless_npm_shim() {
+        let dir = std::env::temp_dir().join(format!("envbox-resolve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Non-PE npm-style shim (no extension) must not win over .cmd.
+        std::fs::write(dir.join("agent-shim"), b"#!/usr/bin/env node\n").unwrap();
+        std::fs::write(dir.join("agent-shim.cmd"), b"@echo off\r\n").unwrap();
+        let path = dir.display().to_string();
+        let resolved = resolve_command("agent-shim", Some(&path)).unwrap();
+        assert!(resolved.via_comspec, "must wrap .cmd via ComSpec");
+        assert!(
+            resolved.program.extension().map(|e| e == "cmd").unwrap_or(false),
+            "got {:?}",
+            resolved.program
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

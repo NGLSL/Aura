@@ -109,17 +109,29 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
   block->push_back(L'\0');
 }
 
-static int InjectRuntimeHandle(HANDLE hProcess) {
-  const char* dll = EnvBoxRuntimeDllPathA();
-  if (dll == nullptr) {
-    return 0;
+// Copy the current process Unicode environment (GetEnvironmentStringsW) as MULTI_SZ.
+static std::vector<wchar_t> CurrentProcessEnvBlock() {
+  std::vector<wchar_t> out;
+  LPWCH blk = GetEnvironmentStringsW();
+  if (blk == nullptr) {
+    return out;
   }
-  const char* dlls[1] = {dll};
-  return DetourUpdateProcessWithDll(hProcess, dlls, 1) ? 1 : 0;
+  const wchar_t* p = blk;
+  while (*p) {
+    std::wstring entry(p);
+    out.insert(out.end(), entry.begin(), entry.end());
+    out.push_back(L'\0');
+    p += entry.size() + 1;
+  }
+  out.push_back(L'\0');
+  FreeEnvironmentStringsW(blk);
+  return out;
 }
 
 // Returns 0 on failure and sets last_error. On success the child is running
 // (or still suspended if the caller asked for that).
+// Use DetourCreateProcessWithDllExW (same as Root launch) with TrueCreateProcessW
+// to avoid re-entering this hook.
 static BOOL SpawnInjected(
     LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
     LPSECURITY_ATTRIBUTES lpProcessAttributes,
@@ -137,28 +149,18 @@ static BOOL SpawnInjected(
   DWORD flags = dwCreationFlags | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
 
   std::vector<wchar_t> env = EnvToWide(lpEnvironment, dwCreationFlags);
+  if (env.empty()) {
+    // lpEnvironment == nullptr means "inherit"; never replace with ENVBOX-only.
+    env = CurrentProcessEnvBlock();
+  }
   UpsertProfileKeys(&env);
   LPVOID env_ptr = env.empty() ? lpEnvironment : static_cast<LPVOID>(env.data());
 
-  if (!TrueCreateProcessW(
+  if (!DetourCreateProcessWithDllExW(
           lpApplicationName, lpCommandLine, lpProcessAttributes,
           lpThreadAttributes, bInheritHandles, flags, env_ptr,
-          lpCurrentDirectory, lpStartupInfo, lpProcessInformation)) {
-    return FALSE;
-  }
-
-  if (!InjectRuntimeHandle(lpProcessInformation->hProcess)) {
-    DWORD err = GetLastError();
-    if (err == 0) {
-      err = ERROR_DLL_INIT_FAILED;
-    }
-    TerminateProcess(lpProcessInformation->hProcess, 1);
-    CloseHandle(lpProcessInformation->hThread);
-    CloseHandle(lpProcessInformation->hProcess);
-    lpProcessInformation->dwProcessId = 0;
-    lpProcessInformation->hProcess = nullptr;
-    lpProcessInformation->hThread = nullptr;
-    SetLastError(err);
+          lpCurrentDirectory, lpStartupInfo, lpProcessInformation, dll,
+          reinterpret_cast<PDETOUR_CREATE_PROCESS_ROUTINEW>(TrueCreateProcessW))) {
     return FALSE;
   }
 
