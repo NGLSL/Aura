@@ -29,7 +29,7 @@ static int InstallAllHooks() {
   }
   char msg[128];
   _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-              "EnvBox Runtime hooks installed=%d/5 (Fail Open per API)\n", ok);
+              "EnvBox Runtime hooks attached=%d (Fail Open per API)\n", ok);
   OutputDebugStringA(msg);
   return 1;
 }

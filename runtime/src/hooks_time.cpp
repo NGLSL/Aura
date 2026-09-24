@@ -1,5 +1,6 @@
-// Timezone hooks (ticket 05). Virtual timezone, real timeline:
+// Timezone hooks (ticket 05+07). Virtual timezone, real timeline:
 // never hook GetSystemTime / QPC / GetTickCount; never SetDynamicTimeZoneInformation.
+// Conversions use Windows rules (SystemTimeToTzSpecificLocalTime* family).
 
 #include "hooks.h"
 
@@ -7,6 +8,23 @@
 
 static DWORD(WINAPI* TrueGetDynamicTimeZoneInformation)(
     PDYNAMIC_TIME_ZONE_INFORMATION) = GetDynamicTimeZoneInformation;
+static DWORD(WINAPI* TrueGetTimeZoneInformation)(LPTIME_ZONE_INFORMATION) =
+    GetTimeZoneInformation;
+static BOOL(WINAPI* TrueGetTimeZoneInformationForYear)(
+    USHORT, PDYNAMIC_TIME_ZONE_INFORMATION, LPTIME_ZONE_INFORMATION) =
+    GetTimeZoneInformationForYear;
+static BOOL(WINAPI* TrueSystemTimeToTzSpecificLocalTime)(
+    const TIME_ZONE_INFORMATION*, const SYSTEMTIME*, LPSYSTEMTIME) =
+    SystemTimeToTzSpecificLocalTime;
+static BOOL(WINAPI* TrueSystemTimeToTzSpecificLocalTimeEx)(
+    const DYNAMIC_TIME_ZONE_INFORMATION*, const SYSTEMTIME*, LPSYSTEMTIME) =
+    SystemTimeToTzSpecificLocalTimeEx;
+static BOOL(WINAPI* TrueTzSpecificLocalTimeToSystemTime)(
+    const TIME_ZONE_INFORMATION*, const SYSTEMTIME*, LPSYSTEMTIME) =
+    TzSpecificLocalTimeToSystemTime;
+static BOOL(WINAPI* TrueTzSpecificLocalTimeToSystemTimeEx)(
+    const DYNAMIC_TIME_ZONE_INFORMATION*, const SYSTEMTIME*, LPSYSTEMTIME) =
+    TzSpecificLocalTimeToSystemTimeEx;
 
 static void DynamicToClassic(const DYNAMIC_TIME_ZONE_INFORMATION* din,
                              TIME_ZONE_INFORMATION* tout) {
@@ -19,18 +37,23 @@ static void DynamicToClassic(const DYNAMIC_TIME_ZONE_INFORMATION* din,
   wcsncpy_s(tout->DaylightName, din->DaylightName, _TRUNCATE);
 }
 
-// Classify STANDARD vs DAYLIGHT for the Profile zone using real UTC and the
-// zone's own transition rules (never SetDynamicTimeZoneInformation).
+static int FillProfileDynamic(DYNAMIC_TIME_ZONE_INFORMATION* out) {
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  if (pfl == nullptr || !pfl->has_tz || out == nullptr) {
+    return 0;
+  }
+  return EnvBoxLookupTimeZone(pfl->tz_windows, out);
+}
+
 static DWORD TimeZoneIdFromInfo(const DYNAMIC_TIME_ZONE_INFORMATION* info) {
   if (info->DaylightDate.wMonth == 0) {
     return TIME_ZONE_ID_STANDARD;
   }
-
   TIME_ZONE_INFORMATION with_dst = {};
   TIME_ZONE_INFORMATION std_only = {};
   DynamicToClassic(info, &with_dst);
   DynamicToClassic(info, &std_only);
-  std_only.DaylightDate = {};  // suppress DST window
+  std_only.DaylightDate = {};
   std_only.DaylightBias = std_only.StandardBias;
 
   SYSTEMTIME utc = {};
@@ -40,10 +63,8 @@ static DWORD TimeZoneIdFromInfo(const DYNAMIC_TIME_ZONE_INFORMATION* info) {
   SYSTEMTIME local_std = {};
   if (!SystemTimeToTzSpecificLocalTime(&with_dst, &utc, &local_dst) ||
       !SystemTimeToTzSpecificLocalTime(&std_only, &utc, &local_std)) {
-    // Fail Open-ish: cannot classify; report STANDARD rather than INVALID.
     return TIME_ZONE_ID_STANDARD;
   }
-
   FILETIME f_dst = {};
   FILETIME f_std = {};
   if (!SystemTimeToFileTime(&local_dst, &f_dst) ||
@@ -59,19 +80,112 @@ static DWORD TimeZoneIdFromInfo(const DYNAMIC_TIME_ZONE_INFORMATION* info) {
 
 static DWORD WINAPI HookGetDynamicTimeZoneInformation(
     PDYNAMIC_TIME_ZONE_INFORMATION p) {
-  const RuntimeProfile* pfl = EnvBoxProfile();
-  if (p != nullptr && pfl != nullptr && pfl->has_tz) {
-    DYNAMIC_TIME_ZONE_INFORMATION info = {};
-    if (EnvBoxLookupTimeZone(pfl->tz_windows, &info)) {
-      *p = info;
-      return TimeZoneIdFromInfo(&info);
-    }
-    // Fail Open: lookup miss -> original API.
+  DYNAMIC_TIME_ZONE_INFORMATION info = {};
+  if (p != nullptr && FillProfileDynamic(&info)) {
+    *p = info;
+    return TimeZoneIdFromInfo(&info);
   }
   return TrueGetDynamicTimeZoneInformation(p);
 }
 
+static DWORD WINAPI HookGetTimeZoneInformation(
+    LPTIME_ZONE_INFORMATION lpTimeZoneInformation) {
+  DYNAMIC_TIME_ZONE_INFORMATION dyn = {};
+  if (lpTimeZoneInformation != nullptr && FillProfileDynamic(&dyn)) {
+    DynamicToClassic(&dyn, lpTimeZoneInformation);
+    return TimeZoneIdFromInfo(&dyn);
+  }
+  return TrueGetTimeZoneInformation(lpTimeZoneInformation);
+}
+
+static BOOL WINAPI HookGetTimeZoneInformationForYear(
+    USHORT wYear, PDYNAMIC_TIME_ZONE_INFORMATION pdtzi,
+    LPTIME_ZONE_INFORMATION ptzi) {
+  // Virtualize the *current* zone (NULL pdtzi). Explicit zone queries pass through.
+  if (pdtzi == nullptr) {
+    DYNAMIC_TIME_ZONE_INFORMATION dyn = {};
+    if (FillProfileDynamic(&dyn)) {
+      return TrueGetTimeZoneInformationForYear(wYear, &dyn, ptzi);
+    }
+  }
+  return TrueGetTimeZoneInformationForYear(wYear, pdtzi, ptzi);
+}
+
+static const TIME_ZONE_INFORMATION* ProfileClassicOrNull(
+    const TIME_ZONE_INFORMATION* zone, TIME_ZONE_INFORMATION* scratch) {
+  if (zone != nullptr) {
+    return zone;
+  }
+  DYNAMIC_TIME_ZONE_INFORMATION dyn = {};
+  if (!FillProfileDynamic(&dyn)) {
+    return nullptr;
+  }
+  DynamicToClassic(&dyn, scratch);
+  return scratch;
+}
+
+static const DYNAMIC_TIME_ZONE_INFORMATION* ProfileDynamicOrNull(
+    const DYNAMIC_TIME_ZONE_INFORMATION* zone,
+    DYNAMIC_TIME_ZONE_INFORMATION* scratch) {
+  if (zone != nullptr) {
+    return zone;
+  }
+  if (!FillProfileDynamic(scratch)) {
+    return nullptr;
+  }
+  return scratch;
+}
+
+static BOOL WINAPI HookSystemTimeToTzSpecificLocalTime(
+    const TIME_ZONE_INFORMATION* lpTimeZoneInformation,
+    const SYSTEMTIME* lpUniversalTime, LPSYSTEMTIME lpLocalTime) {
+  TIME_ZONE_INFORMATION scratch = {};
+  const TIME_ZONE_INFORMATION* z =
+      ProfileClassicOrNull(lpTimeZoneInformation, &scratch);
+  return TrueSystemTimeToTzSpecificLocalTime(z, lpUniversalTime, lpLocalTime);
+}
+
+static BOOL WINAPI HookSystemTimeToTzSpecificLocalTimeEx(
+    const DYNAMIC_TIME_ZONE_INFORMATION* lpTimeZoneInformation,
+    const SYSTEMTIME* lpUniversalTime, LPSYSTEMTIME lpLocalTime) {
+  DYNAMIC_TIME_ZONE_INFORMATION scratch = {};
+  const DYNAMIC_TIME_ZONE_INFORMATION* z =
+      ProfileDynamicOrNull(lpTimeZoneInformation, &scratch);
+  return TrueSystemTimeToTzSpecificLocalTimeEx(z, lpUniversalTime, lpLocalTime);
+}
+
+static BOOL WINAPI HookTzSpecificLocalTimeToSystemTime(
+    const TIME_ZONE_INFORMATION* lpTimeZoneInformation,
+    const SYSTEMTIME* lpLocalTime, LPSYSTEMTIME lpUniversalTime) {
+  TIME_ZONE_INFORMATION scratch = {};
+  const TIME_ZONE_INFORMATION* z =
+      ProfileClassicOrNull(lpTimeZoneInformation, &scratch);
+  return TrueTzSpecificLocalTimeToSystemTime(z, lpLocalTime, lpUniversalTime);
+}
+
+static BOOL WINAPI HookTzSpecificLocalTimeToSystemTimeEx(
+    const DYNAMIC_TIME_ZONE_INFORMATION* lpTimeZoneInformation,
+    const SYSTEMTIME* lpLocalTime, LPSYSTEMTIME lpUniversalTime) {
+  DYNAMIC_TIME_ZONE_INFORMATION scratch = {};
+  const DYNAMIC_TIME_ZONE_INFORMATION* z =
+      ProfileDynamicOrNull(lpTimeZoneInformation, &scratch);
+  return TrueTzSpecificLocalTimeToSystemTimeEx(z, lpLocalTime, lpUniversalTime);
+}
+
 int EnvBoxInstallTimeHooks() {
-  return EnvBoxAttach(&TrueGetDynamicTimeZoneInformation,
-                      HookGetDynamicTimeZoneInformation);
+  int ok = 0;
+  ok += EnvBoxAttach(&TrueGetDynamicTimeZoneInformation,
+                     HookGetDynamicTimeZoneInformation);
+  ok += EnvBoxAttach(&TrueGetTimeZoneInformation, HookGetTimeZoneInformation);
+  ok += EnvBoxAttach(&TrueGetTimeZoneInformationForYear,
+                     HookGetTimeZoneInformationForYear);
+  ok += EnvBoxAttach(&TrueSystemTimeToTzSpecificLocalTime,
+                     HookSystemTimeToTzSpecificLocalTime);
+  ok += EnvBoxAttach(&TrueSystemTimeToTzSpecificLocalTimeEx,
+                     HookSystemTimeToTzSpecificLocalTimeEx);
+  ok += EnvBoxAttach(&TrueTzSpecificLocalTimeToSystemTime,
+                     HookTzSpecificLocalTimeToSystemTime);
+  ok += EnvBoxAttach(&TrueTzSpecificLocalTimeToSystemTimeEx,
+                     HookTzSpecificLocalTimeToSystemTimeEx);
+  return ok;
 }

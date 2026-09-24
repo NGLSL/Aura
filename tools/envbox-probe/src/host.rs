@@ -8,15 +8,22 @@ use crate::{
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use windows::Win32::Globalization::{
-    GetUserDefaultGeoName, GetUserDefaultLCID, GetUserDefaultLocaleName, GetUserDefaultUILanguage,
-    GetUserGeoID, GetUserPreferredUILanguages, GetSystemDefaultLocaleName,
-    GetSystemDefaultUILanguage, MUI_LANGUAGE_NAME, SYSGEOCLASS,
+    GetLocaleInfoEx, GetLocaleInfoW, GetSystemDefaultLCID, GetSystemDefaultLocaleName,
+    GetSystemDefaultUILanguage, GetProcessPreferredUILanguages,
+    GetSystemPreferredUILanguages, GetThreadPreferredUILanguages,
+    GetUserDefaultGeoName, GetUserDefaultLCID, GetUserDefaultLocaleName,
+    GetUserDefaultUILanguage, GetUserGeoID, GetUserPreferredUILanguages,
+    LOCALE_SNAME, MUI_LANGUAGE_NAME, SYSGEOCLASS,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GetNetworkParams, GET_ADAPTERS_ADDRESSES_FLAGS,
 };
 use windows::Win32::System::Time::{
     DYNAMIC_TIME_ZONE_INFORMATION, GetDynamicTimeZoneInformation,
+    GetTimeZoneInformation, GetTimeZoneInformationForYear,
+    SystemTimeToTzSpecificLocalTime, SystemTimeToTzSpecificLocalTimeEx,
+    TIME_ZONE_INFORMATION, TzSpecificLocalTimeToSystemTime,
+    TzSpecificLocalTimeToSystemTimeEx,
 };
 use windows::core::PWSTR;
 
@@ -91,6 +98,34 @@ fn collect_locale() -> Section {
 
         let lcid = GetUserDefaultLCID();
         fields.push(field("GetUserDefaultLCID", lcid.to_string()));
+        let sys_lcid = GetSystemDefaultLCID();
+        fields.push(field("GetSystemDefaultLCID", sys_lcid.to_string()));
+
+        let mut sname = [0u16; 85];
+        let sname_ok = GetLocaleInfoEx(
+            windows::core::PCWSTR::null(),
+            LOCALE_SNAME,
+            Some(&mut sname),
+        );
+        fields.push(field(
+            "GetLocaleInfoEx_SNAME",
+            if sname_ok > 0 {
+                wstr_from_until_nul(&sname)
+            } else {
+                "<error>".into()
+            },
+        ));
+
+        let mut sname_w = [0u16; 85];
+        let sname_w_ok = GetLocaleInfoW(lcid, LOCALE_SNAME, Some(&mut sname_w));
+        fields.push(field(
+            "GetLocaleInfoW_SNAME",
+            if sname_w_ok > 0 {
+                wstr_from_until_nul(&sname_w)
+            } else {
+                "<error>".into()
+            },
+        ));
     }
     Section {
         title: SECTION_LOCALE.to_string(),
@@ -112,35 +147,56 @@ fn collect_language() -> Section {
             format!("{sys_ui:#06x}"),
         ));
 
-        let mut count = 0u32;
-        let mut buffer_size = 0u32;
-        let empty = PWSTR::null();
-        let _ = GetUserPreferredUILanguages(
-            MUI_LANGUAGE_NAME,
-            &mut count,
-            empty,
-            &mut buffer_size,
-        );
-        if buffer_size > 0 {
-            let mut buffer = vec![0u16; buffer_size as usize];
-            let mut count2 = count;
-            let mut size2 = buffer_size;
-            let ptr = PWSTR(buffer.as_mut_ptr());
-            match GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count2, ptr, &mut size2) {
-                Ok(()) => fields.push(field(
-                    "GetUserPreferredUILanguages",
-                    parse_multi_sz(&buffer),
-                )),
-                Err(_) => fields.push(field("GetUserPreferredUILanguages", "<error>")),
-            }
-        } else {
-            fields.push(field("GetUserPreferredUILanguages", "<empty>"));
-        }
+        push_preferred_ui(&mut fields, "GetUserPreferredUILanguages", |count, buf, size| {
+            GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
+        });
+        push_preferred_ui(&mut fields, "GetSystemPreferredUILanguages", |count, buf, size| {
+            GetSystemPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
+        });
+        push_preferred_ui(&mut fields, "GetThreadPreferredUILanguages", |count, buf, size| {
+            GetThreadPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
+        });
+        push_preferred_ui(&mut fields, "GetProcessPreferredUILanguages", |count, buf, size| {
+            GetProcessPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
+        });
+        push_preferred_ui(&mut fields, "GetUserPreferredUILanguages_ID", |count, buf, size| {
+            GetUserPreferredUILanguages(0x4, count, buf, size) // MUI_LANGUAGE_ID
+        });
     }
     Section {
         title: SECTION_LANGUAGE.to_string(),
         fields,
     }
+}
+
+fn push_preferred_ui(
+    fields: &mut Vec<Field>,
+    name: &str,
+    mut call: impl FnMut(&mut u32, PWSTR, &mut u32) -> windows::core::Result<()>,
+) {
+    let mut count = 0u32;
+    let mut buffer_size = 0u32;
+    let empty = PWSTR::null();
+    let _ = call(&mut count, empty, &mut buffer_size);
+    if buffer_size > 0 {
+        let mut buffer = vec![0u16; buffer_size as usize];
+        let mut count2 = count;
+        let mut size2 = buffer_size;
+        let ptr = PWSTR(buffer.as_mut_ptr());
+        match call(&mut count2, ptr, &mut size2) {
+            Ok(()) => fields.push(field(name, parse_multi_sz(&buffer))),
+            Err(_) => fields.push(field(name, "<error>")),
+        }
+    } else {
+        fields.push(field(name, "<empty>"));
+    }
+}
+
+fn format_system_time(t: &windows::Win32::Foundation::SYSTEMTIME) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    )
 }
 
 fn collect_timezone() -> Section {
@@ -158,6 +214,74 @@ fn collect_timezone() -> Section {
                 wide_to_string(&tzi.TimeZoneKeyName),
             ));
             fields.push(field("Bias", tzi.Bias.to_string()));
+        }
+
+        let mut classic = std::mem::MaybeUninit::<TIME_ZONE_INFORMATION>::zeroed();
+        let id2 = GetTimeZoneInformation(classic.as_mut_ptr());
+        if id2 == u32::MAX {
+            fields.push(field("GetTimeZoneInformation", "<error>"));
+        } else {
+            let tzi = classic.assume_init();
+            fields.push(field(
+                "GetTimeZoneInformation",
+                wide_to_string(&tzi.StandardName),
+            ));
+            fields.push(field("GetTimeZoneInformation_Bias", tzi.Bias.to_string()));
+        }
+
+        // Fixed UTC 2024-01-15 12:00:00 (independent fixture for conversion).
+        let utc = windows::Win32::Foundation::SYSTEMTIME {
+            wYear: 2024,
+            wMonth: 1,
+            wDay: 15,
+            wDayOfWeek: 1,
+            wHour: 12,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        let mut local = windows::Win32::Foundation::SYSTEMTIME::default();
+        if SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_ok() {
+            fields.push(field("SystemTimeToTzSpecificLocalTime", format_system_time(&local)));
+        } else {
+            fields.push(field("SystemTimeToTzSpecificLocalTime", "<error>"));
+        }
+
+        let mut back = windows::Win32::Foundation::SYSTEMTIME::default();
+        if TzSpecificLocalTimeToSystemTime(None, &local, &mut back).is_ok() {
+            fields.push(field("TzSpecificLocalTimeToSystemTime", format_system_time(&back)));
+        } else {
+            fields.push(field("TzSpecificLocalTimeToSystemTime", "<error>"));
+        }
+
+        let mut local_ex = windows::Win32::Foundation::SYSTEMTIME::default();
+        if SystemTimeToTzSpecificLocalTimeEx(None, &utc, &mut local_ex).is_ok() {
+            fields.push(field(
+                "SystemTimeToTzSpecificLocalTimeEx",
+                format_system_time(&local_ex),
+            ));
+        } else {
+            fields.push(field("SystemTimeToTzSpecificLocalTimeEx", "<error>"));
+        }
+
+        let mut back_ex = windows::Win32::Foundation::SYSTEMTIME::default();
+        if TzSpecificLocalTimeToSystemTimeEx(None, &local_ex, &mut back_ex).is_ok() {
+            fields.push(field(
+                "TzSpecificLocalTimeToSystemTimeEx",
+                format_system_time(&back_ex),
+            ));
+        } else {
+            fields.push(field("TzSpecificLocalTimeToSystemTimeEx", "<error>"));
+        }
+
+        let mut year_tzi = TIME_ZONE_INFORMATION::default();
+        if GetTimeZoneInformationForYear(0, None, &mut year_tzi).is_ok() {
+            fields.push(field(
+                "GetTimeZoneInformationForYear",
+                wide_to_string(&year_tzi.StandardName),
+            ));
+        } else {
+            fields.push(field("GetTimeZoneInformationForYear", "<error>"));
         }
     }
     Section {

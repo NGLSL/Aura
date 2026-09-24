@@ -393,7 +393,8 @@ fn run_probe_four_core_apis_show_profile_values() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Ticket 05: non-virtualized fields stay on Host baseline (independent compare).
+/// Ticket 05 residual: fields still on Host baseline (DNS not yet ticket 08).
+/// Locale/Language/Geo/Time fields moved to ticket 07 consistency test.
 #[test]
 fn run_probe_non_virtualized_fields_match_host() {
     let dll = test_runtime_dll().expect("runtime DLL required");
@@ -416,11 +417,6 @@ fn run_probe_non_virtualized_fields_match_host() {
     let run_out = String::from_utf8_lossy(&run.stdout);
 
     for key in [
-        "GetSystemDefaultLocaleName:",
-        "GetSystemDefaultUILanguage:",
-        "GetUserGeoID:",
-        "GetUserDefaultLCID:",
-        "GetUserPreferredUILanguages:",
         "GetNetworkParams:",
     ] {
         assert_eq!(
@@ -429,6 +425,102 @@ fn run_probe_non_virtualized_fields_match_host() {
             "non-virtualized {key} changed under Profile"
         );
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 07: Locale / Language / Geo / Timezone APIs stay Environment-consistent
+/// with the Profile (no en-US vs zh-CN split inside one process). Fail Open not
+/// triggered — these must return Profile literals, not Host.
+#[test]
+fn run_probe_locale_language_timezone_consistent_with_profile() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root); // US / en-US / Pacific Standard Time
+
+    let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Geo
+    assert_eq!(field_after(&stdout, "GetUserDefaultGeoName:"), "US");
+    assert_eq!(field_after(&stdout, "GetUserGeoID:"), "244", "US GEOID");
+
+    // Locale name + LCID + GetLocaleInfoEx/W
+    assert_eq!(field_after(&stdout, "GetUserDefaultLocaleName:"), "en-US");
+    assert_eq!(field_after(&stdout, "GetSystemDefaultLocaleName:"), "en-US");
+    assert_eq!(field_after(&stdout, "GetUserDefaultLCID:"), "1033");
+    assert_eq!(field_after(&stdout, "GetSystemDefaultLCID:"), "1033");
+    assert_eq!(field_after(&stdout, "GetLocaleInfoEx_SNAME:"), "en-US");
+    assert_eq!(field_after(&stdout, "GetLocaleInfoW_SNAME:"), "en-US");
+
+    // UI Language: IDs and preferred lists start with Profile language
+    assert_eq!(field_after(&stdout, "GetUserDefaultUILanguage:"), "0x0409");
+    assert_eq!(field_after(&stdout, "GetSystemDefaultUILanguage:"), "0x0409");
+    let user_pref = field_after(&stdout, "GetUserPreferredUILanguages:");
+    assert!(
+        user_pref.starts_with("en-US"),
+        "preferred UI first item must be Profile language, got {user_pref}"
+    );
+    let sys_pref = field_after(&stdout, "GetSystemPreferredUILanguages:");
+    assert!(
+        sys_pref.starts_with("en-US"),
+        "system preferred UI first item, got {sys_pref}"
+    );
+    let thread_pref = field_after(&stdout, "GetThreadPreferredUILanguages:");
+    assert!(
+        thread_pref.starts_with("en-US"),
+        "thread preferred UI first item, got {thread_pref}"
+    );
+    let process_pref = field_after(&stdout, "GetProcessPreferredUILanguages:");
+    assert!(
+        process_pref.starts_with("en-US"),
+        "process preferred UI first item, got {process_pref}"
+    );
+    // MUI_LANGUAGE_ID form: hex LANGID, not locale name.
+    let id_pref = field_after(&stdout, "GetUserPreferredUILanguages_ID:");
+    assert!(
+        id_pref.starts_with("0409"),
+        "preferred UI ID form must start with 0409, got {id_pref}"
+    );
+
+    // Timezone identity + Windows-rule conversion (real timeline: UTC fixture).
+    assert_eq!(
+        field_after(&stdout, "GetDynamicTimeZoneInformation:"),
+        "Pacific Standard Time"
+    );
+    // Classic APIs return localized StandardName (Host locale), not the key.
+    // Require Profile-zone identity: year API and classic API agree, and the
+    // conversion matches Pacific (UTC-8 in January), not the Host zone.
+    let classic = field_after(&stdout, "GetTimeZoneInformation:");
+    let year = field_after(&stdout, "GetTimeZoneInformationForYear:");
+    assert_eq!(classic, year, "classic vs year StandardName mismatch");
+    assert!(!classic.is_empty() && classic != "<error>", "got {classic}");
+    assert_eq!(field_after(&stdout, "Bias:"), field_after(&stdout, "GetTimeZoneInformation_Bias:"));
+    // 2024-01-15 12:00:00 UTC → PST (UTC-8) = 04:00:00 local.
+    assert_eq!(
+        field_after(&stdout, "SystemTimeToTzSpecificLocalTime:"),
+        "2024-01-15 04:00:00"
+    );
+    assert_eq!(
+        field_after(&stdout, "TzSpecificLocalTimeToSystemTime:"),
+        "2024-01-15 12:00:00"
+    );
+    assert_eq!(
+        field_after(&stdout, "SystemTimeToTzSpecificLocalTimeEx:"),
+        "2024-01-15 04:00:00"
+    );
+    assert_eq!(
+        field_after(&stdout, "TzSpecificLocalTimeToSystemTimeEx:"),
+        "2024-01-15 12:00:00"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
