@@ -1,5 +1,7 @@
 # EnvBox
 
+Run Windows applications with isolated locale, region, timezone and network profiles — without a VM.
+
 Windows process-level environment virtualization launcher. Target apps run on the host (full access to filesystem, GPU, network, user profile, Git/SSH/IDE) but see **Environment Profile** values for locale, region, UI language, timezone, DNS view, environment variables, and whitelisted internationalization registry reads.
 
 ## Security posture
