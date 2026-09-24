@@ -8,3 +8,9 @@ license.workspace = true
 envbox-core = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
+[dev-dependencies]
+envbox-core = { workspace = true }

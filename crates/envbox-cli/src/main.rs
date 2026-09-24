@@ -26,10 +26,7 @@ fn main() -> ExitCode {
             Some("add") => cmd_app_add(&store, &args[2..]),
             _ => usage(),
         },
-        Some("run") => {
-            eprintln!("error: `envbox run` is not available until ticket 03");
-            ExitCode::FAILURE
-        }
+        Some("run") => cmd_run(&store, &args[1..]),
         _ => usage(),
     }
 }
@@ -45,8 +42,106 @@ fn usage() -> ExitCode {
     eprintln!("  envbox app list");
     eprintln!("  envbox app add --name N (--command C | --executable P) --profile ID \\");
     eprintln!("     [--working-directory D] [--arg A]... [--inherit-children]");
-    eprintln!("  envbox run --profile <id> <command>");
+    eprintln!("  envbox run --profile <id> [--working-directory D] [--] <command> [args...]");
     ExitCode::FAILURE
+}
+
+fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
+    let mut profile_raw = String::new();
+    let mut working_directory: Option<PathBuf> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i].as_str();
+        let take = |i: &mut usize| -> Option<String> {
+            *i += 1;
+            args.get(*i).cloned()
+        };
+        match key {
+            "--profile" => profile_raw = take(&mut i).unwrap_or_default(),
+            "--working-directory" => working_directory = take(&mut i).map(PathBuf::from),
+            "--" => {
+                rest.extend_from_slice(&args[i + 1..]);
+                break;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("error: unknown flag {other:?}");
+                return ExitCode::FAILURE;
+            }
+            _ => {
+                rest.extend_from_slice(&args[i..]);
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    if profile_raw.is_empty() {
+        eprintln!("error: --profile <id-or-name> is required");
+        return ExitCode::FAILURE;
+    }
+
+    // Startup Fail Policy: missing/corrupt profile must not start.
+    let profile = match store.load_profiles() {
+        Ok(doc) => doc.profiles.into_iter().find(|p| {
+            p.id.to_string() == profile_raw
+                || p.id.simple().to_string() == profile_raw
+                || p.name.eq_ignore_ascii_case(&profile_raw)
+        }),
+        Err(err) => {
+            eprintln!("error: profiles store unreadable: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(profile) = profile else {
+        eprintln!("error: profile {profile_raw:?} not found");
+        return ExitCode::FAILURE;
+    };
+    if let Err(err) = envbox_storage::validate_profile(&profile) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    let Some((command, command_args)) = rest.split_first() else {
+        eprintln!("error: missing command to run");
+        return ExitCode::FAILURE;
+    };
+
+    let request = envbox_launcher::LaunchRequest {
+        launch: envbox_core::LaunchTarget::Command {
+            command: command.clone(),
+        },
+        arguments: command_args.to_vec(),
+        working_directory,
+        profile: profile.clone(),
+        instance_id: Uuid::new_v4(),
+    };
+
+    match envbox_launcher::launch(request) {
+        Ok(mut child) => {
+            eprintln!(
+                "envbox: started pid={} instance={} profile={} (API hooks not active until ticket 04/05)",
+                child.pid, child.instance_id, child.profile_id
+            );
+            match child.wait() {
+                Ok(status) => {
+                    if status.success() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(status.code().unwrap_or(1) as u8)
+                    }
+                }
+                Err(err) => {
+                    eprintln!("error: wait failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_profile_list(store: &ConfigStore) -> ExitCode {

@@ -19,6 +19,7 @@ name = "envbox-cli"
 version = "0.1.0"
 dependencies = [
  "envbox-core",
+ "envbox-launcher",
  "envbox-storage",
  "uuid",
 ]
@@ -40,6 +41,7 @@ dependencies = [
  "envbox-core",
  "thiserror",
  "uuid",
+ "windows",
 ]
 
 [[package]]

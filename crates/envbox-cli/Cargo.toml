@@ -10,5 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 envbox-core = { workspace = true }
+envbox-launcher = { workspace = true }
 envbox-storage = { workspace = true }
 uuid = { workspace = true }
