@@ -8,8 +8,12 @@ Parent: .scratch/envbox-v01/spec.md
 
 **Status:** ready-for-agent
 
-- [ ] Application / Environment Profile 领域模型与 TOML 往返一致
-- [ ] Profile 校验：Locale、Region、Timezone Windows ID、DNS 地址、环境变量名不合法则拒绝保存
-- [ ] `envbox profile list` / `envbox app list` 输出可读且含稳定 id
-- [ ] 领域术语与 `docs/CONTEXT.md` 一致
-- [ ] `cargo test` 覆盖序列化、校验、失败路径
+- [x] Application / Environment Profile 领域模型与 TOML 往返一致
+- [x] Profile 校验：Locale、Region、Timezone Windows ID、DNS 地址、环境变量名不合法则拒绝保存
+- [x] `envbox profile list` / `envbox app list` 输出可读且含稳定 id
+- [x] 领域术语与 `docs/CONTEXT.md` 一致
+- [x] `cargo test` 覆盖序列化、校验、失败路径
+
+## Comments
+
+- Ticket 02 delivered. CLI `profile add` / `app add` + list; DomainError validation in core; timezone Windows ID existence via EnumDynamicTimeZoneInformation; corrupt TOML fails closed. `cargo test --workspace` 27 passed. Review applied: removed silent locale default, no overwrite of corrupt stores.

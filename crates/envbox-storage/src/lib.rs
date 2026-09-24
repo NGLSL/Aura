@@ -1,6 +1,6 @@
 //! TOML persistence for Application and Environment Profile under `%LOCALAPPDATA%\EnvBox\`.
 
-use envbox_core::{Application, EnvironmentProfile};
+use envbox_core::{Application, DomainError, EnvironmentProfile};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,10 +14,8 @@ pub enum StorageError {
     TomlDecode(#[from] toml::de::Error),
     #[error("toml encode error: {0}")]
     TomlEncode(#[from] toml::ser::Error),
-    #[error("profile validation failed: {0}")]
-    InvalidProfile(String),
-    #[error("application validation failed: {0}")]
-    InvalidApplication(String),
+    #[error(transparent)]
+    Domain(#[from] DomainError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -41,6 +39,9 @@ impl ConfigStore {
     }
 
     pub fn default_root() -> PathBuf {
+        if let Some(root) = std::env::var_os("ENVBOX_CONFIG_ROOT") {
+            return PathBuf::from(root);
+        }
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
@@ -71,7 +72,8 @@ impl ConfigStore {
 
     pub fn save_profiles(&self, doc: &ProfileDocument) -> Result<(), StorageError> {
         for profile in &doc.profiles {
-            validate_profile(profile)?;
+            profile.validate()?;
+            validate_timezone_windows_id(&profile.timezone.windows_id)?;
         }
         save_doc(self.profiles_path(), doc)
     }
@@ -82,7 +84,7 @@ impl ConfigStore {
 
     pub fn save_applications(&self, doc: &ApplicationDocument) -> Result<(), StorageError> {
         for app in &doc.applications {
-            validate_application(app)?;
+            app.validate()?;
         }
         save_doc(self.applications_path(), doc)
     }
@@ -105,65 +107,87 @@ fn save_doc<T: serde::Serialize>(path: PathBuf, doc: &T) -> Result<(), StorageEr
     Ok(())
 }
 
-pub fn validate_profile(profile: &EnvironmentProfile) -> Result<(), StorageError> {
-    if profile.name.trim().is_empty() {
-        return Err(StorageError::InvalidProfile("name must not be empty".into()));
+/// Reject timezone Windows IDs that cannot exist on this host.
+/// Format checks live in core; this is the host-existence gate at save time.
+fn validate_timezone_windows_id(windows_id: &str) -> Result<(), DomainError> {
+    let id = windows_id.trim();
+    if id.is_empty() {
+        return Err(DomainError::InvalidProfile(
+            "timezone.windows_id must not be empty".into(),
+        ));
     }
-    if profile.locale.locale_name.trim().is_empty() {
-        return Err(StorageError::InvalidProfile("locale_name must not be empty".into()));
-    }
-    if profile.locale.ui_language.trim().is_empty() {
-        return Err(StorageError::InvalidProfile("ui_language must not be empty".into()));
-    }
-    let region = profile.locale.region.trim();
-    if region.len() != 2 || !region.chars().all(|c| c.is_ascii_alphabetic()) {
-        return Err(StorageError::InvalidProfile(format!(
-            "region must be a 2-letter ISO code, got {:?}",
-            profile.locale.region
+    if !windows_id_exists(id) {
+        return Err(DomainError::InvalidProfile(format!(
+            "timezone Windows ID not found on this host: {id:?}"
         )));
     }
-    if profile.timezone.windows_id.trim().is_empty() {
-        return Err(StorageError::InvalidProfile("timezone.windows_id must not be empty".into()));
-    }
-    if profile.timezone.iana_id.trim().is_empty() {
-        return Err(StorageError::InvalidProfile("timezone.iana_id must not be empty".into()));
-    }
-    for (key, _) in &profile.environment {
-        if !is_valid_env_name(key) {
-            return Err(StorageError::InvalidProfile(format!(
-                "invalid environment variable name {key:?}"
-            )));
-        }
-    }
     Ok(())
 }
 
+fn windows_id_exists(windows_id: &str) -> bool {
+    #[cfg(windows)]
+    {
+        win_tz::enumerate_dynamic_timezone_ids()
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(windows_id))
+    }
+    #[cfg(not(windows))]
+    {
+        // Non-Windows CI cannot enumerate Windows IDs; accept well-formed IDs.
+        !windows_id.is_empty() && !windows_id.contains('\0')
+    }
+}
+
+#[cfg(windows)]
+mod win_tz {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Time::{
+        EnumDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION,
+    };
+
+    pub fn enumerate_dynamic_timezone_ids() -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut index = 0u32;
+        loop {
+            let mut info = DYNAMIC_TIME_ZONE_INFORMATION::default();
+            let status = unsafe { EnumDynamicTimeZoneInformation(index, &mut info) };
+            // ERROR_NO_MORE_ITEMS = 259
+            if status == 259 || status != 0 {
+                break;
+            }
+            let name: String = {
+                let len = info
+                    .TimeZoneKeyName
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(info.TimeZoneKeyName.len());
+                std::ffi::OsString::from_wide(&info.TimeZoneKeyName[..len])
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            if !name.is_empty() {
+                ids.push(name);
+            }
+            index += 1;
+            if index > 1024 {
+                break;
+            }
+        }
+        ids
+    }
+}
+
+/// Validate an Environment Profile including host timezone existence.
+pub fn validate_profile(profile: &EnvironmentProfile) -> Result<(), StorageError> {
+    profile.validate()?;
+    validate_timezone_windows_id(&profile.timezone.windows_id)?;
+    Ok(())
+}
+
+/// Validate an Application before persisting.
 pub fn validate_application(app: &Application) -> Result<(), StorageError> {
-    if app.name.trim().is_empty() {
-        return Err(StorageError::InvalidApplication("name must not be empty".into()));
-    }
-    match &app.launch {
-        envbox_core::LaunchTarget::Executable { path } if path.as_os_str().is_empty() => {
-            return Err(StorageError::InvalidApplication(
-                "executable path must not be empty".into(),
-            ));
-        }
-        envbox_core::LaunchTarget::Command { command } if command.trim().is_empty() => {
-            return Err(StorageError::InvalidApplication(
-                "command must not be empty".into(),
-            ));
-        }
-        _ => {}
-    }
+    app.validate()?;
     Ok(())
-}
-
-fn is_valid_env_name(name: &str) -> bool {
-    if name.is_empty() || name.contains('=') || name.contains('\0') {
-        return false;
-    }
-    // Windows env names cannot contain `=`, and should be non-empty.
-    true
 }
 
 #[cfg(test)]
@@ -225,10 +249,16 @@ mod tests {
                 profiles: vec![sample_profile()],
             })
             .unwrap();
+        let text = std::fs::read_to_string(store.profiles_path()).unwrap();
+        assert!(text.contains("[[profiles]]"), "expected array-of-tables:\n{text}");
         let loaded = store.load_profiles().unwrap();
         assert_eq!(loaded.profiles.len(), 1);
         assert_eq!(loaded.profiles[0].name, "US Development");
         assert_eq!(loaded.profiles[0].locale.region, "US");
+        assert_eq!(
+            loaded.profiles[0].timezone.windows_id,
+            "Pacific Standard Time"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -238,7 +268,27 @@ mod tests {
         profile.locale.region = "USA".into();
         assert!(matches!(
             validate_profile(&profile),
-            Err(StorageError::InvalidProfile(_))
+            Err(StorageError::Domain(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_timezone_windows_id_is_rejected() {
+        let mut profile = sample_profile();
+        profile.timezone.windows_id = "Not A Real Zone".into();
+        assert!(matches!(
+            validate_profile(&profile),
+            Err(StorageError::Domain(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_dns_servers_rejected_by_type_and_mode() {
+        let mut profile = sample_profile();
+        profile.dns.servers.clear();
+        assert!(matches!(
+            validate_profile(&profile),
+            Err(StorageError::Domain(_))
         ));
     }
 
@@ -252,6 +302,9 @@ mod tests {
                 applications: vec![sample_app()],
             })
             .unwrap();
+        let text = std::fs::read_to_string(store.applications_path()).unwrap();
+        assert!(text.contains("[[applications]]"), "expected array-of-tables:\n{text}");
+        assert!(text.contains("type = \"command\""), "launch tag:\n{text}");
         let loaded = store.load_applications().unwrap();
         assert_eq!(loaded.applications[0].name, "Claude Code");
         let _ = fs::remove_dir_all(&dir);
@@ -265,7 +318,23 @@ mod tests {
         };
         assert!(matches!(
             validate_application(&app),
-            Err(StorageError::InvalidApplication(_))
+            Err(StorageError::Domain(_))
         ));
+    }
+
+    #[test]
+    fn invalid_profile_is_not_written() {
+        let dir = std::env::temp_dir().join(format!("envbox-test-nosave-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&dir);
+        store.ensure_dirs().unwrap();
+        let mut bad = sample_profile();
+        bad.locale.region = "X".into();
+        assert!(store
+            .save_profiles(&ProfileDocument {
+                profiles: vec![bad]
+            })
+            .is_err());
+        assert!(!store.profiles_path().exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

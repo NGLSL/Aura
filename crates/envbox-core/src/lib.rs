@@ -6,7 +6,16 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use thiserror::Error;
 use uuid::Uuid;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DomainError {
+    #[error("invalid Environment Profile: {0}")]
+    InvalidProfile(String),
+    #[error("invalid Application: {0}")]
+    InvalidApplication(String),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -26,6 +35,30 @@ pub struct Application {
     pub inherit_children: bool,
 }
 
+impl Application {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.name.trim().is_empty() {
+            return Err(DomainError::InvalidApplication(
+                "name must not be empty".into(),
+            ));
+        }
+        match &self.launch {
+            LaunchTarget::Executable { path } if path.as_os_str().is_empty() => {
+                return Err(DomainError::InvalidApplication(
+                    "executable path must not be empty".into(),
+                ));
+            }
+            LaunchTarget::Command { command } if command.trim().is_empty() => {
+                return Err(DomainError::InvalidApplication(
+                    "command must not be empty".into(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocaleProfile {
     pub locale_name: String,
@@ -33,10 +66,54 @@ pub struct LocaleProfile {
     pub region: String,
 }
 
+impl LocaleProfile {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.locale_name.trim().is_empty() {
+            return Err(DomainError::InvalidProfile(
+                "locale_name must not be empty".into(),
+            ));
+        }
+        if self.ui_language.trim().is_empty() {
+            return Err(DomainError::InvalidProfile(
+                "ui_language must not be empty".into(),
+            ));
+        }
+        let region = self.region.trim();
+        if region.len() != 2 || !region.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(DomainError::InvalidProfile(format!(
+                "region must be a 2-letter ISO code, got {:?}",
+                self.region
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimezoneProfile {
     pub windows_id: String,
     pub iana_id: String,
+}
+
+impl TimezoneProfile {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.windows_id.trim().is_empty() {
+            return Err(DomainError::InvalidProfile(
+                "timezone.windows_id must not be empty".into(),
+            ));
+        }
+        if self.iana_id.trim().is_empty() {
+            return Err(DomainError::InvalidProfile(
+                "timezone.iana_id must not be empty".into(),
+            ));
+        }
+        if self.windows_id.contains('\0') || self.iana_id.contains('\0') {
+            return Err(DomainError::InvalidProfile(
+                "timezone ids must not contain NUL".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +127,22 @@ pub enum DnsMode {
 pub struct DnsProfile {
     pub mode: DnsMode,
     pub servers: Vec<IpAddr>,
+}
+
+impl DnsProfile {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        match self.mode {
+            DnsMode::Host => {}
+            DnsMode::VirtualView => {
+                if self.servers.is_empty() {
+                    return Err(DomainError::InvalidProfile(
+                        "DNS VirtualView requires at least one server".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -66,6 +159,29 @@ pub struct EnvironmentProfile {
     pub dns: DnsProfile,
     pub environment: HashMap<String, String>,
     pub registry: RegistryProfile,
+}
+
+impl EnvironmentProfile {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.name.trim().is_empty() {
+            return Err(DomainError::InvalidProfile("name must not be empty".into()));
+        }
+        self.locale.validate()?;
+        self.timezone.validate()?;
+        self.dns.validate()?;
+        for (key, _) in &self.environment {
+            if !is_valid_env_name(key) {
+                return Err(DomainError::InvalidProfile(format!(
+                    "invalid environment variable name {key:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,16 +208,99 @@ pub struct RuntimeInstance {
 mod tests {
     use super::*;
 
-    #[test]
-    fn launch_target_command_keeps_raw_command() {
-        let target = LaunchTarget::Command {
-            command: "claude".into(),
-        };
-        assert!(matches!(target, LaunchTarget::Command { command } if command == "claude"));
+    fn valid_profile() -> EnvironmentProfile {
+        EnvironmentProfile {
+            id: Uuid::nil(),
+            name: "US Development".into(),
+            locale: LocaleProfile {
+                locale_name: "en-US".into(),
+                ui_language: "en-US".into(),
+                region: "US".into(),
+            },
+            timezone: TimezoneProfile {
+                windows_id: "Pacific Standard Time".into(),
+                iana_id: "America/Los_Angeles".into(),
+            },
+            dns: DnsProfile {
+                mode: DnsMode::VirtualView,
+                servers: vec!["1.1.1.1".parse().unwrap()],
+            },
+            environment: HashMap::from([("LANG".into(), "en_US.UTF-8".into())]),
+            registry: RegistryProfile::default(),
+        }
     }
 
     #[test]
-    fn dns_mode_distinct() {
-        assert_ne!(DnsMode::Host, DnsMode::VirtualView);
+    fn valid_profile_accepted() {
+        assert!(valid_profile().validate().is_ok());
     }
+
+    #[test]
+    fn region_must_be_iso_alpha2() {
+        let mut p = valid_profile();
+        p.locale.region = "USA".into();
+        assert!(matches!(p.validate(), Err(DomainError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn virtual_view_requires_servers() {
+        let mut p = valid_profile();
+        p.dns.servers.clear();
+        assert!(matches!(p.validate(), Err(DomainError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn host_dns_may_be_empty() {
+        let mut p = valid_profile();
+        p.dns.mode = DnsMode::Host;
+        p.dns.servers.clear();
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn env_name_with_equals_rejected() {
+        let mut p = valid_profile();
+        p.environment.insert("BAD=NAME".into(), "x".into());
+        assert!(matches!(p.validate(), Err(DomainError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn empty_locale_name_rejected() {
+        let mut p = valid_profile();
+        p.locale.locale_name = "  ".into();
+        assert!(matches!(p.validate(), Err(DomainError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn empty_command_rejected() {
+        let app = Application {
+            id: Uuid::nil(),
+            name: "x".into(),
+            launch: LaunchTarget::Command {
+                command: "  ".into(),
+            },
+            working_directory: None,
+            arguments: vec![],
+            default_profile_id: Uuid::nil(),
+            inherit_children: true,
+        };
+        assert!(matches!(
+            app.validate(),
+            Err(DomainError::InvalidApplication(_))
+        ));
+    }
+
+    #[test]
+    fn command_launch_target_round_trips() {
+        let target = LaunchTarget::Command {
+            command: "claude".into(),
+        };
+        let text = toml::to_string(&Wrap(target.clone())).unwrap();
+        assert!(text.contains("type = \"command\""));
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.0, target);
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Wrap(LaunchTarget);
 }

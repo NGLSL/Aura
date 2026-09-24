@@ -1,65 +1,339 @@
-//! envbox CLI: inspect Applications and Environment Profiles.
+//! envbox CLI: define and inspect Applications and Environment Profiles.
 
-use envbox_storage::ConfigStore;
+use envbox_core::{
+    Application, DnsMode, DnsProfile, EnvironmentProfile, LaunchTarget, LocaleProfile,
+    RegistryProfile, TimezoneProfile,
+};
+use envbox_storage::{validate_application, validate_profile, ConfigStore};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use uuid::Uuid;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let store = ConfigStore::new(ConfigStore::default_root());
 
     match args.first().map(String::as_str) {
-        Some("profile") if args.get(1).map(String::as_str) == Some("list") => match store.load_profiles()
-        {
-            Ok(doc) => {
-                if doc.profiles.is_empty() {
-                    println!("(no profiles)");
-                }
-                for profile in &doc.profiles {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}",
-                        profile.id,
-                        profile.name,
-                        profile.locale.locale_name,
-                        profile.locale.region,
-                        profile.timezone.windows_id
-                    );
-                }
-                ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!("error: {err}");
-                ExitCode::FAILURE
-            }
+        Some("profile") => match args.get(1).map(String::as_str) {
+            Some("list") => cmd_profile_list(&store),
+            Some("add") => cmd_profile_add(&store, &args[2..]),
+            _ => usage(),
         },
-        Some("app") if args.get(1).map(String::as_str) == Some("list") => {
-            match store.load_applications() {
-                Ok(doc) => {
-                    if doc.applications.is_empty() {
-                        println!("(no applications)");
-                    }
-                    for app in &doc.applications {
-                        println!("{}\t{}\t{:?}", app.id, app.name, app.launch);
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Some("app") => match args.get(1).map(String::as_str) {
+            Some("list") => cmd_app_list(&store),
+            Some("add") => cmd_app_add(&store, &args[2..]),
+            _ => usage(),
+        },
         Some("run") => {
             eprintln!("error: `envbox run` is not available until ticket 03");
             ExitCode::FAILURE
         }
-        _ => {
-            eprintln!("envbox — process-scoped Windows environment virtualization");
-            eprintln!();
-            eprintln!("usage:");
-            eprintln!("  envbox profile list");
-            eprintln!("  envbox app list");
-            eprintln!("  envbox run --profile <id> <command>");
+        _ => usage(),
+    }
+}
+
+fn usage() -> ExitCode {
+    eprintln!("envbox — process-scoped Windows environment virtualization");
+    eprintln!();
+    eprintln!("usage:");
+    eprintln!("  envbox profile list");
+    eprintln!("  envbox profile add --name N --locale L --ui-language U --region R \\");
+    eprintln!("     --tz-windows W --tz-iana I [--dns-mode host|virtual_view] \\");
+    eprintln!("     [--dns IP]... [--env K=V]...");
+    eprintln!("  envbox app list");
+    eprintln!("  envbox app add --name N (--command C | --executable P) --profile ID \\");
+    eprintln!("     [--working-directory D] [--arg A]... [--inherit-children]");
+    eprintln!("  envbox run --profile <id> <command>");
+    ExitCode::FAILURE
+}
+
+fn cmd_profile_list(store: &ConfigStore) -> ExitCode {
+    match store.load_profiles() {
+        Ok(doc) => {
+            if doc.profiles.is_empty() {
+                println!("(no profiles)");
+            }
+            for profile in &doc.profiles {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    profile.id,
+                    profile.name,
+                    profile.locale.locale_name,
+                    profile.locale.region,
+                    profile.timezone.windows_id,
+                    profile.dns.mode_label()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_app_list(store: &ConfigStore) -> ExitCode {
+    match store.load_applications() {
+        Ok(doc) => {
+            if doc.applications.is_empty() {
+                println!("(no applications)");
+            }
+            for app in &doc.applications {
+                let launch = match &app.launch {
+                    LaunchTarget::Executable { path } => format!("exe={}", path.display()),
+                    LaunchTarget::Command { command } => format!("cmd={command}"),
+                };
+                println!(
+                    "{}\t{}\t{}\tprofile={}",
+                    app.id, app.name, launch, app.default_profile_id
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
+    let mut name = String::new();
+    let mut locale_name = String::new();
+    let mut ui_language = String::new();
+    let mut region = String::new();
+    let mut tz_windows = String::new();
+    let mut tz_iana = String::new();
+    let mut dns_mode = DnsMode::Host;
+    let mut servers: Vec<IpAddr> = Vec::new();
+    let mut environment = HashMap::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i].as_str();
+        let take = |i: &mut usize| -> Option<String> {
+            *i += 1;
+            args.get(*i).cloned()
+        };
+        match key {
+            "--name" => name = take(&mut i).unwrap_or_default(),
+            "--locale" => locale_name = take(&mut i).unwrap_or_default(),
+            "--ui-language" => ui_language = take(&mut i).unwrap_or_default(),
+            "--region" => region = take(&mut i).unwrap_or_default(),
+            "--tz-windows" => tz_windows = take(&mut i).unwrap_or_default(),
+            "--tz-iana" => tz_iana = take(&mut i).unwrap_or_default(),
+            "--dns-mode" => {
+                let mode = take(&mut i).unwrap_or_default();
+                dns_mode = match mode.as_str() {
+                    "host" => DnsMode::Host,
+                    "virtual_view" | "virtualview" | "custom" => DnsMode::VirtualView,
+                    other => {
+                        eprintln!("error: unknown dns-mode {other:?} (host|virtual_view)");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            }
+            "--dns" => {
+                let raw = take(&mut i).unwrap_or_default();
+                match raw.parse::<IpAddr>() {
+                    Ok(ip) => servers.push(ip),
+                    Err(_) => {
+                        eprintln!("error: invalid DNS address {raw:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--env" => {
+                let raw = take(&mut i).unwrap_or_default();
+                match raw.split_once('=') {
+                    Some((k, v)) => {
+                        environment.insert(k.to_string(), v.to_string());
+                    }
+                    None => {
+                        eprintln!("error: --env expects KEY=VALUE, got {raw:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            other => {
+                eprintln!("error: unknown flag {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 1;
+    }
+
+    let profile = EnvironmentProfile {
+        id: Uuid::new_v4(),
+        name,
+        locale: LocaleProfile {
+            locale_name,
+            ui_language,
+            region,
+        },
+        timezone: TimezoneProfile {
+            windows_id: tz_windows,
+            iana_id: tz_iana,
+        },
+        dns: DnsProfile {
+            mode: dns_mode,
+            servers,
+        },
+        environment,
+        registry: RegistryProfile::default(),
+    };
+
+    if let Err(err) = validate_profile(&profile) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    if store.ensure_dirs().is_err() {
+        eprintln!("error: cannot create config directory");
+        return ExitCode::FAILURE;
+    }
+    let mut doc = match store.load_profiles() {
+        Ok(doc) => doc,
+        Err(err) => {
+            eprintln!("error: cannot load profiles.toml: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    doc.profiles.push(profile.clone());
+    match store.save_profiles(&doc) {
+        Ok(()) => {
+            println!("{}", profile.id);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
+    let mut name = String::new();
+    let mut command = String::new();
+    let mut executable = String::new();
+    let mut profile_raw = String::new();
+    let mut working_directory: Option<PathBuf> = None;
+    let mut arguments: Vec<String> = Vec::new();
+    let mut inherit_children = true;
+
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i].as_str();
+        let take = |i: &mut usize| -> Option<String> {
+            *i += 1;
+            args.get(*i).cloned()
+        };
+        match key {
+            "--name" => name = take(&mut i).unwrap_or_default(),
+            "--command" => command = take(&mut i).unwrap_or_default(),
+            "--executable" => executable = take(&mut i).unwrap_or_default(),
+            "--profile" => profile_raw = take(&mut i).unwrap_or_default(),
+            "--working-directory" => {
+                working_directory = take(&mut i).map(PathBuf::from);
+            }
+            "--arg" => {
+                if let Some(v) = take(&mut i) {
+                    arguments.push(v);
+                }
+            }
+            "--inherit-children" => inherit_children = true,
+            "--no-inherit-children" => inherit_children = false,
+            other => {
+                eprintln!("error: unknown flag {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 1;
+    }
+
+    let launch = if !executable.is_empty() {
+        LaunchTarget::Executable {
+            path: PathBuf::from(executable),
+        }
+    } else if !command.is_empty() {
+        LaunchTarget::Command { command }
+    } else {
+        eprintln!("error: provide --command or --executable");
+        return ExitCode::FAILURE;
+    };
+
+    let default_profile_id = match profile_raw.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!("error: --profile must be a UUID, got {profile_raw:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Default profile must already exist (stable id contract).
+    match store.load_profiles() {
+        Ok(doc) if doc.profiles.iter().any(|p| p.id == default_profile_id) => {}
+        Ok(_) => {
+            eprintln!("error: profile {default_profile_id} not found");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let app = Application {
+        id: Uuid::new_v4(),
+        name,
+        launch,
+        working_directory,
+        arguments,
+        default_profile_id,
+        inherit_children,
+    };
+
+    if let Err(err) = validate_application(&app) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    if store.ensure_dirs().is_err() {
+        eprintln!("error: cannot create config directory");
+        return ExitCode::FAILURE;
+    }
+    let mut doc = match store.load_applications() {
+        Ok(doc) => doc,
+        Err(err) => {
+            eprintln!("error: cannot load applications.toml: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    doc.applications.push(app.clone());
+    match store.save_applications(&doc) {
+        Ok(()) => {
+            println!("{}", app.id);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+trait DnsModeLabel {
+    fn mode_label(&self) -> &'static str;
+}
+
+impl DnsModeLabel for DnsProfile {
+    fn mode_label(&self) -> &'static str {
+        match self.mode {
+            DnsMode::Host => "host",
+            DnsMode::VirtualView => "virtual_view",
         }
     }
 }

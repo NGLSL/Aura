@@ -6,4 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

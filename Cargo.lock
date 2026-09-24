@@ -20,6 +20,7 @@ version = "0.1.0"
 dependencies = [
  "envbox-core",
  "envbox-storage",
+ "uuid",
 ]
 
 [[package]]
@@ -27,6 +28,8 @@ name = "envbox-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "thiserror",
+ "toml",
  "uuid",
 ]
 
@@ -55,6 +58,7 @@ dependencies = [
  "thiserror",
  "toml",
  "uuid",
+ "windows",
 ]
 
 [[package]]
