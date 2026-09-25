@@ -9,6 +9,15 @@ use std::time::SystemTime;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod session;
+
+pub use session::{
+    capabilities_for_target, evaluate_injection_support, isolation_for_strategy, is_packaged_target,
+    select_attach_strategy, ActivatedTarget, AttachStrategy, EnvironmentSession, InjectionCapability,
+    IntegrityLevel, IsolationGuarantee, MitigationPolicy, PackageIdentity, SessionState,
+    TargetCapabilities,
+};
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DomainError {
     #[error("invalid Environment Profile: {0}")]
@@ -22,6 +31,12 @@ pub enum DomainError {
 pub enum LaunchTarget {
     Executable { path: PathBuf },
     Command { command: String },
+    /// Packaged / WindowsApps target activated by AUMID (never raw WindowsApps exe).
+    Packaged {
+        aumid: String,
+        package_full_name: String,
+        package_family_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +69,11 @@ impl Application {
             LaunchTarget::Command { command } if command.trim().is_empty() => {
                 return Err(DomainError::InvalidApplication(
                     "command must not be empty".into(),
+                ));
+            }
+            LaunchTarget::Packaged { aumid, .. } if aumid.trim().is_empty() => {
+                return Err(DomainError::InvalidApplication(
+                    "packaged aumid must not be empty".into(),
                 ));
             }
             _ => {}
@@ -227,6 +247,15 @@ pub struct RuntimeInstance {
     pub process_ids: HashSet<u32>,
     pub started_at: SystemTime,
     pub status: InstanceStatus,
+    /// Packaged sessions (ticket 27 / packaged-v1): optional identity + strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_family_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aumid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_guarantee: Option<IsolationGuarantee>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_strategy: Option<AttachStrategy>,
 }
 
 /// Audit Mode event schema v1 (ticket 20). One JSON object per line.

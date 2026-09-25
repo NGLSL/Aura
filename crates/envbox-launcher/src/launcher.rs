@@ -22,12 +22,30 @@ pub enum LaunchError {
     WorkingDirectoryMissing(PathBuf),
     #[error("profile invalid: {0}")]
     InvalidProfile(String),
-    #[error("failed to create process: {0}")]
-    CreateProcess(String),
+    #[error("failed to create process (GetLastError={code}): {message}")]
+    CreateProcess { code: u32, message: String },
     #[error("comspec not set")]
     ComSpecMissing,
     #[error(transparent)]
     Inject(#[from] crate::injection::InjectError),
+}
+
+impl LaunchError {
+    /// Win32/API failure carrying the saved GetLastError code.
+    pub fn create_process(code: u32, message: impl Into<String>) -> Self {
+        Self::CreateProcess {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Non-Win32 / policy rejection (no OS error code).
+    pub fn create_process_msg(message: impl Into<String>) -> Self {
+        Self::CreateProcess {
+            code: 0,
+            message: message.into(),
+        }
+    }
 }
 
 pub struct LaunchRequest {
@@ -59,13 +77,15 @@ pub struct LaunchedProcess {
 }
 
 #[cfg(windows)]
-mod win {
+pub mod win {
     use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 
     pub fn last_error() -> u32 {
         unsafe { GetLastError().0 }
     }
 
+    /// RAII process/thread HANDLE. Not Clone — one owner closes it.
+    #[derive(Debug)]
     pub struct SafeHandle(pub HANDLE);
 
     impl Drop for SafeHandle {
@@ -254,6 +274,14 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
             let resolved = resolve_command(command, path_env.as_deref())?;
             (resolved, req.arguments.clone())
         }
+        LaunchTarget::Packaged { aumid, .. } => {
+            // Packaged roots go through Activation/Attach seams (session.rs),
+            // never a raw WindowsApps exe. Keep `launch()` for Win32 golden path.
+            return Err(LaunchError::create_process_msg(format!(
+                "packaged target must use session start (AUMID={aumid}); \
+                 do not CreateProcess a WindowsApps exe"
+            )));
+        }
     };
 
     let mut job = InstanceJob::create()?;
@@ -283,7 +311,7 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     if let Err(err) = job.assign_pid(child.pid) {
         // Startup Fail Policy: never leave a suspended Root Process behind.
         if let Err(kill_err) = child.kill_raw() {
-            return Err(LaunchError::CreateProcess(format!(
+            return Err(LaunchError::create_process_msg(format!(
                 "job assign failed ({err}); also failed to terminate pid={}: {kill_err}",
                 child.pid
             )));
@@ -299,9 +327,10 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
                 if ResumeThread(child.thread.0) == u32::MAX {
                     let code = win::last_error();
                     let _ = job.terminate();
-                    return Err(LaunchError::CreateProcess(format!(
-                        "ResumeThread failed (GetLastError={code})"
-                    )));
+                    return Err(LaunchError::create_process(
+                        code,
+                        "ResumeThread failed".to_string(),
+                    ));
                 }
             }
         }
@@ -321,6 +350,134 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     })
 }
 
+/// Map a LaunchError from the spawn path onto ActivateError (numeric code preserved).
+fn map_launch_to_activate(e: LaunchError) -> crate::activation::ActivateError {
+    match e {
+        LaunchError::Inject(inj) => crate::activation::ActivateError::Inject(inj),
+        LaunchError::CreateProcess { code, .. } if code != 0 => {
+            crate::activation::ActivateError::CreateProcess(code)
+        }
+        other => crate::activation::ActivateError::Resolve(other.to_string()),
+    }
+}
+
+/// Spawn result used by ActivationBackend (pid + optional suspend handles).
+pub struct ActivationSpawn {
+    pub pid: u32,
+    pub suspended: bool,
+    #[cfg(windows)]
+    pub process: win::SafeHandle,
+    #[cfg(windows)]
+    pub thread: Option<win::SafeHandle>,
+}
+
+/// Spawn a Win32/Command target for the activation seam.
+///
+/// Profile mode: DetourCreateProcessWithDllExW (CREATE_SUSPENDED) when
+/// `runtime_dll` is set; otherwise plain CreateProcess.
+pub fn spawn_for_activation(
+    resolved: &ResolvedCommand,
+    user_args: &[String],
+    req: &crate::activation::ActivationRequest,
+) -> Result<ActivationSpawn, crate::activation::ActivateError> {
+    let env_block = encode_environment_block(&req.environment);
+    let (program, args) = spawn_args(resolved, user_args, &req.environment).map_err(|e| {
+        crate::activation::ActivateError::Resolve(e.to_string())
+    })?;
+
+    if let Some(dll) = &req.runtime_dll {
+        let child = spawn_suspended(
+            &program,
+            &args,
+            req.working_directory.as_deref(),
+            &env_block,
+            dll,
+        )
+        .map_err(map_launch_to_activate)?;
+        Ok(ActivationSpawn {
+            pid: child.pid,
+            suspended: true,
+            #[cfg(windows)]
+            process: child.process,
+            #[cfg(windows)]
+            thread: Some(child.thread),
+        })
+    } else {
+        let child = spawn_plain(
+            &program,
+            &args,
+            req.working_directory.as_deref(),
+            &env_block,
+        )
+        .map_err(map_launch_to_activate)?;
+        Ok(ActivationSpawn {
+            pid: child.pid,
+            suspended: false,
+            #[cfg(windows)]
+            process: child.process,
+            #[cfg(windows)]
+            thread: Some(child.thread),
+        })
+    }
+}
+
+/// Open a process handle by PID (packaged attach path).
+#[cfg(windows)]
+pub fn open_process_handle(
+    pid: u32,
+) -> Result<win::SafeHandle, crate::activation::ActivateError> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
+    };
+    unsafe {
+        let handle = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+        .map_err(|_| {
+            crate::activation::ActivateError::OpenProcess(win::last_error())
+        })?;
+        Ok(win::SafeHandle(handle))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_process_handle(
+    pid: u32,
+) -> Result<(), crate::activation::ActivateError> {
+    let _ = pid;
+    Err(crate::activation::ActivateError::UnsupportedTarget(
+        "open_process_handle is Windows-only".into(),
+    ))
+}
+
+/// Resume a suspended activated root (PreExecution).
+pub fn resume_activated(
+    target: &crate::activation::ActivatedTarget,
+) -> Result<(), crate::activation::ActivateError> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::ResumeThread;
+        let Some(thread) = &target.thread else {
+            return Ok(());
+        };
+        unsafe {
+            if ResumeThread(thread.0) == u32::MAX {
+                return Err(crate::activation::ActivateError::ResumeThread(
+                    win::last_error(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 struct SpawnedChild {
     pid: u32,
@@ -334,10 +491,10 @@ impl SpawnedChild {
         use windows::Win32::System::Threading::TerminateProcess;
         unsafe {
             if TerminateProcess(self.process.0, 1).is_err() {
-                return Err(LaunchError::CreateProcess(format!(
-                    "TerminateProcess failed (GetLastError={})",
-                    win::last_error()
-                )));
+                return Err(LaunchError::create_process(
+                    win::last_error(),
+                    "TerminateProcess failed".to_string(),
+                ));
             }
         }
         Ok(())
@@ -454,10 +611,10 @@ fn spawn_plain(
             &mut pi,
         );
         if ok.is_err() {
-            return Err(LaunchError::CreateProcess(format!(
-                "CreateProcessW failed (GetLastError={})",
-                win::last_error()
-            )));
+            return Err(LaunchError::create_process(
+                win::last_error(),
+                "CreateProcessW failed".to_string(),
+            ));
         }
         Ok(SpawnedChild {
             pid: pi.dwProcessId,
@@ -474,8 +631,8 @@ fn spawn_plain(
     _working_directory: Option<&Path>,
     _env_block: &[u16],
 ) -> Result<SpawnedChild, LaunchError> {
-    Err(LaunchError::CreateProcess(
-        "CreateProcessW is Windows-only".into(),
+    Err(LaunchError::create_process_msg(
+        "CreateProcessW is Windows-only",
     ))
 }
 
@@ -507,8 +664,8 @@ fn spawn_suspended(
     _runtime_dll: &Path,
 ) -> Result<SpawnedChild, LaunchError> {
     let _ = (program, args, working_directory);
-    Err(LaunchError::CreateProcess(
-        "DetourCreateProcessWithDllExW is Windows-only".into(),
+    Err(LaunchError::create_process_msg(
+        "DetourCreateProcessWithDllExW is Windows-only",
     ))
 }
 

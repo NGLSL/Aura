@@ -165,11 +165,14 @@ impl EnvBoxApp {
                 name: app.name.clone(),
                 kind: match &app.launch {
                     LaunchTarget::Command { .. } => LaunchKind::Command,
-                    LaunchTarget::Executable { .. } => LaunchKind::Executable,
+                    LaunchTarget::Executable { .. } | LaunchTarget::Packaged { .. } => {
+                        LaunchKind::Executable
+                    }
                 },
                 path: match &app.launch {
                     LaunchTarget::Command { command } => command.clone(),
                     LaunchTarget::Executable { path } => path.display().to_string(),
+                    LaunchTarget::Packaged { aumid, .. } => aumid.clone(),
                 },
                 args: format_args(&app.arguments),
                 work_dir: app
@@ -183,6 +186,7 @@ impl EnvBoxApp {
                 icon_src: match &app.launch {
                     LaunchTarget::Command { command } => command.clone(),
                     LaunchTarget::Executable { path } => path.display().to_string(),
+                    LaunchTarget::Packaged { aumid, .. } => aumid.clone(),
                 },
             };
         }
@@ -290,6 +294,7 @@ impl EnvBoxApp {
                 let src = match &a.launch {
                     LaunchTarget::Command { command } => command.clone(),
                     LaunchTarget::Executable { path } => path.display().to_string(),
+                    LaunchTarget::Packaged { aumid, .. } => aumid.clone(),
                 };
                 (a.id, src)
             })
@@ -429,6 +434,9 @@ impl EnvBoxApp {
                         }
                         LaunchTarget::Executable { path } => {
                             path.to_string_lossy().to_ascii_lowercase().contains(&q)
+                        }
+                        LaunchTarget::Packaged { aumid, .. } => {
+                            aumid.to_ascii_lowercase().contains(&q)
                         }
                     }
             })

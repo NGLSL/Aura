@@ -171,8 +171,8 @@ fn resolve_runtime_dll_for_arch(
         let dll_arch = pe_arch(&p).unwrap_or(PeArch::Unknown(0));
         match (dll_arch, target_arch) {
             (PeArch::X86, PeArch::X86) | (PeArch::X64, PeArch::X64) => Ok(p),
-            // Unknown PE (corrupt / non-PE): let Detours fail closed later.
-            (PeArch::Unknown(_), _) => Ok(p),
+            // Corrupt / non-PE Runtime must fail closed (Startup Fail Policy).
+            (PeArch::Unknown(_), _) => Err(InjectError::RuntimeDllInvalid(p)),
             _ => Err(InjectError::ArchitectureMismatch {
                 dll: p,
                 dll_arch,

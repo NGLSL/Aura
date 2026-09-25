@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "ipc_bootstrap.h"
+
 static RuntimeProfile g_profile = {};
 static int g_loaded = 0;
 static char g_dll_path_a[MAX_PATH] = {};
@@ -324,14 +326,53 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
   return 0;
 }
 
+// Merge an IPC-fetched profile into g_profile (IPC payload is authoritative
+// when used). Preserves fields the payload omitted only when it is empty.
+static void ApplyIpcProfile(const RuntimeProfile* src) {
+  if (src->profile_id[0] != L'\0') {
+    wcsncpy_s(g_profile.profile_id, src->profile_id, _TRUNCATE);
+  }
+  if (src->instance_id[0] != L'\0') {
+    wcsncpy_s(g_profile.instance_id, src->instance_id, _TRUNCATE);
+  }
+  if (src->has_locale) {
+    wcsncpy_s(g_profile.locale_name, src->locale_name, _TRUNCATE);
+    g_profile.has_locale = 1;
+  }
+  if (src->has_ui) {
+    wcsncpy_s(g_profile.ui_language, src->ui_language, _TRUNCATE);
+    g_profile.has_ui = 1;
+  }
+  if (src->has_region) {
+    wcsncpy_s(g_profile.region, src->region, _TRUNCATE);
+    g_profile.has_region = 1;
+  }
+  if (src->has_tz) {
+    wcsncpy_s(g_profile.tz_windows, src->tz_windows, _TRUNCATE);
+    g_profile.has_tz = 1;
+  }
+  if (src->tz_iana[0] != L'\0') {
+    wcsncpy_s(g_profile.tz_iana, src->tz_iana, _TRUNCATE);
+  }
+  g_profile.inherit_children = src->inherit_children;
+  g_profile.audit = src->audit;
+  g_profile.dns_mode = src->dns_mode;
+  g_profile.dns_server_count = src->dns_server_count;
+  for (int i = 0; i < src->dns_server_count && i < ENVBOX_DNS_MAX; i++) {
+    strncpy_s(g_profile.dns_servers[i], src->dns_servers[i], _TRUNCATE);
+  }
+  g_profile.registry_path_count = src->registry_path_count;
+  for (int i = 0; i < src->registry_path_count && i < ENVBOX_REG_MAX; i++) {
+    wcsncpy_s(g_profile.registry_paths[i], src->registry_paths[i], _TRUNCATE);
+  }
+}
+
 int EnvBoxLoadProfile() {
   if (g_loaded) {
     return 1;  // immutable after first successful init
   }
-  if (!ReadEnvW(L"ENVBOX_PROFILE_ID", g_profile.profile_id, 64)) {
-    OutputDebugStringA("EnvBox: ENVBOX_PROFILE_ID missing\n");
-    return 0;
-  }
+  int has_env_profile_id =
+      ReadEnvW(L"ENVBOX_PROFILE_ID", g_profile.profile_id, 64);
   ReadEnvW(L"ENVBOX_INSTANCE_ID", g_profile.instance_id, 64);
 
   // Child process inheritance default: on (Application may disable).
@@ -363,13 +404,38 @@ int EnvBoxLoadProfile() {
     }
   }
 
-  char id_utf8[64] = {};
-  WideCharToMultiByte(CP_UTF8, 0, g_profile.profile_id, -1, id_utf8,
-                      (int)sizeof(id_utf8), nullptr, nullptr);
-  if (!LoadFromProfilesToml(id_utf8)) {
+  int loaded = 0;
+  if (has_env_profile_id) {
+    // Preferred path (unchanged): profiles.toml selected by ENVBOX_PROFILE_ID.
+    char id_utf8[64] = {};
+    WideCharToMultiByte(CP_UTF8, 0, g_profile.profile_id, -1, id_utf8,
+                        (int)sizeof(id_utf8), nullptr, nullptr);
+    if (LoadFromProfilesToml(id_utf8)) {
+      loaded = 1;
+    } else {
+      // Optional supplement: Host may still resolve the Profile over IPC.
+      RuntimeProfile ipc = {};
+      if (EnvBoxIpcFetchProfile(&ipc)) {
+        ApplyIpcProfile(&ipc);
+        loaded = 1;
+      }
+    }
+  } else {
+    // Packaged root has no Environment Block: IPC Bootstrap (ticket 40).
+    RuntimeProfile ipc = {};
+    if (EnvBoxIpcFetchProfile(&ipc)) {
+      ApplyIpcProfile(&ipc);
+      loaded = 1;
+    }
+  }
+
+  if (!loaded) {
+    // Startup Fail Policy: never run without a Profile (env or IPC).
     return 0;
   }
 
   g_loaded = 1;
+  // Best-effort readiness notice; never affects startup success.
+  EnvBoxIpcNotifyRuntimeReady();
   return 1;
 }

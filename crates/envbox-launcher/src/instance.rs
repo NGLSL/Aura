@@ -67,6 +67,10 @@ impl InstanceManager {
             process_ids: Default::default(),
             started_at: std::time::SystemTime::now(),
             status: InstanceStatus::Starting,
+            package_family_name: None,
+            aumid: None,
+            isolation_guarantee: None,
+            attach_strategy: None,
         };
 
         match launch(request) {

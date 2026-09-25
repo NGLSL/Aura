@@ -142,6 +142,7 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string()),
+        LaunchTarget::Packaged { aumid, .. } => aumid.clone(),
     };
 
     let profile_badge = badge(

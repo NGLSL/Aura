@@ -8,13 +8,21 @@
 |------|------|
 | **Application** | 用户配置的可启动应用（名称、LaunchTarget、默认 Profile、工作目录等） |
 | **Environment Profile（Profile）** | 一套可复用的环境视图：Locale、UI Language、Region、Timezone、DNS View、Environment Variables、Registry 白名单 |
-| **RuntimeInstance** | 一次 Run 产生的运行实例；同一 Application 可并存多个实例 |
+| **EnvironmentSession** | 一次 Run 的控制面聚合：目标、Profile、Root/子进程集合、Package Identity、IsolationGuarantee、AttachStrategy、状态 |
+| **RuntimeInstance** | 一次 Run 的运行记录；同一 Application 可并存多个实例 |
 | **Process Tree Instance** | 隔离单位：Root Process 及其子进程树；不是可执行文件名 |
-| **Root Process** | EnvBox 直接创建的进程；后续子进程经注入继承 Profile |
-| **LaunchTarget** | 启动方式：完整/PATH 解析的 Executable，或 Command（含 `.cmd`/`.bat` wrapper） |
+| **Root Process** | EnvBox 直接创建或激活的进程；后续子进程经注入继承 Profile |
+| **LaunchTarget** | 启动方式：Executable / Command / Packaged（AUMID，禁止直接跑 WindowsApps exe） |
+| **ActivationBackend** | 激活后端：Win32（CreateProcess SUSPENDED）/ Packaged（ActivateApplication） |
+| **AttachStrategy** | 注入时机：PreExecution（挂起注入）/ PostActivation（激活后注入）/ PackageDebug（预留） |
+| **RuntimeAttacher / RuntimeInjector** | 共享注入缝：向 PID 装载 envbox-runtime；与激活方式解耦 |
+| **TargetCapabilities** | 目标能力标志：can_suspend / can_inject_runtime / can_create_environment_block / can_assign_job / can_track_children |
+| **IsolationGuarantee** | 隔离保证级别：FullPreExecution / PostActivation / Partial |
+| **early-start race** | Packaged root 在激活后、注入前可能已读到 Host 值的窗口（PostActivation 已知限制） |
+| **Runtime IPC Bootstrap** | Runtime 经 Named Pipe 按 PID 向 Host 取 RuntimeProfile；ENVBOX_* 仅作 Win32 回退 |
 | **Packaging** | 目标的打包模型：Win32 / Packaged Win32（Full Trust）/ AppContainer（UWP）/ PackagedUnknown。按 Package Identity 判断，不按目录 |
 | **AUMID** | AppUserModelId；打包应用的激活标识（`PackageFamilyName!ApplicationId`） |
-| **Injection Support** | Runtime 注入能力：Supported（挂起注入）/ Delayed（激活后注入）/ Unsupported（AppContainer 等，拒绝启动，不静默降级） |
+| **Injection Support** | Runtime 注入能力：Supported（可注入）/ Delayed（AttachStrategy::PostActivation 激活后注入）/ Unsupported（AppContainer / mitigation Blocking 或 Unknown 等，拒绝启动，不静默降级） |
 | **Host** | 宿主 Windows 系统配置与真实时间线；EnvBox 不得修改 Host |
 | **Probe（envbox-probe）** | 打印全部待虚拟化环境值的验收基准工具 |
 
@@ -46,3 +54,11 @@
 | **Process-scoped** | 所有修改仅属于一个 RuntimeInstance 的进程树 |
 | **Host-transparent** | 不修改 Windows 全局配置 |
 | **Environment-consistent** | 同一 Profile 下 Region/Locale/Language/Timezone/DNS/Environment 尽量逻辑一致 |
+
+## 隔离分层（文档概念，非代码）
+
+| Tier | 目标 | 注入时机 | IsolationGuarantee |
+|------|------|----------|--------------------|
+| Tier 1 | 原生 Win32 | PreExecution（挂起注入） | FullPreExecution |
+| Tier 2 | Packaged Win32 mediumIL | PostActivation（AUMID 后注入） | PostActivation（有 early-start race） |
+| Tier 3 | AppContainer / 受保护进程 | 不支持（Fail Closed） | — |

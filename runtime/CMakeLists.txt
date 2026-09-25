@@ -28,6 +28,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/dllmain.cpp
   src/audit.cpp
   src/runtime_profile.cpp
+  src/ipc_bootstrap.cpp
   src/hooks_time.cpp
   src/hooks_geo.cpp
   src/hooks_locale.cpp

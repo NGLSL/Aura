@@ -8,6 +8,8 @@ Parent: .scratch/envbox-v02/spec.md
 
 **Status:** open
 
+> 后续实现归 **Packaged App Backend V1 / EnvironmentSession**：见 `.scratch/envbox-packaged-v1/spec.md`（tickets 37–41）。本 issue 保留分类/徽章策略结论。
+
 - [x] 分类模型：Win32 / Packaged Win32 / AppContainer / PackagedUnknown
 - [x] Capability Probe（路径 + AppxManifest 启发式）→ 可注入 / 延迟注入 / 不支持注入
 - [x] 添加应用选择器展示来源、包类型、注入能力徽章

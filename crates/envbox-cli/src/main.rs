@@ -340,30 +340,32 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let request = envbox_launcher::LaunchRequest {
+    let request = envbox_launcher::SessionStartRequest {
+        application_id: Uuid::nil(),
         launch: envbox_core::LaunchTarget::Command {
             command: command.clone(),
         },
         arguments: command_args.to_vec(),
         working_directory,
         profile: Some(profile.clone()),
-        instance_id: Uuid::new_v4(),
         inherit_children: !no_inherit,
         audit,
     };
 
-    match envbox_launcher::launch(request) {
-        Ok(mut child) => {
+    match envbox_launcher::start_session(request) {
+        Ok(mut handle) => {
             eprintln!(
                 "envbox: started pid={} instance={} profile={} (Runtime + core hooks active)",
-                child.pid, child.instance_id, child.profile_id
+                handle.instance.root_pid,
+                handle.instance.id,
+                handle.instance.profile_id
             );
-            match child.wait() {
-                Ok(status) => {
-                    if status.success() {
+            match handle.wait_root() {
+                Ok(code) => {
+                    if code == 0 {
                         ExitCode::SUCCESS
                     } else {
-                        ExitCode::from(status.code().unwrap_or(1) as u8)
+                        ExitCode::from(code.clamp(0, 255) as u8)
                     }
                 }
                 Err(err) => {
@@ -415,6 +417,7 @@ fn cmd_app_list(store: &ConfigStore) -> ExitCode {
                 let launch = match &app.launch {
                     LaunchTarget::Executable { path } => format!("exe={}", path.display()),
                     LaunchTarget::Command { command } => format!("cmd={command}"),
+                    LaunchTarget::Packaged { aumid, .. } => format!("packaged={aumid}"),
                 };
                 println!(
                     "{}\t{}\t{}\tprofile={}",
