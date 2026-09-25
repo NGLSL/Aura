@@ -75,6 +75,83 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// WebRTC Privacy policy tokens (ticket 54). Mirrors envbox-core::WebRtcPolicy
+// parse / as_str / chromium_ip_handling_policy exactly; C++ never invents new
+// semantics. Canonical tokens: host, public_interface_only, proxy_only, strict.
+// ---------------------------------------------------------------------------
+static const wchar_t kWebRtcHost[] = L"host";
+static const wchar_t kWebRtcPublicInterfaceOnly[] = L"public_interface_only";
+static const wchar_t kWebRtcProxyOnly[] = L"proxy_only";
+static const wchar_t kWebRtcStrict[] = L"strict";
+
+const wchar_t* EnvBoxWebRtcChromiumValue(const wchar_t* policy_token) {
+  if (policy_token == nullptr || policy_token[0] == L'\0') {
+    return nullptr;
+  }
+  if (_wcsicmp(policy_token, kWebRtcPublicInterfaceOnly) == 0) {
+    return L"default_public_interface_only";
+  }
+  if (_wcsicmp(policy_token, kWebRtcProxyOnly) == 0 ||
+      _wcsicmp(policy_token, kWebRtcStrict) == 0) {
+    return L"disable_non_proxied_udp";
+  }
+  return nullptr;  // host (and unknown): never add / never overwrite.
+}
+
+int EnvBoxNormalizeWebRtcPolicy(const wchar_t* raw, wchar_t* out, size_t cap) {
+  if (out == nullptr || cap == 0) {
+    return 0;
+  }
+  wcsncpy_s(out, cap, kWebRtcHost, _TRUNCATE);
+  if (raw == nullptr) {
+    return 1;  // empty -> host
+  }
+  while (*raw == L' ' || *raw == L'\t' || *raw == L'\n' || *raw == L'\r') {
+    raw++;
+  }
+  size_t len = wcslen(raw);
+  while (len > 0 && (raw[len - 1] == L' ' || raw[len - 1] == L'\t' ||
+                     raw[len - 1] == L'\n' || raw[len - 1] == L'\r')) {
+    len--;
+  }
+  if (len == 0) {
+    return 1;  // empty -> host
+  }
+  // Bounded ASCII lowercase (mirror Rust to_ascii_lowercase + alias match).
+  wchar_t norm[32];
+  if (len >= sizeof(norm) / sizeof(norm[0])) {
+    return 0;
+  }
+  for (size_t i = 0; i < len; i++) {
+    wchar_t c = raw[i];
+    if (c >= L'A' && c <= L'Z') {
+      c = (wchar_t)(c - L'A' + L'a');
+    }
+    norm[i] = c;
+  }
+  norm[len] = L'\0';
+
+  const wchar_t* canonical = nullptr;
+  if (wcscmp(norm, kWebRtcHost) == 0) {
+    canonical = kWebRtcHost;
+  } else if (wcscmp(norm, kWebRtcPublicInterfaceOnly) == 0 ||
+             wcscmp(norm, L"public-interface-only") == 0) {
+    canonical = kWebRtcPublicInterfaceOnly;
+  } else if (wcscmp(norm, kWebRtcProxyOnly) == 0 ||
+             wcscmp(norm, L"proxy-only") == 0 ||
+             wcscmp(norm, L"disable_non_proxied_udp") == 0) {
+    canonical = kWebRtcProxyOnly;
+  } else if (wcscmp(norm, kWebRtcStrict) == 0) {
+    canonical = kWebRtcStrict;
+  }
+  if (canonical == nullptr) {
+    return 0;  // unknown: never silently run as host.
+  }
+  wcsncpy_s(out, cap, canonical, _TRUNCATE);
+  return 1;
+}
+
 // Merge an IPC-fetched profile into g_profile (IPC payload is authoritative
 // when used). Preserves fields the payload omitted only when it is empty.
 static void ApplyIpcProfile(const RuntimeProfile* src) {
@@ -113,6 +190,9 @@ static void ApplyIpcProfile(const RuntimeProfile* src) {
   g_profile.registry_path_count = src->registry_path_count;
   for (int i = 0; i < src->registry_path_count && i < ENVBOX_REG_MAX; i++) {
     wcsncpy_s(g_profile.registry_paths[i], src->registry_paths[i], _TRUNCATE);
+  }
+  if (src->webrtc_policy[0] != L'\0') {
+    wcsncpy_s(g_profile.webrtc_policy, src->webrtc_policy, _TRUNCATE);
   }
 }
 
@@ -215,6 +295,19 @@ static int LoadFromEnvValues() {
     SplitListW(reg_raw, g_profile.registry_paths, ENVBOX_REG_MAX,
                &g_profile.registry_path_count);
     (void)tmp;
+  }
+
+  // Browser / Network Guard WebRTC policy token (ticket 51/54). Default
+  // host; unknown tokens are rejected (never silently run with the wrong
+  // policy). Alias set matches envbox-core::WebRtcPolicy::parse.
+  wchar_t webrtc_raw[32] = {};
+  if (ReadEnvW(L"ENVBOX_WEBRTC_POLICY", webrtc_raw, 32)) {
+    if (!EnvBoxNormalizeWebRtcPolicy(webrtc_raw, g_profile.webrtc_policy, 32)) {
+      OutputDebugStringA("EnvBox: invalid ENVBOX_WEBRTC_POLICY token\n");
+      return 0;
+    }
+  } else {
+    wcsncpy_s(g_profile.webrtc_policy, L"host", _TRUNCATE);
   }
 
   if (!g_profile.has_locale || !g_profile.has_ui || !g_profile.has_region ||

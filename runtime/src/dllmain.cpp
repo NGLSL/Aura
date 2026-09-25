@@ -24,6 +24,7 @@ static int InstallAllHooks() {
   ok += EnvBoxInstallDnsHooks();
   ok += EnvBoxInstallRegistryHooks();
   ok += EnvBoxInstallProcessHooks();
+  ok += EnvBoxInstallNetworkHooks();
 
   LONG err = DetourTransactionCommit();
   if (err != NO_ERROR) {

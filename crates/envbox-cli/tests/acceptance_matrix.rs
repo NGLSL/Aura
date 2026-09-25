@@ -298,6 +298,7 @@ fn acceptance_notepad_launch_and_stop() {
         },
         environment: HashMap::new(),
         registry: RegistryProfile::default(),
+            browser: Default::default(),
     };
     let app = Application {
         id: Uuid::new_v4(),

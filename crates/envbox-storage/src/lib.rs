@@ -281,6 +281,7 @@ mod tests {
                 ("TZ".into(), "America/Los_Angeles".into()),
             ]),
             registry: RegistryProfile::default(),
+            browser: Default::default(),
         }
     }
 
@@ -318,6 +319,28 @@ mod tests {
         assert_eq!(
             loaded.profiles[0].timezone.windows_id,
             "Pacific Standard Time"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_webrtc_round_trips_through_toml() {
+        let dir = std::env::temp_dir().join(format!("envbox-test-webrtc-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&dir);
+        store.ensure_dirs().unwrap();
+        let mut p = sample_profile();
+        p.browser.webrtc = envbox_core::WebRtcPolicy::Strict;
+        store
+            .save_profiles(&ProfileDocument {
+                profiles: vec![p.clone()],
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(store.profiles_path()).unwrap();
+        assert!(text.contains("webrtc"), "expected webrtc in TOML:\n{text}");
+        let loaded = store.load_profiles().unwrap();
+        assert_eq!(
+            loaded.profiles[0].browser.webrtc,
+            envbox_core::WebRtcPolicy::Strict
         );
         let _ = fs::remove_dir_all(&dir);
     }

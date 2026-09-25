@@ -63,6 +63,72 @@ impl std::fmt::Display for DnsChoice {
     }
 }
 
+/// WebRTC Privacy form choice (mirrors `DnsChoice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebRtcChoice {
+    Host,
+    PublicInterfaceOnly,
+    ProxyOnly,
+    Strict,
+}
+
+impl WebRtcChoice {
+    pub const ALL: [WebRtcChoice; 4] = [
+        WebRtcChoice::Host,
+        WebRtcChoice::PublicInterfaceOnly,
+        WebRtcChoice::ProxyOnly,
+        WebRtcChoice::Strict,
+    ];
+
+    pub fn to_policy(self) -> envbox_core::WebRtcPolicy {
+        match self {
+            WebRtcChoice::Host => envbox_core::WebRtcPolicy::Host,
+            WebRtcChoice::PublicInterfaceOnly => envbox_core::WebRtcPolicy::PublicInterfaceOnly,
+            WebRtcChoice::ProxyOnly => envbox_core::WebRtcPolicy::ProxyOnly,
+            WebRtcChoice::Strict => envbox_core::WebRtcPolicy::Strict,
+        }
+    }
+
+    pub fn from_policy(p: &envbox_core::WebRtcPolicy) -> Self {
+        match p {
+            envbox_core::WebRtcPolicy::Host => WebRtcChoice::Host,
+            envbox_core::WebRtcPolicy::PublicInterfaceOnly => WebRtcChoice::PublicInterfaceOnly,
+            envbox_core::WebRtcPolicy::ProxyOnly => WebRtcChoice::ProxyOnly,
+            envbox_core::WebRtcPolicy::Strict => WebRtcChoice::Strict,
+        }
+    }
+
+    /// Compact badge text for profile cards / instance rows.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            WebRtcChoice::Host => "WebRTC: 宿主",
+            WebRtcChoice::PublicInterfaceOnly => "WebRTC: 仅公网",
+            WebRtcChoice::ProxyOnly => "WebRTC: 仅代理",
+            WebRtcChoice::Strict => "WebRTC: 严格",
+        }
+    }
+}
+
+impl std::fmt::Display for WebRtcChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WebRtcChoice::Host => write!(f, "Host"),
+            WebRtcChoice::PublicInterfaceOnly => write!(f, "PublicInterfaceOnly"),
+            WebRtcChoice::ProxyOnly => write!(f, "ProxyOnly"),
+            WebRtcChoice::Strict => write!(f, "Strict"),
+        }
+    }
+}
+
+/// Display-only Browser Guarantee label.
+/// `NetworkEnforced` is Strict + Runtime Network Guard (session UDP deny).
+pub fn browser_guarantee_label(policy: envbox_core::WebRtcPolicy) -> &'static str {
+    match policy.browser_guarantee() {
+        envbox_core::BrowserGuarantee::PolicyOnly => "PolicyOnly",
+        envbox_core::BrowserGuarantee::NetworkEnforced => "NetworkEnforced",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedId {
     pub name: String,
@@ -164,6 +230,7 @@ pub enum Message {
     ProfileTzIana(String),
     ProfileDnsMode(DnsChoice),
     ProfileDnsServers(String),
+    ProfileWebRtc(WebRtcChoice),
     ProfileEnv(String),
     ProfileSelect(Uuid),
     ProfileSave,
@@ -182,4 +249,29 @@ pub enum Message {
     WindowMinimize,
     WindowToggleMaximize,
     WindowClose,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webrtc_choice_round_trips() {
+        for c in WebRtcChoice::ALL {
+            assert_eq!(WebRtcChoice::from_policy(&c.to_policy()), c);
+        }
+        assert_eq!(
+            WebRtcChoice::from_policy(&envbox_core::WebRtcPolicy::Host),
+            WebRtcChoice::Host
+        );
+    }
+
+    #[test]
+    fn webrtc_guarantee_labels_match_domain() {
+        assert_eq!(
+            browser_guarantee_label(envbox_core::WebRtcPolicy::ProxyOnly),
+            "PolicyOnly"
+        );
+        assert!(browser_guarantee_label(envbox_core::WebRtcPolicy::Strict).contains("NetworkEnforced"));
+    }
 }

@@ -29,6 +29,21 @@
 | **Injection Support** | Runtime 注入能力：Supported（可注入）/ Delayed（AttachStrategy::PostActivation 激活后注入）/ Unsupported（AppContainer / mitigation Blocking 或 Unknown 等，拒绝启动，不静默降级） |
 | **Host** | 宿主 Windows 系统配置与真实时间线；EnvBox 不得修改 Host |
 | **Probe（envbox-probe）** | 打印全部待虚拟化环境值的验收基准工具 |
+| **envbox-browser-probe** | 网络/WebRTC 路径验收基准工具（policy 环境、本地地址分类、可选 STUN）；与 envbox-probe 职责分离 |
+
+## Browser / Network Guard（WebRTC Privacy）
+
+| 术语 | 含义 |
+|------|------|
+| **BrowserPrivacyProfile** | Profile 上的浏览器隐私配置；当前字段 `webrtc: WebRtcPolicy` |
+| **WebRtcPolicy** | WebRTC/UDP 路径策略：`Host` / `PublicInterfaceOnly` / `ProxyOnly` / `Strict` |
+| **Browser Policy** | Chromium/WebView2 策略产物：`--force-webrtc-ip-handling-policy` 与 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` |
+| **BrowserEngine** | 显式浏览器引擎分类：Chromium / Edge / WebView2 / Electron / Unknown（禁止裸字符串匹配） |
+| **Browser Guarantee** | 浏览器层保证级别：`PolicyOnly`（Balanced）/ `NetworkEnforced`（Strict，需 Network Guard） |
+| **Network Guard** | Session 进程树 direct UDP 约束；Strict 的执行层。不做端口封禁、不改 Host 防火墙 |
+| **Runtime Child Guard** | CreateProcess 缝上识别 Browser Engine 子进程并继承/确认 WebRTC 策略 |
+
+产品哲学：**约束真实网络路径，不伪造检测结果**（非反检测）。
 
 ## 环境虚拟化
 

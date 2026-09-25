@@ -59,6 +59,8 @@ pub struct ActivationRequest {
     pub runtime_dll: Option<std::path::PathBuf>,
     /// Startup Fail Policy: never launch unvirtualized when a profile is set.
     pub require_runtime: bool,
+    /// Browser / Network Guard: root-process Chromium switch (Win32 only).
+    pub webrtc_policy: Option<envbox_core::WebRtcPolicy>,
 }
 
 /// ActivationBackend: produce a live process. Attach is a separate seam.

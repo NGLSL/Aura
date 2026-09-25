@@ -42,6 +42,39 @@ Packaged root 经 `ActivateApplication` 启动后才能注入 Runtime。在「�
 | MicrosoftSignedOnly / StoreSignedOnly / Unknown mitigation | Unsupported |
 | 无法打开/查询进程 | Unsupported |
 
+## Browser / Network Guard（WebRTC Privacy）
+
+对历史「明确不做 WebRTC」的**有意扩围**。独立于 Geo/Locale Hook，属于 Browser / Network Guard。
+
+| WebRtcPolicy | Browser Guarantee | 执行层 | 说明 |
+|--------------|-------------------|--------|------|
+| `Host` | — | 不改浏览器 | 调试与合法 P2P 可用 |
+| `PublicInterfaceOnly` | PolicyOnly | Chromium `default_public_interface_only` | 隐藏私网/本地接口 |
+| `ProxyOnly` | PolicyOnly | Chromium `disable_non_proxied_udp` | UDP 仅经代理；默认推荐 |
+| `Strict` | NetworkEnforced | ProxyOnly + Network Guard | 进程树 direct UDP deny；**无 Guard 则 Startup Fail** |
+
+### Packaged / PostActivation 限制
+
+AUMID 激活后根 Chromium 可能已错过启动 flag。阶段 1 对 Packaged 仅保证 WebView2 环境与子进程策略；根进程 Strict 承诺依赖 Network Guard。
+
+### Network Guard 语义（阶段 3）
+
+- Session 进程树 UDP 出站仅允许 Profile 授权出口；无 UDP-capable proxy 则 direct UDP deny。
+- **禁止**按 STUN/TURN 端口封禁。
+- Session 归属查 Session Registry / Process Tracker（PID）；`ALE_APP_ID` 仅作开发验证，不是产品承诺（分不清 Aura Chrome 与用户 Chrome）。
+- 真正「只限本进程树」的内核路径需 WFP Callout Driver（`FWPS_METADATA_FIELD_PROCESS_ID`）——**单独里程碑，不进阶段 1/2**。
+- Strict 无法执行 → Startup Fail Policy，禁止静默降级为 Balanced。
+- HTTP/3 在 Strict 下回退 TCP 为可接受行为。
+- stop 后移除 Session 约束；Host 防火墙/全局配置不变。
+
+### Browser Guarantee 分级
+
+| 名称 | 含义 |
+|------|------|
+| `BrowserPolicyOnly` | 仅 Browser Policy 产物（Balanced / ProxyOnly） |
+| `NetworkEnforced` | Policy + Network Guard（Strict） |
+
 ## 明确不做
 
-Sandbox / VM / 驱动级隔离 / 反检测 / 字体虚拟化 / WebRTC Hook / 完整 Registry Sandbox。
+Sandbox / VM / 驱动级隔离 / 反检测 / 字体虚拟化 / 完整 Registry Sandbox。
+（WebRTC 已扩围为 Browser / Network Guard，见上节；仍不做「把检测页结果改好看」。）

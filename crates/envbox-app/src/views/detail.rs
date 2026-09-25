@@ -8,7 +8,7 @@ use iced::{Alignment, Element, Fill, Length, Padding};
 use crate::app::EnvBoxApp;
 use crate::font;
 use crate::icons::{icon, Icon};
-use crate::message::{DnsChoice, LaunchKind, Message, NamedId};
+use crate::message::{browser_guarantee_label, DnsChoice, LaunchKind, Message, NamedId, WebRtcChoice};
 use crate::theme::*;
 use crate::widgets::{
     app_icon_badge, badge, danger_btn, field_label, form_row, kv_row, primary_btn, secondary_btn,
@@ -273,11 +273,19 @@ fn app_detail(app: &EnvBoxApp) -> Element<'_, Message> {
                     envbox_core::DnsMode::Host => "DNS: 宿主",
                     envbox_core::DnsMode::VirtualView => "DNS: 虚拟视图",
                 };
+                let webrtc = p.browser.webrtc;
+                let webrtc_choice = WebRtcChoice::from_policy(&webrtc);
+                let webrtc_active = webrtc != envbox_core::WebRtcPolicy::Host;
                 column![
                     row![
                         badge(&p.locale.region, ACCENT_BG, ACCENT_TEXT),
                         badge(&p.timezone.windows_id, BORDER, MUTED),
                         badge(dns_label, BORDER, MUTED),
+                        badge(
+                            webrtc_choice.short_label(),
+                            if webrtc_active { ACCENT_BG } else { BORDER },
+                            if webrtc_active { ACCENT_TEXT } else { MUTED },
+                        ),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -297,6 +305,10 @@ fn app_detail(app: &EnvBoxApp) -> Element<'_, Message> {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         }
+                    ),
+                    kv_row(
+                        "WebRTC",
+                        &format!("{} · {}", webrtc.as_str(), browser_guarantee_label(webrtc)),
                     ),
                     kv_row(
                         "Environment",
@@ -449,6 +461,23 @@ fn profile_detail(app: &EnvBoxApp) -> Element<'_, Message> {
                 .style(input_style)
                 .font(font::ui_font())
         ),
+        field_label("WebRTC 隐私"),
+        form_row(
+            "WebRTC 策略",
+            pick_list(
+                WebRtcChoice::ALL,
+                Some(app.profile_draft.webrtc),
+                Message::ProfileWebRtc
+            )
+            .style(pick_style)
+            .menu_style(pick_menu)
+            .padding(Padding::from([5, 8]))
+            .font(font::ui_font()),
+        ),
+        text("Host 不改动 · PublicInterfaceOnly / ProxyOnly 注入浏览器策略 · Strict = Policy + Network Guard（进程树 UDP deny）")
+            .size(10)
+            .color(FAINT)
+            .font(font::ui_font()),
         field_label("环境变量"),
         text_input("KEY=VALUE;KEY2=VALUE2", &app.profile_draft.env)
             .on_input(Message::ProfileEnv)

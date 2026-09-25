@@ -944,6 +944,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "envbox-browser-probe"
+version = "0.1.0"
+dependencies = [
+ "envbox-core",
+ "serde",
+ "serde_json",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "envbox-cli"
 version = "0.1.0"
 dependencies = [

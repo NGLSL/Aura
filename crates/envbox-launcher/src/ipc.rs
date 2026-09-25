@@ -56,6 +56,9 @@ pub enum IpcMessage {
         dns_mode: bool,
         dns_servers: Vec<String>,
         registry_paths: Vec<String>,
+        /// Browser / Network Guard WebRTC policy (`host`/`public_interface_only`/`proxy_only`/`strict`).
+        /// C++ stores the token; business semantics stay in envbox-core.
+        webrtc: String,
     },
     RuntimeReady {
         pid: u32,
@@ -89,6 +92,8 @@ pub enum IpcMessage {
         dns_mode: bool,
         dns_servers: Vec<String>,
         registry_paths: Vec<String>,
+        /// See `IpcMessage::Profile::webrtc`.
+        webrtc: String,
     },
     /// Host → Broker: bind a PID to a session profile (and optional parent).
     BindPid {
@@ -143,9 +148,10 @@ impl IpcMessage {
                 dns_mode,
                 dns_servers,
                 registry_paths,
+                webrtc,
             } => {
                 let mut s = format!(
-                    "PROFILE profile_id={} instance_id={} locale_name={} ui_language={} region={} tz_windows={} tz_iana={} inherit_children={} audit={} dns_mode={}",
+                    "PROFILE profile_id={} instance_id={} locale_name={} ui_language={} region={} tz_windows={} tz_iana={} inherit_children={} audit={} dns_mode={} webrtc={}",
                     quote_value(profile_id),
                     quote_value(instance_id),
                     quote_value(locale_name),
@@ -156,6 +162,7 @@ impl IpcMessage {
                     if *inherit_children { 1 } else { 0 },
                     if *audit { 1 } else { 0 },
                     if *dns_mode { 1 } else { 0 },
+                    quote_value(webrtc),
                 );
                 for d in dns_servers {
                     s.push_str(&format!(" dns_server={}", quote_value(d)));
@@ -208,9 +215,10 @@ impl IpcMessage {
                 dns_mode,
                 dns_servers,
                 registry_paths,
+                webrtc,
             } => {
                 let mut s = format!(
-                    "REGISTER_PROFILE profile_id={} instance_id={} locale_name={} ui_language={} region={} tz_windows={} tz_iana={} inherit_children={} audit={} dns_mode={}",
+                    "REGISTER_PROFILE profile_id={} instance_id={} locale_name={} ui_language={} region={} tz_windows={} tz_iana={} inherit_children={} audit={} dns_mode={} webrtc={}",
                     quote_value(profile_id),
                     quote_value(instance_id),
                     quote_value(locale_name),
@@ -221,6 +229,7 @@ impl IpcMessage {
                     if *inherit_children { 1 } else { 0 },
                     if *audit { 1 } else { 0 },
                     if *dns_mode { 1 } else { 0 },
+                    quote_value(webrtc),
                 );
                 for d in dns_servers {
                     s.push_str(&format!(" dns_server={}", quote_value(d)));
@@ -308,6 +317,7 @@ impl IpcMessage {
                 dns_mode: get_flag("dns_mode"),
                 dns_servers: list("dns_server"),
                 registry_paths: list("registry_path"),
+                webrtc: first("webrtc"),
             },
             "RUNTIME_READY" => IpcMessage::RuntimeReady {
                 pid: get_u32("pid")?,
@@ -340,6 +350,7 @@ impl IpcMessage {
                 dns_mode: get_flag("dns_mode"),
                 dns_servers: list("dns_server"),
                 registry_paths: list("registry_path"),
+                webrtc: first("webrtc"),
             },
             "BIND_PID" => IpcMessage::BindPid {
                 pid: get_u32("pid")?,
@@ -384,6 +395,7 @@ pub fn profile_to_message_with_flags(
             .map(|s| s.to_string())
             .collect(),
         registry_paths: profile.registry.whitelist_paths.clone(),
+        webrtc: profile.browser.webrtc.as_str().to_string(),
     }
 }
 
@@ -398,6 +410,7 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
         dns_mode,
         dns_servers,
         registry_paths,
+        webrtc,
         ..
     } = msg
     else {
@@ -415,6 +428,14 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
             servers.push(ip);
         }
     }
+    let webrtc_policy = if webrtc.is_empty() {
+        // Older peers omit the field: Host (no browser alteration).
+        envbox_core::WebRtcPolicy::Host
+    } else {
+        envbox_core::WebRtcPolicy::parse(webrtc).ok_or_else(|| {
+            IpcError::Protocol(format!("PROFILE invalid webrtc={webrtc:?}"))
+        })?
+    };
     Ok(EnvironmentProfile {
         id: Uuid::nil(),
         name: "ipc".into(),
@@ -438,6 +459,9 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
         environment: HashMap::new(),
         registry: RegistryProfile {
             whitelist_paths: registry_paths.clone(),
+        },
+        browser: envbox_core::BrowserPrivacyProfile {
+            webrtc: webrtc_policy,
         },
     })
 }
@@ -578,6 +602,7 @@ impl SessionTable {
                     dns_mode,
                     dns_servers,
                     registry_paths,
+                    webrtc,
                 } => IpcMessage::Profile {
                     profile_id,
                     instance_id,
@@ -591,6 +616,7 @@ impl SessionTable {
                     dns_mode,
                     dns_servers,
                     registry_paths,
+                    webrtc,
                 },
                 other => other,
             };
@@ -654,6 +680,7 @@ impl SessionTable {
                         dns_mode: false,
                         dns_servers: vec![],
                         registry_paths: vec![],
+                        webrtc: "host".into(),
                     })
                 })
             }
@@ -787,6 +814,7 @@ mod tests {
                 dns_mode: true,
                 dns_servers: vec!["1.1.1.1".into()],
                 registry_paths: vec!["HKCU\\Software\\EnvBox".into()],
+                webrtc: "proxy_only".into(),
             },
             IpcMessage::RuntimeReady { pid: 1 },
             IpcMessage::HookError {
@@ -843,6 +871,7 @@ mod tests {
             registry: RegistryProfile {
                 whitelist_paths: vec!["HKCU\\Software\\EnvBox".into()],
             },
+            browser: Default::default(),
         };
         let msg = profile_to_message(&profile, "inst-1");
         let back = round_trip(&msg);
@@ -854,6 +883,52 @@ mod tests {
             decoded.registry.whitelist_paths,
             profile.registry.whitelist_paths
         );
+        assert_eq!(decoded.browser.webrtc, profile.browser.webrtc);
+    }
+
+    #[test]
+    fn profile_webrtc_round_trips_and_invalid_rejected() {
+        let mut profile = EnvironmentProfile {
+            id: Uuid::nil(),
+            name: "US".into(),
+            locale: LocaleProfile {
+                locale_name: "en-US".into(),
+                ui_language: "en-US".into(),
+                region: "US".into(),
+            },
+            timezone: TimezoneProfile {
+                windows_id: "Pacific Standard Time".into(),
+                iana_id: "America/Los_Angeles".into(),
+            },
+            dns: envbox_core::DnsProfile {
+                mode: DnsMode::Host,
+                servers: vec![],
+            },
+            environment: HashMap::new(),
+            registry: RegistryProfile::default(),
+            browser: Default::default(),
+        };
+        profile.browser.webrtc = envbox_core::WebRtcPolicy::Strict;
+        let msg = profile_to_message(&profile, "inst-1");
+        let decoded = message_to_profile(&msg).unwrap();
+        assert_eq!(decoded.browser.webrtc, envbox_core::WebRtcPolicy::Strict);
+
+        // Empty webrtc (older peer) → Host.
+        if let IpcMessage::Profile { webrtc, .. } = &msg {
+            let mut m = msg.clone();
+            if let IpcMessage::Profile { webrtc: w, .. } = &mut m {
+                *w = String::new();
+            }
+            let _ = webrtc;
+            let decoded = message_to_profile(&m).unwrap();
+            assert_eq!(decoded.browser.webrtc, envbox_core::WebRtcPolicy::Host);
+
+            // Garbage webrtc → protocol error (never silent Host).
+            if let IpcMessage::Profile { webrtc: w, .. } = &mut m {
+                *w = "nope".into();
+            }
+            assert!(message_to_profile(&m).is_err());
+        }
     }
 
     #[test]
@@ -876,6 +951,7 @@ mod tests {
             },
             environment: HashMap::new(),
             registry: RegistryProfile::default(),
+            browser: Default::default(),
         };
         let mut broker = FakeBroker::new();
         broker.table.set_instance_id("inst");
@@ -908,6 +984,7 @@ mod tests {
             dns_mode: false,
             dns_servers: vec![],
             registry_paths: vec![],
+            webrtc: "host".into(),
         };
         assert!(message_to_profile(&msg).is_err());
     }
@@ -927,6 +1004,7 @@ mod tests {
             dns_mode: false,
             dns_servers: vec![],
             registry_paths: vec![],
+            webrtc: "strict".into(),
         };
         assert_eq!(round_trip(&reg), reg);
         let bind = IpcMessage::BindPid {
@@ -953,6 +1031,7 @@ mod tests {
             dns_mode: false,
             dns_servers: vec![],
             registry_paths: vec![],
+            webrtc: "host".into(),
         });
         t.handle(&IpcMessage::BindPid {
             pid: 10,

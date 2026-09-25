@@ -119,6 +119,13 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
         profile
             .validate()
             .map_err(|e| SessionError::InvalidProfile(e.to_string()))?;
+        // Strict WebRTC requires Network Guard (Runtime hooks_network). We inject
+        // the Runtime on this path, so process-tree UDP deny is available.
+        // Host-mode (no profile) never hits this check.
+        let guard = envbox_core::NetworkGuardCapability::runtime_udp_enforced();
+        guard
+            .check_policy(profile.browser.webrtc)
+            .map_err(SessionError::Unsupported)?;
     }
 
     let host_env: HashMap<String, String> = std::env::vars().collect();
@@ -227,6 +234,7 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
         environment: env.clone(),
         runtime_dll: runtime_dll.clone(),
         require_runtime: !host_mode,
+        webrtc_policy: req.profile.as_ref().map(|p| p.browser.webrtc),
     };
 
     let backend = backend_for(&req.launch);
@@ -417,6 +425,7 @@ mod tests {
             },
             environment: HashMap::new(),
             registry: RegistryProfile::default(),
+            browser: Default::default(),
         }
     }
 
@@ -479,6 +488,33 @@ mod tests {
         let line = msg.encode_line();
         assert!(line.contains("locale_name=en-US"));
         assert!(line.contains("region=US"));
+    }
+
+    #[test]
+    fn strict_webrtc_requires_network_guard_startup_fail() {
+        // Direct check: without guard capability, Strict is refused.
+        let refused = envbox_core::NetworkGuardCapability::browser_policy_only()
+            .check_policy(envbox_core::WebRtcPolicy::Strict);
+        assert!(refused.is_err());
+
+        // start_session path uses runtime_udp_enforced (Runtime hooks_network),
+        // so Strict is accepted at the policy gate (launch may still need DLL).
+        let mut p = profile();
+        p.browser.webrtc = envbox_core::WebRtcPolicy::Strict;
+        envbox_core::NetworkGuardCapability::runtime_udp_enforced()
+            .check_policy(p.browser.webrtc)
+            .expect("strict ok when network guard present");
+    }
+
+    #[test]
+    fn proxy_only_still_starts_policy_check_ok() {
+        // Policy check itself must accept ProxyOnly (actual launch may still
+        // need a runtime DLL — that is a separate gate).
+        let mut p = profile();
+        p.browser.webrtc = envbox_core::WebRtcPolicy::ProxyOnly;
+        envbox_core::NetworkGuardCapability::browser_policy_only()
+            .check_policy(p.browser.webrtc)
+            .expect("proxy_only must not require network guard");
     }
 
     /// Machine smoke: Full Trust packaged ChatGPT via AUMID (issue 36 / GUI run).

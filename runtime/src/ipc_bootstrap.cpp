@@ -449,6 +449,11 @@ int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
   out->registry_path_count =
       MsgGetAllW(m, "registry_path", out->registry_paths, ENVBOX_REG_MAX, 128);
 
+  // Browser / Network Guard WebRTC policy token (ticket 51). C++ stores only.
+  if ((v = MsgGet(m, "webrtc")) != nullptr) {
+    Utf8ToWide(v, out->webrtc_policy, 32);
+  }
+
   return out->has_locale && out->has_ui && out->has_region && out->has_tz;
 }
 

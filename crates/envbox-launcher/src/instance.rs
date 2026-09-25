@@ -228,6 +228,7 @@ mod tests {
             },
             environment: HashMap::new(),
             registry: RegistryProfile::default(),
+            browser: Default::default(),
         }
     }
 

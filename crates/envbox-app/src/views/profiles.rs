@@ -6,7 +6,7 @@ use iced::{Alignment, Element, Fill, Padding};
 use crate::app::EnvBoxApp;
 use crate::font;
 use crate::icons::{icon, Icon};
-use crate::message::Message;
+use crate::message::{Message, WebRtcChoice};
 use crate::theme::{self, ACCENT_BG, ACCENT_LINE, ACCENT_TEXT, INK, MUTED};
 use crate::widgets::{badge, primary_btn};
 
@@ -69,10 +69,17 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                 envbox_core::DnsMode::Host => MUTED,
                 envbox_core::DnsMode::VirtualView => ACCENT_TEXT,
             };
+            let webrtc_choice = WebRtcChoice::from_policy(&p.browser.webrtc);
+            let webrtc_active = p.browser.webrtc != envbox_core::WebRtcPolicy::Host;
 
             let mut badges = row![
                 badge(&p.locale.region, ACCENT_BG, ACCENT_TEXT),
                 badge(dns_label, dns_bg, dns_fg),
+                badge(
+                    webrtc_choice.short_label(),
+                    if webrtc_active { ACCENT_BG } else { theme::BORDER },
+                    if webrtc_active { ACCENT_TEXT } else { MUTED },
+                ),
             ]
             .spacing(6)
             .align_y(Alignment::Center);

@@ -285,7 +285,23 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     };
 
     let mut job = InstanceJob::create()?;
-    let (program, args) = spawn_args(&resolved, &user_args, &env)?;
+    let (program, mut args) = spawn_args(&resolved, &user_args, &env)?;
+
+    // Browser Policy (ticket 52): root Chromium/Electron get the WebRTC switch.
+    // Unknown engines leave the command line alone (Balanced is still fine).
+    if let Some(profile) = &req.profile {
+        let engine = envbox_core::BrowserEngine::from_image(&program.display().to_string());
+        if engine.is_browser()
+            && matches!(
+                engine,
+                envbox_core::BrowserEngine::Chromium
+                    | envbox_core::BrowserEngine::Edge
+                    | envbox_core::BrowserEngine::Electron
+            )
+        {
+            envbox_core::ensure_chromium_webrtc_argv(&mut args, profile.browser.webrtc);
+        }
+    }
 
     let child = if host_mode {
         // Host Run: plain CreateProcess, no Runtime injection (true host view).
@@ -381,9 +397,22 @@ pub fn spawn_for_activation(
     req: &crate::activation::ActivationRequest,
 ) -> Result<ActivationSpawn, crate::activation::ActivateError> {
     let env_block = encode_environment_block(&req.environment);
-    let (program, args) = spawn_args(resolved, user_args, &req.environment).map_err(|e| {
+    let (program, mut args) = spawn_args(resolved, user_args, &req.environment).map_err(|e| {
         crate::activation::ActivateError::Resolve(e.to_string())
     })?;
+
+    // Browser Policy on the activation seam (Win32 root).
+    if let Some(policy) = req.webrtc_policy {
+        let engine = envbox_core::BrowserEngine::from_image(&program.display().to_string());
+        if matches!(
+            engine,
+            envbox_core::BrowserEngine::Chromium
+                | envbox_core::BrowserEngine::Edge
+                | envbox_core::BrowserEngine::Electron
+        ) {
+            envbox_core::ensure_chromium_webrtc_argv(&mut args, policy);
+        }
+    }
 
     if let Some(dll) = &req.runtime_dll {
         let child = spawn_suspended(

@@ -6,7 +6,7 @@ use iced::{Alignment, Element, Fill, Padding};
 use crate::app::{status_label, EnvBoxApp};
 use crate::font;
 use crate::icons::{icon, Icon};
-use crate::message::Message;
+use crate::message::{Message, WebRtcChoice};
 use crate::theme::{self, FAINT, INK, INK_2, MUTED, SUCCESS};
 use crate::widgets::{secondary_btn, short_id, status_dot};
 
@@ -92,6 +92,20 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                     badge(status_label(inst.status), theme::BORDER, MUTED)
                 };
 
+                let webrtc = app
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == inst.profile_id)
+                    .map(|p| p.browser.webrtc);
+                let webrtc_badge = webrtc.map(|w| {
+                    let active = w != envbox_core::WebRtcPolicy::Host;
+                    badge(
+                        WebRtcChoice::from_policy(&w).short_label(),
+                        if active { theme::ACCENT_BG } else { theme::BORDER },
+                        if active { theme::ACCENT_TEXT } else { MUTED },
+                    )
+                });
+
                 let stop_btn = if running {
                     button(
                         row![
@@ -110,24 +124,29 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                         .style(secondary_btn)
                 };
 
+                let mut name_row = row![
+                    text(format!("{}.exe", app_name.to_lowercase().replace(' ', "_")))
+                        .size(15)
+                        .color(INK)
+                        .font(font::name_font()),
+                    text(format!("PID {}", inst.root_pid))
+                        .size(12)
+                        .color(theme::ACCENT_TEXT)
+                        .font(font::ui_font()),
+                    status_badge,
+                    badge(&pname, theme::ACCENT_BG, theme::ACCENT_TEXT),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center);
+                if let Some(wb) = webrtc_badge {
+                    name_row = name_row.push(wb);
+                }
+
                 let card = container(
                     row![
                         status_dot(if running { SUCCESS } else { FAINT }),
                         column![
-                            row![
-                                text(format!("{}.exe", app_name.to_lowercase().replace(' ', "_")))
-                                    .size(15)
-                                    .color(INK)
-                                    .font(font::name_font()),
-                                text(format!("PID {}", inst.root_pid))
-                                    .size(12)
-                                    .color(theme::ACCENT_TEXT)
-                                    .font(font::ui_font()),
-                                status_badge,
-                                badge(&pname, theme::ACCENT_BG, theme::ACCENT_TEXT),
-                            ]
-                            .spacing(10)
-                            .align_y(Alignment::Center),
+                            name_row,
                             row![
                                 text(format!("衍生子进程: {} 个", count))
                                     .size(12)

@@ -2,8 +2,8 @@
 //! View rendering lives in `app/` modules; injection logic never lives here.
 
 use envbox_core::{
-    Application, AuditEvent, DnsProfile, EnvironmentProfile, InstanceStatus, LaunchTarget,
-    LocaleProfile, RegistryProfile, TimezoneProfile,
+    Application, AuditEvent, BrowserPrivacyProfile, DnsProfile, EnvironmentProfile,
+    InstanceStatus, LaunchTarget, LocaleProfile, RegistryProfile, TimezoneProfile,
 };
 use envbox_launcher::{format_args, parse_args, InstanceManager, RunTarget};
 use envbox_storage::{
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::message::{
-    BottomTab, DetailTab, DnsChoice, LaunchKind, Message, Nav, StatusKind,
+    BottomTab, DetailTab, DnsChoice, LaunchKind, Message, Nav, StatusKind, WebRtcChoice,
 };
 
 pub struct AppDraft {
@@ -61,6 +61,7 @@ pub struct ProfileDraft {
     pub tz_iana: String,
     pub dns_mode: DnsChoice,
     pub dns_servers: String,
+    pub webrtc: WebRtcChoice,
     pub env: String,
 }
 
@@ -129,6 +130,7 @@ impl EnvBoxApp {
             tz_iana,
             dns_mode: DnsChoice::Host,
             dns_servers: String::new(),
+            webrtc: WebRtcChoice::Host,
             env: String::new(),
         };
         let mut app = Self {
@@ -610,6 +612,7 @@ impl EnvBoxApp {
             Message::ProfileTzIana(v) => self.profile_draft.tz_iana = v,
             Message::ProfileDnsMode(m) => self.profile_draft.dns_mode = m,
             Message::ProfileDnsServers(v) => self.profile_draft.dns_servers = v,
+            Message::ProfileWebRtc(c) => self.profile_draft.webrtc = c,
             Message::ProfileEnv(v) => self.profile_draft.env = v,
             Message::ProfileSelect(id) => {
                 if let Some(p) = self.profiles.iter().find(|p| p.id == id) {
@@ -631,6 +634,7 @@ impl EnvBoxApp {
                     tz_iana,
                     dns_mode: DnsChoice::Host,
                     dns_servers: String::new(),
+                    webrtc: WebRtcChoice::Host,
                     env: String::new(),
                 };
             }
@@ -911,6 +915,9 @@ impl EnvBoxApp {
             },
             environment,
             registry: RegistryProfile::default(),
+            browser: BrowserPrivacyProfile {
+                webrtc: self.profile_draft.webrtc.to_policy(),
+            },
         };
         if let Err(err) = validate_profile(&profile) {
             self.set_status(StatusKind::Error, format!("保存失败: {err}"));
@@ -969,6 +976,7 @@ pub fn profile_to_draft(p: &EnvironmentProfile) -> ProfileDraft {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .join(","),
+        webrtc: WebRtcChoice::from_policy(&p.browser.webrtc),
         env: p
             .environment
             .iter()

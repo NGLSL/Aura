@@ -36,6 +36,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/hooks_dns.cpp
   src/hooks_registry.cpp
   src/hooks_process.cpp
+  src/hooks_network.cpp
 )
 target_compile_features(${ENVBOX_RT_TARGET} PRIVATE cxx_std_17)
 target_compile_definitions(${ENVBOX_RT_TARGET} PRIVATE ENVBOX_RUNTIME=1 ENVBOX_ARCH=${ENVBOX_RT_ARCH})

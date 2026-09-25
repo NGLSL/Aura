@@ -1,8 +1,8 @@
 //! envbox CLI: define and inspect Applications and Environment Profiles.
 
 use envbox_core::{
-    Application, AuditEvent, DnsMode, DnsProfile, EnvironmentProfile, LaunchTarget, LocaleProfile,
-    RegistryProfile, TimezoneProfile,
+    Application, AuditEvent, BrowserPrivacyProfile, DnsMode, DnsProfile, EnvironmentProfile,
+    LaunchTarget, LocaleProfile, RegistryProfile, TimezoneProfile, WebRtcPolicy,
 };
 use envbox_storage::{validate_application, validate_profile, ConfigStore};
 use std::collections::HashMap;
@@ -43,7 +43,7 @@ fn usage() -> ExitCode {
     eprintln!("  envbox profile list");
     eprintln!("  envbox profile add --name N --locale L --ui-language U --region R \\");
     eprintln!("     --tz-windows W --tz-iana I [--dns-mode host|virtual_view] \\");
-    eprintln!("     [--dns IP]... [--env K=V]...");
+    eprintln!("     [--dns IP]... [--env K=V]... [--webrtc host|public_interface_only|proxy_only|strict]");
     eprintln!("  envbox app list");
     eprintln!("  envbox app add --name N (--command C | --executable P) --profile ID \\");
     eprintln!("     [--working-directory D] [--arg A]... [--inherit-children] [--audit]");
@@ -389,13 +389,14 @@ fn cmd_profile_list(store: &ConfigStore) -> ExitCode {
             }
             for profile in &doc.profiles {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\twebrtc={}",
                     profile.id,
                     profile.name,
                     profile.locale.locale_name,
                     profile.locale.region,
                     profile.timezone.windows_id,
-                    profile.dns.mode_label()
+                    profile.dns.mode_label(),
+                    profile.browser.webrtc.as_str(),
                 );
             }
             ExitCode::SUCCESS
@@ -443,6 +444,7 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
     let mut dns_mode = DnsMode::Host;
     let mut servers: Vec<IpAddr> = Vec::new();
     let mut environment = HashMap::new();
+    let mut webrtc = WebRtcPolicy::Host;
 
     let mut i = 0;
     while i < args.len() {
@@ -458,6 +460,19 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
             "--region" => region = take(&mut i).unwrap_or_default(),
             "--tz-windows" => tz_windows = take(&mut i).unwrap_or_default(),
             "--tz-iana" => tz_iana = take(&mut i).unwrap_or_default(),
+            "--webrtc" => {
+                let raw = take(&mut i).unwrap_or_default();
+                match WebRtcPolicy::parse(&raw) {
+                    Some(p) => webrtc = p,
+                    None => {
+                        eprintln!(
+                            "error: unknown webrtc policy {raw:?} \
+                             (host|public_interface_only|proxy_only|strict)"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--dns-mode" => {
                 let mode = take(&mut i).unwrap_or_default();
                 dns_mode = match mode.as_str() {
@@ -517,6 +532,7 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         },
         environment,
         registry: RegistryProfile::default(),
+        browser: BrowserPrivacyProfile { webrtc },
     };
 
     if let Err(err) = validate_profile(&profile) {

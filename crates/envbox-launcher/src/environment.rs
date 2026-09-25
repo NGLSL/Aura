@@ -26,7 +26,7 @@ pub fn build_environment_block(
         }
     }
     let lower = |k: &str| k.to_ascii_lowercase();
-    const DROP: [&str; 12] = [
+    const DROP: [&str; 13] = [
         "envbox_instance_id",
         "envbox_profile_id",
         "envbox_inherit_children",
@@ -39,8 +39,17 @@ pub fn build_environment_block(
         "envbox_dns_mode",
         "envbox_dns_servers",
         "envbox_registry_paths",
+        "envbox_webrtc_policy",
     ];
     env.retain(|k, _| !DROP.contains(&lower(k).as_str()));
+    // Host WebRTC policy must not strip user WEBVIEW2 args (spec: Host 不覆盖).
+    // Non-Host policies rewrite WEBVIEW2 below via browser_env_entries.
+    if profile
+        .map(|p| p.browser.webrtc != envbox_core::WebRtcPolicy::Host)
+        .unwrap_or(false)
+    {
+        env.retain(|k, _| lower(k) != "webview2_additional_browser_arguments");
+    }
     env.insert("ENVBOX_INSTANCE_ID".into(), instance_id.to_string());
     env.insert("ENVBOX_PROFILE_ID".into(), profile_id.to_string());
     env.insert(
@@ -99,6 +108,13 @@ pub fn insert_profile_value_fallback(
         "ENVBOX_REGISTRY_PATHS".into(),
         profile.registry.whitelist_paths.join(";"),
     );
+    // Browser / Network Guard (WebRTC Privacy): policy token + WebView2 args.
+    for (key, value) in envbox_core::browser_env_entries(profile.browser.webrtc) {
+        // Replace case-insensitively so Host WebView2 args cannot win over Profile.
+        let lower = key.to_ascii_lowercase();
+        env.retain(|k, _| k.to_ascii_lowercase() != lower);
+        env.insert(key, value);
+    }
 }
 
 /// Encode as a Windows Unicode environment block: `k=v\0k=v\0\0`.
@@ -143,6 +159,7 @@ mod tests {
             },
             environment: HashMap::from([("LANG".into(), "en_US.UTF-8".into())]),
             registry: RegistryProfile::default(),
+            browser: Default::default(),
         }
     }
 
@@ -217,6 +234,66 @@ mod tests {
             .collect();
         assert_eq!(langs.len(), 1);
         assert_eq!(langs[0].1, "en_US.UTF-8");
+    }
+
+    #[test]
+    fn browser_policy_written_to_env_block() {
+        let host = HashMap::new();
+        let mut p = profile();
+        p.browser.webrtc = envbox_core::WebRtcPolicy::ProxyOnly;
+        let merged = build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        assert_eq!(
+            merged.get("ENVBOX_WEBRTC_POLICY").map(String::as_str),
+            Some("proxy_only")
+        );
+        let webview = merged
+            .get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(webview.contains("disable_non_proxied_udp"));
+    }
+
+    #[test]
+    fn browser_host_policy_omits_webview2_args() {
+        let host = HashMap::new();
+        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true, false);
+        assert_eq!(
+            merged.get("ENVBOX_WEBRTC_POLICY").map(String::as_str),
+            Some("host")
+        );
+        assert!(!merged.contains_key("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"));
+    }
+
+    #[test]
+    fn browser_host_policy_preserves_user_webview2_args() {
+        let host = HashMap::from([(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".into(),
+            "--user-flag".into(),
+        )]);
+        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true, false);
+        assert_eq!(
+            merged
+                .get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+                .map(String::as_str),
+            Some("--user-flag")
+        );
+    }
+
+    #[test]
+    fn browser_non_host_rewrites_webview2_args() {
+        let host = HashMap::from([(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".into(),
+            "--force-webrtc-ip-handling-policy=default --keep".into(),
+        )]);
+        let mut p = profile();
+        p.browser.webrtc = envbox_core::WebRtcPolicy::ProxyOnly;
+        let merged = build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        let v = merged
+            .get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(v.contains("disable_non_proxied_udp"));
+        assert!(!v.contains("policy=default"));
     }
 
     #[test]

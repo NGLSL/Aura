@@ -36,6 +36,10 @@ struct RuntimeProfile {
   // Registry Virtual View (ticket 09): extra whitelist_paths from Profile.
   int registry_path_count;
   wchar_t registry_paths[ENVBOX_REG_MAX][128];
+  // Browser / Network Guard (ticket 51/56): WebRTC policy token.
+  // host / public_interface_only / proxy_only / strict (C++ stores, does not
+  // invent business semantics). Empty = host.
+  wchar_t webrtc_policy[32];
 };
 
 // Process-wide immutable profile after successful init. Never mutated later.
@@ -52,3 +56,15 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
 
 // Absolute path of this Runtime DLL (for child injection).
 const char* EnvBoxRuntimeDllPathA();
+
+// Chromium `--force-webrtc-ip-handling-policy` value for a WebRTC policy
+// token. Returns nullptr for `host` / empty / unknown (never add the switch,
+// never overwrite user args). Mirrors
+// envbox-core::WebRtcPolicy::chromium_ip_handling_policy.
+const wchar_t* EnvBoxWebRtcChromiumValue(const wchar_t* policy_token);
+
+// Normalize a WebRTC policy token (same alias set as the Rust peer parse).
+// null/empty input -> `host`. Known token/alias -> canonical token in out.
+// Returns 1 on success, 0 on unknown input (out left as `host`; caller must
+// reject the profile rather than silently run with the wrong policy).
+int EnvBoxNormalizeWebRtcPolicy(const wchar_t* raw, wchar_t* out, size_t cap);

@@ -9,8 +9,15 @@ use std::time::SystemTime;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod browser_policy;
 pub mod session;
 
+pub use browser_policy::{
+    browser_env_entries, ensure_chromium_webrtc_argv, ensure_chromium_webrtc_switch,
+    ensure_webview2_arguments, plan_child_policy, BrowserChildPolicy, BrowserEngine,
+    BrowserGuarantee, BrowserPrivacyProfile, CommandLinePolicy, NetworkGuardCapability, PolicyApply,
+    WebRtcPolicy, AUDIT_API_NETWORK_UDP_DENY,
+};
 pub use session::{
     capabilities_for_target, evaluate_injection_support, isolation_for_strategy, is_packaged_target,
     select_attach_strategy, ActivatedTarget, ActivationType, AttachStrategy, EnvironmentSession,
@@ -204,6 +211,9 @@ pub struct EnvironmentProfile {
     pub dns: DnsProfile,
     pub environment: HashMap<String, String>,
     pub registry: RegistryProfile,
+    /// Browser / Network Guard (WebRTC Privacy). Default = Host (compat).
+    #[serde(default)]
+    pub browser: crate::browser_policy::BrowserPrivacyProfile,
 }
 
 impl EnvironmentProfile {
@@ -347,12 +357,32 @@ mod tests {
             },
             environment: HashMap::from([("LANG".into(), "en_US.UTF-8".into())]),
             registry: RegistryProfile::default(),
+            browser: BrowserPrivacyProfile::default(),
         }
     }
 
     #[test]
     fn valid_profile_accepted() {
         assert!(valid_profile().validate().is_ok());
+    }
+
+    #[test]
+    fn browser_policy_round_trips() {
+        let mut p = valid_profile();
+        p.browser.webrtc = WebRtcPolicy::Strict;
+        let json = serde_json::to_string(&p).unwrap();
+        let back: EnvironmentProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.browser.webrtc, WebRtcPolicy::Strict);
+    }
+
+    #[test]
+    fn browser_defaults_when_missing() {
+        let mut p = valid_profile();
+        p.browser = BrowserPrivacyProfile::default();
+        let mut json = serde_json::to_value(&p).unwrap();
+        json.as_object_mut().unwrap().remove("browser");
+        let back: EnvironmentProfile = serde_json::from_value(json).unwrap();
+        assert_eq!(back.browser.webrtc, WebRtcPolicy::Host);
     }
 
     #[test]

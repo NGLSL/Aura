@@ -6,6 +6,7 @@
 #include "hooks.h"
 
 #include <string.h>
+#include <wctype.h>
 
 #include <string>
 #include <utility>
@@ -13,6 +14,191 @@
 
 #include "audit.h"
 #include "ipc_bootstrap.h"
+
+// --- Browser / Network Guard (ticket 54): Child Guard decision table ----------
+// Explicit engine image names only (never bare substring "chrome").
+enum BrowserEngineKind {
+  kEngineUnknown = 0,
+  kEngineChromium = 1,
+  kEngineEdge = 2,
+  kEngineWebView2 = 3,
+  kEngineElectron = 4,
+};
+
+static BrowserEngineKind ClassifyBrowserEngine(const wchar_t* path_or_cmd) {
+  if (path_or_cmd == nullptr || path_or_cmd[0] == L'\0') {
+    return kEngineUnknown;
+  }
+  // Take the file name component.
+  const wchar_t* name = path_or_cmd;
+  for (const wchar_t* p = path_or_cmd; *p; ++p) {
+    if (*p == L'\\' || *p == L'/') {
+      name = p + 1;
+    }
+  }
+  // Strip surrounding quotes if present.
+  std::wstring n(name);
+  if (!n.empty() && n.front() == L'"') {
+    n.erase(0, 1);
+  }
+  // Cut at first space (command line token).
+  size_t sp = n.find(L' ');
+  if (sp != std::wstring::npos) {
+    n = n.substr(0, sp);
+  }
+  // Lowercase for compare.
+  for (auto& c : n) {
+    if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+  }
+  if (n == L"msedgewebview2.exe" || n.rfind(L"msedgewebview2", 0) == 0) {
+    return kEngineWebView2;
+  }
+  if (n == L"electron.exe" || (n.size() >= 12 &&
+                              n.compare(n.size() - 12, 12, L"electron.exe") == 0)) {
+    return kEngineElectron;
+  }
+  if (n == L"msedge.exe") {
+    return kEngineEdge;
+  }
+  if (n == L"chrome.exe" || n == L"chromium.exe" || n == L"chrome_proxy.exe" ||
+      n == L"googlechromeproxy.exe") {
+    return kEngineChromium;
+  }
+  return kEngineUnknown;
+}
+
+// 0=host, 1=public_interface_only, 2=proxy_only, 3=strict
+static int WebrtcPolicyCode(const RuntimeProfile* pfl) {
+  if (pfl == nullptr || pfl->webrtc_policy[0] == L'\0') {
+    return 0;
+  }
+  if (_wcsicmp(pfl->webrtc_policy, L"public_interface_only") == 0) return 1;
+  if (_wcsicmp(pfl->webrtc_policy, L"proxy_only") == 0) return 2;
+  if (_wcsicmp(pfl->webrtc_policy, L"strict") == 0) return 3;
+  return 0;
+}
+
+static const wchar_t* ChromiumIpHandlingValue(int policy_code) {
+  switch (policy_code) {
+    case 1:
+      return L"default_public_interface_only";
+    case 2:
+    case 3:
+      return L"disable_non_proxied_udp";
+    default:
+      return nullptr;
+  }
+}
+
+static const wchar_t* kChromiumSwitch = L"--force-webrtc-ip-handling-policy";
+
+// Rewrite/append Chromium WebRTC switch on a command line. Never duplicates.
+// Returns 1 if modified, 0 if unchanged. Fail Open on buffer issues.
+static int EnsureChromiumSwitchW(std::wstring* cmd, int policy_code) {
+  const wchar_t* value = ChromiumIpHandlingValue(policy_code);
+  if (value == nullptr) {
+    return 0;
+  }
+  std::wstring want = std::wstring(kChromiumSwitch) + L"=" + value;
+  std::wstring lower = *cmd;
+  for (auto& c : lower) {
+    if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+  }
+  size_t pos = lower.find(kChromiumSwitch);
+  if (pos != std::wstring::npos) {
+    // Rewrite existing token: find end of this argv token.
+    size_t end = pos + wcslen(kChromiumSwitch);
+    // Skip =value or " value"
+    if (end < cmd->size() && (*cmd)[end] == L'=') {
+      end++;
+      while (end < cmd->size() && !iswspace((*cmd)[end])) end++;
+    } else {
+      while (end < cmd->size() && iswspace((*cmd)[end])) end++;
+      while (end < cmd->size() && !iswspace((*cmd)[end])) end++;
+    }
+    cmd->replace(pos, end - pos, want);
+    return 1;
+  }
+  if (!cmd->empty() && !iswspace(cmd->back())) {
+    cmd->push_back(L' ');
+  }
+  cmd->append(want);
+  return 1;
+}
+
+// Upsert WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS with the policy switch.
+static int EnsureWebView2ArgsW(std::vector<std::pair<std::wstring, std::wstring>>* vars,
+                               int policy_code) {
+  const wchar_t* value = ChromiumIpHandlingValue(policy_code);
+  if (value == nullptr) {
+    return 0;
+  }
+  std::wstring want = std::wstring(kChromiumSwitch) + L"=" + value;
+  const wchar_t* key = L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+  for (auto& kv : *vars) {
+    if (_wcsicmp(kv.first.c_str(), key) == 0) {
+      std::wstring lower = kv.second;
+      for (auto& c : lower) {
+        if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+      }
+      size_t pos = lower.find(kChromiumSwitch);
+      if (pos != std::wstring::npos) {
+        size_t end = pos + wcslen(kChromiumSwitch);
+        if (end < kv.second.size() && kv.second[end] == L'=') {
+          end++;
+          while (end < kv.second.size() && !iswspace(kv.second[end])) end++;
+        } else {
+          while (end < kv.second.size() && iswspace(kv.second[end])) end++;
+          while (end < kv.second.size() && !iswspace(kv.second[end])) end++;
+        }
+        kv.second.replace(pos, end - pos, want);
+      } else {
+        if (!kv.second.empty() && !iswspace(kv.second.back())) {
+          kv.second.push_back(L' ');
+        }
+        kv.second.append(want);
+      }
+      return 1;
+    }
+  }
+  vars->emplace_back(key, want);
+  return 1;
+}
+
+// Apply Browser Policy to child command line + env before create.
+// Unknown engines leave the command line alone. Host policy: no changes.
+static void ApplyBrowserChildPolicy(const wchar_t* image_or_cmd, std::wstring* cmd,
+                                    std::vector<std::pair<std::wstring, std::wstring>>* vars) {
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  if (pfl == nullptr) {
+    return;
+  }
+  int policy_code = WebrtcPolicyCode(pfl);
+  if (policy_code == 0) {
+    return;  // Host: never overwrite user args.
+  }
+  // Classify from application name or first token of command line.
+  BrowserEngineKind engine = ClassifyBrowserEngine(image_or_cmd);
+  if (engine == kEngineUnknown && cmd != nullptr) {
+    engine = ClassifyBrowserEngine(cmd->c_str());
+  }
+  if (engine == kEngineUnknown) {
+    if (pfl->audit) {
+      EnvBoxAuditEvent("CreateProcessW", 1, "BrowserPolicyIgnoredUnknown");
+    }
+    return;
+  }
+  if (engine == kEngineWebView2) {
+    if (EnsureWebView2ArgsW(vars, policy_code) && pfl->audit) {
+      EnvBoxAuditEvent("CreateProcessW", 1, "BrowserPolicyApplied");
+    }
+    return;
+  }
+  // Chromium / Edge / Electron: command-line switch.
+  if (cmd != nullptr && EnsureChromiumSwitchW(cmd, policy_code) && pfl->audit) {
+    EnvBoxAuditEvent("CreateProcessW", 1, "BrowserPolicyApplied");
+  }
+}
 
 static BOOL(WINAPI* TrueCreateProcessW)(
     LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
@@ -151,6 +337,17 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
     upsert(L"ENVBOX_IPC_PIPE", pipe);
   }
 
+  // Browser / Network Guard: always carry the policy token + WebView2 args.
+  {
+    const wchar_t* tok =
+        (pfl->webrtc_policy[0] != L'\0') ? pfl->webrtc_policy : L"host";
+    upsert(L"ENVBOX_WEBRTC_POLICY", tok);
+    int policy_code = WebrtcPolicyCode(pfl);
+    if (policy_code != 0) {
+      EnsureWebView2ArgsW(&vars, policy_code);
+    }
+  }
+
   block->clear();
   for (auto& kv : vars) {
     block->insert(block->end(), kv.first.begin(), kv.first.end());
@@ -209,8 +406,31 @@ static BOOL SpawnInjected(
   UpsertProfileKeys(&env);
   LPVOID env_ptr = env.empty() ? lpEnvironment : static_cast<LPVOID>(env.data());
 
+  // Browser Child Guard (ticket 54): apply WebRTC policy to browser engines.
+  std::wstring cmd_storage;
+  LPWSTR cmd_ptr = lpCommandLine;
+  if (lpCommandLine != nullptr) {
+    cmd_storage.assign(lpCommandLine);
+    // Rebuild env vars overlay so WebView2 args land before create.
+    std::vector<std::pair<std::wstring, std::wstring>> dummy;  // env already upserted
+    ApplyBrowserChildPolicy(lpApplicationName, &cmd_storage, &dummy);
+    // WebView2 env is applied inside UpsertProfileKeys; here we only need the
+    // command-line rewrite for Chromium/Edge/Electron. Re-parse if changed.
+    if (cmd_storage != lpCommandLine) {
+      cmd_ptr = cmd_storage.data();
+    }
+  } else if (lpApplicationName != nullptr) {
+    std::wstring only_app(lpApplicationName);
+    std::vector<std::pair<std::wstring, std::wstring>> dummy;
+    ApplyBrowserChildPolicy(lpApplicationName, &only_app, &dummy);
+    if (only_app != lpApplicationName) {
+      cmd_storage = only_app;
+      cmd_ptr = cmd_storage.data();
+    }
+  }
+
   if (!DetourCreateProcessWithDllExW(
-          lpApplicationName, lpCommandLine, lpProcessAttributes,
+          lpApplicationName, cmd_ptr, lpProcessAttributes,
           lpThreadAttributes, bInheritHandles, flags, env_ptr,
           lpCurrentDirectory, lpStartupInfo, lpProcessInformation, dll,
           reinterpret_cast<PDETOUR_CREATE_PROCESS_ROUTINEW>(TrueCreateProcessW))) {
