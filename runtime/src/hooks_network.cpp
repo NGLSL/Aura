@@ -1,4 +1,4 @@
-// Network Guard (ticket 56) — session/process-tree direct UDP constraint.
+// Network Guard (ticket 56) - session/process-tree direct UDP constraint.
 //
 // Strict WebRTC policy denies non-loopback UDP from this injected process tree.
 // Process-scoped: only EnvBox-injected processes are hooked (no WFP driver,
@@ -8,11 +8,13 @@
 // (Host Environment Block / UpsertProfileKeys). RuntimeProfile::webrtc_policy
 // is used when the field is present (UTF-16 token: host / public_interface_only
 // / proxy_only / strict).
-
-#include "hooks.h"
+//
+// Include order: winsock2.h MUST precede windows.h (via hooks.h).
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+
+#include "hooks.h"
 
 #include <string.h>
 
@@ -79,12 +81,12 @@ static int IsLoopbackAddr(const struct sockaddr* addr, int len) {
 }
 
 // Strict: deny non-loopback UDP, except DNS (VirtualView / host resolver)
-// so DNS is not a Network Guard target (spec: DNS 非目标保持不变).
+// so DNS is not a Network Guard target (spec: DNS stays out of scope).
 // Returns 1 when the send must be blocked.
 static int ShouldDenyUdp(const struct sockaddr* addr, int len) {
   if (g_webrtc_policy != 3) return 0;
   if (IsLoopbackAddr(addr, len)) return 0;
-  // Allow DNS UDP (port 53) — hooks_dns VirtualView uses sendto to resolvers.
+  // Allow DNS UDP (port 53): hooks_dns VirtualView uses sendto to resolvers.
   if (addr != nullptr) {
     if (addr->sa_family == AF_INET && len >= (int)sizeof(sockaddr_in)) {
       const sockaddr_in* v4 = (const sockaddr_in*)addr;
