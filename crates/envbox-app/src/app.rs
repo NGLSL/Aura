@@ -736,13 +736,20 @@ impl EnvBoxApp {
             self.set_status(StatusKind::Error, "保存失败：默认配置文件不存在");
             return Task::none();
         }
-        let launch = match self.app_draft.kind {
-            LaunchKind::Command => LaunchTarget::Command {
-                command: self.app_draft.path.clone(),
-            },
-            LaunchKind::Executable => LaunchTarget::Executable {
-                path: PathBuf::from(self.app_draft.path.clone()),
-            },
+        // AUMID / shell:AppsFolder must become LaunchTarget::Packaged — never a
+        // CreateProcess Executable (already-saved legacy entries also normalize).
+        let path = self.app_draft.path.clone();
+        let launch = if envbox_launcher::extract_aumid(&path).is_some() {
+            envbox_launcher::launch_target_from_user_path(&path)
+        } else {
+            match self.app_draft.kind {
+                LaunchKind::Command => LaunchTarget::Command {
+                    command: self.app_draft.path.clone(),
+                },
+                LaunchKind::Executable => LaunchTarget::Executable {
+                    path: PathBuf::from(self.app_draft.path.clone()),
+                },
+            }
         };
         let arguments = parse_args(&self.app_draft.args);
         let working_directory = if self.app_draft.work_dir.trim().is_empty() {

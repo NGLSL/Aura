@@ -8,7 +8,7 @@ use envbox_core::{
     TargetCapabilities,
 };
 
-/// Trust / packaging signals collected before attach.
+/// Trust / packaging / architecture signals collected before attach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessProbe {
     pub is_app_container: bool,
@@ -17,6 +17,10 @@ pub struct ProcessProbe {
     pub dynamic_code_policy: MitigationPolicy,
     pub image_load_policy: MitigationPolicy,
     pub can_open_process: bool,
+    /// Target PE architecture (from probe / PE header).
+    pub architecture: &'static str,
+    /// Process type label (win32 / packaged_win32 / appcontainer / unknown).
+    pub process_type: &'static str,
 }
 
 impl ProcessProbe {
@@ -29,6 +33,8 @@ impl ProcessProbe {
             dynamic_code_policy: MitigationPolicy::Unknown,
             image_load_policy: MitigationPolicy::Unknown,
             can_open_process: false,
+            architecture: "unknown",
+            process_type: "unknown",
         }
     }
 
@@ -41,6 +47,8 @@ impl ProcessProbe {
             dynamic_code_policy: MitigationPolicy::Allow,
             image_load_policy: MitigationPolicy::Allow,
             can_open_process: true,
+            architecture: "x64",
+            process_type: "win32",
         }
     }
 
@@ -297,9 +305,39 @@ mod win {
                     MitigationPolicy::Unknown
                 },
                 can_open_process: true,
+                architecture: process_arch(process.0),
+                process_type: if is_app_container {
+                    "appcontainer"
+                } else {
+                    "win32"
+                },
             }
         }
     }
+}
+
+/// Target architecture from Wow64 state (x64 / x86 / unknown).
+#[cfg(windows)]
+fn process_arch(process: windows::Win32::Foundation::HANDLE) -> &'static str {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Threading::IsWow64Process;
+    let mut wow = BOOL(0);
+    unsafe {
+        if IsWow64Process(process, &mut wow).is_ok() {
+            if wow.as_bool() {
+                "x86"
+            } else {
+                "x64"
+            }
+        } else {
+            "unknown"
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn process_arch(_process: ()) -> &'static str {
+    "unknown"
 }
 
 #[cfg(test)]

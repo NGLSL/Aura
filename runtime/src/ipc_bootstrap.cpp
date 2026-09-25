@@ -409,7 +409,7 @@ int ParseFlag(const IpcMsg* m, const char* key, int def) {
 }
 
 // Apply a decoded PROFILE message into *out. Returns 1 when required fields
-// are present (same completeness rule as the profiles.toml path).
+// are present (same completeness rule as the ENVBOX_* value fallback).
 int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
   const char* v;
   if ((v = MsgGet(m, "profile_id")) != nullptr) {

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "audit.h"
+#include "ipc_bootstrap.h"
 
 static BOOL(WINAPI* TrueCreateProcessW)(
     LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
@@ -93,6 +94,50 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
   upsert(L"ENVBOX_INHERIT_CHILDREN", pfl->inherit_children ? L"1" : L"0");
   upsert(L"ENVBOX_AUDIT", pfl->audit ? L"1" : L"0");
 
+  // ENVBOX_* value fallback (V0.3): children can bootstrap without Broker.
+  if (pfl->has_locale) {
+    upsert(L"ENVBOX_LOCALE_NAME", pfl->locale_name);
+  }
+  if (pfl->has_ui) {
+    upsert(L"ENVBOX_UI_LANGUAGE", pfl->ui_language);
+  }
+  if (pfl->has_region) {
+    upsert(L"ENVBOX_REGION", pfl->region);
+  }
+  if (pfl->has_tz) {
+    upsert(L"ENVBOX_TZ_WINDOWS", pfl->tz_windows);
+  }
+  if (pfl->tz_iana[0] != L'\0') {
+    upsert(L"ENVBOX_TZ_IANA", pfl->tz_iana);
+  }
+  {
+    wchar_t dns_mode[4] = {};
+    _snwprintf_s(dns_mode, _TRUNCATE, L"%d", pfl->dns_mode ? 1 : 0);
+    upsert(L"ENVBOX_DNS_MODE", dns_mode);
+  }
+  if (pfl->dns_server_count > 0) {
+    std::wstring servers;
+    for (int i = 0; i < pfl->dns_server_count; i++) {
+      if (i) servers.push_back(L';');
+      int n = MultiByteToWideChar(CP_UTF8, 0, pfl->dns_servers[i], -1, nullptr, 0);
+      if (n > 0) {
+        std::wstring w((size_t)n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, pfl->dns_servers[i], -1, &w[0], n);
+        if (!w.empty() && w.back() == L'\0') w.pop_back();
+        servers += w;
+      }
+    }
+    upsert(L"ENVBOX_DNS_SERVERS", servers.c_str());
+  }
+  if (pfl->registry_path_count > 0) {
+    std::wstring paths;
+    for (int i = 0; i < pfl->registry_path_count; i++) {
+      if (i) paths.push_back(L';');
+      paths += pfl->registry_paths[i];
+    }
+    upsert(L"ENVBOX_REGISTRY_PATHS", paths.c_str());
+  }
+
   wchar_t root[MAX_PATH] = {};
   if (GetEnvironmentVariableW(L"ENVBOX_CONFIG_ROOT", root, MAX_PATH) > 0) {
     upsert(L"ENVBOX_CONFIG_ROOT", root);
@@ -100,6 +145,10 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
   wchar_t rt[MAX_PATH] = {};
   if (GetEnvironmentVariableW(L"ENVBOX_RUNTIME_DLL", rt, MAX_PATH) > 0) {
     upsert(L"ENVBOX_RUNTIME_DLL", rt);
+  }
+  wchar_t pipe[MAX_PATH] = {};
+  if (GetEnvironmentVariableW(L"ENVBOX_IPC_PIPE", pipe, MAX_PATH) > 0) {
+    upsert(L"ENVBOX_IPC_PIPE", pipe);
   }
 
   block->clear();
@@ -205,6 +254,10 @@ static BOOL SpawnInjected(
   // Never log command bodies or environment blocks (ticket 21).
   EnvBoxAuditEvent("CreateProcessW", 1,
                    caller_requested_suspended ? "inject-suspended" : "inject-resumed");
+  // V0.3: notify Broker so the child joins this EnvironmentSession.
+  if (lpProcessInformation != nullptr) {
+    EnvBoxIpcNotifyProcessCreated(lpProcessInformation->dwProcessId, nullptr);
+  }
   return TRUE;
 }
 

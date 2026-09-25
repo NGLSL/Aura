@@ -1,5 +1,7 @@
-// Immutable Runtime Profile loaded once at DLL init (ticket 05).
-// Values come from profiles.toml selected by ENVBOX_PROFILE_ID.
+// Immutable Runtime Profile loaded once at DLL init (V0.3 ticket 45).
+//
+// Values come from Runtime IPC Bootstrap (Broker PROFILE DTO) or, as Win32
+// fallback, from ENVBOX_* structured value vars. C++ never parses profiles.toml.
 
 #pragma once
 

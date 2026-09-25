@@ -3,7 +3,7 @@
 //! WindowsApps must not be treated as "any exe under a folder". Classification
 //! is by packaging model (Packaged Win32 / UWP AppContainer), not by directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How the target is packaged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +63,14 @@ pub fn classify_target(path: &str, args: &str) -> Capability {
     }
     let lower = p.to_ascii_lowercase();
 
-    // shell:AppsFolder\<AUMID>!App — UWP / package AUMID activation.
-    if lower.starts_with("shell:appsfolder\\") || (lower.contains("shell:appsfolder\\") && p.contains('!')) {
-        return uwp("AUMID / AppsFolder 目标");
-    }
-    if p.contains('!') && lower.contains("microsoft.") && !looks_like_path(p) {
-        return uwp("Package AUMID");
+    // shell:AppsFolder\<AUMID>!App / bare AUMID — classify by Package Identity
+    // (AppxManifest), never by folder name alone. Full Trust desktop packages
+    // are Delayed (post-activation inject); WinRT / AppContainer stay Unsupported.
+    if lower.starts_with("shell:appsfolder\\")
+        || (lower.contains("shell:appsfolder\\") && p.contains('!'))
+        || (p.contains('!') && !looks_like_path(p))
+    {
+        return classify_aumid_target(p);
     }
 
     // Absolute path under a WindowsApps install root.
@@ -84,6 +86,67 @@ pub fn classify_target(path: &str, args: &str) -> Capability {
     // Command lines that only mention WindowsApps are not classified as packaged.
     let _ = args;
     classic()
+}
+
+/// Classify `shell:AppsFolder\<AUMID>!App` / bare AUMID via package manifest.
+///
+/// Resolution is Package Identity based (issue 36 decision table), not a
+/// blanket "AppsFolder = AppContainer". Unresolved packages stay Delayed so
+/// Full Trust desktop packages are never labeled Unsupported up front.
+fn classify_aumid_target(target: &str) -> Capability {
+    let Some(aumid) = aumid_from_target(target) else {
+        return packaged_unknown();
+    };
+    if let Some(manifest) = find_manifest_by_aumid(&aumid) {
+        return classify_manifest(&manifest);
+    }
+    Capability {
+        packaging: Packaging::PackagedUnknown,
+        injection: InjectionSupport::Delayed,
+        runtime_label: "Packaged",
+        trust_label: "Unknown",
+        reason: "AUMID 目标，待按 Package Identity 分类",
+    }
+}
+
+/// Classify an install root (e.g. `System.AppUserModel.PackageInstallPath`).
+pub fn classify_install_dir(dir: &Path) -> Capability {
+    let manifest = dir.join("AppxManifest.xml");
+    if manifest.is_file() {
+        return classify_manifest(&manifest);
+    }
+    packaged_unknown()
+}
+
+/// Find `AppxManifest.xml` for `PackageFamilyName!ApplicationId` under WindowsApps.
+fn find_manifest_by_aumid(aumid: &str) -> Option<std::path::PathBuf> {
+    let family = aumid.split('!').next()?;
+    find_manifest_by_family(family)
+}
+
+fn find_manifest_by_family(family: &str) -> Option<std::path::PathBuf> {
+    let program_files = std::env::var("ProgramFiles").ok()?;
+    let root = PathBuf::from(program_files).join("WindowsApps");
+    let entries = std::fs::read_dir(&root).ok()?;
+    let family_l = family.to_ascii_lowercase();
+    // Family is `Name_PublisherHash`; full folder is `Name_Ver_Arch__Hash`.
+    let (name, hash) = family.rsplit_once('_').unwrap_or((family, ""));
+    let name_l = name.to_ascii_lowercase();
+    let suffix = format!("__{}", hash.to_ascii_lowercase());
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let folder_l = file_name.to_ascii_lowercase();
+        let matched = folder_l == family_l
+            || (folder_l.starts_with(&format!("{name_l}_")) && folder_l.ends_with(&suffix));
+        if !matched {
+            continue;
+        }
+        let manifest = entry.path().join("AppxManifest.xml");
+        if manifest.is_file() {
+            return Some(manifest);
+        }
+    }
+    None
 }
 
 fn classic() -> Capability {
@@ -212,11 +275,44 @@ mod tests {
     }
 
     #[test]
-    fn apps_folder_aumid_is_unsupported() {
+    fn apps_folder_aumid_is_not_blanket_unsupported() {
+        // Unresolved AUMID must not claim AppContainer — Full Trust desktop
+        // packages use the same AUMID form (issue 36 decision table).
         let c = classify_target(
-            r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            r"shell:AppsFolder\Not.A.Real_Package_abc123xyz!App",
             "",
         );
+        assert_eq!(c.packaging, Packaging::PackagedUnknown);
+        assert_eq!(c.injection, InjectionSupport::Delayed);
+    }
+
+    #[test]
+    fn full_trust_manifest_is_delayed() {
+        let dir = std::env::temp_dir().join("envbox_pkg_fulltrust_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let xml = r#"
+        <Package>
+          <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>
+          <Application Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication" />
+        </Package>
+        "#;
+        std::fs::write(dir.join("AppxManifest.xml"), xml).unwrap();
+        let c = classify_install_dir(&dir);
+        assert_eq!(c.packaging, Packaging::PackagedWin32);
+        assert_eq!(c.injection, InjectionSupport::Delayed);
+    }
+
+    #[test]
+    fn winrt_manifest_is_unsupported() {
+        let dir = std::env::temp_dir().join("envbox_pkg_winrt_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let xml = r#"
+        <Package>
+          <Application Id="App" Executable="x.exe" EntryPoint="Windows.Application" />
+        </Package>
+        "#;
+        std::fs::write(dir.join("AppxManifest.xml"), xml).unwrap();
+        let c = classify_install_dir(&dir);
         assert_eq!(c.packaging, Packaging::AppContainer);
         assert_eq!(c.injection, InjectionSupport::Unsupported);
     }

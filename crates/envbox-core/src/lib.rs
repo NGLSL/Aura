@@ -13,9 +13,9 @@ pub mod session;
 
 pub use session::{
     capabilities_for_target, evaluate_injection_support, isolation_for_strategy, is_packaged_target,
-    select_attach_strategy, ActivatedTarget, AttachStrategy, EnvironmentSession, InjectionCapability,
-    IntegrityLevel, IsolationGuarantee, MitigationPolicy, PackageIdentity, SessionState,
-    TargetCapabilities,
+    select_attach_strategy, ActivatedTarget, ActivationType, AttachStrategy, EnvironmentSession,
+    InjectionCapability, IntegrityLevel, IsolationGuarantee, MitigationPolicy, PackageIdentity,
+    SessionState, TargetCapabilities,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -256,6 +256,45 @@ pub struct RuntimeInstance {
     pub isolation_guarantee: Option<IsolationGuarantee>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach_strategy: Option<AttachStrategy>,
+}
+
+impl RuntimeInstance {
+    /// Map an EnvironmentSession control-plane aggregate to the persisted
+    /// run record. Session fields never drop isolation/attach/package.
+    pub fn from_session(
+        session: &session::EnvironmentSession,
+        started_at: SystemTime,
+    ) -> Self {
+        Self {
+            id: session.id,
+            application_id: session.application_id,
+            profile_id: session.profile_id,
+            root_pid: session.root_processes.iter().next().copied().unwrap_or(0),
+            process_ids: session.processes.clone(),
+            started_at,
+            status: InstanceStatus::from_session_state(session.state),
+            package_family_name: session
+                .package_identity
+                .as_ref()
+                .map(|p| p.package_family_name.clone()),
+            aumid: session.package_identity.as_ref().map(|p| p.aumid.clone()),
+            isolation_guarantee: Some(session.isolation),
+            attach_strategy: Some(session.attach_strategy),
+        }
+    }
+}
+
+impl InstanceStatus {
+    pub fn from_session_state(state: session::SessionState) -> Self {
+        use session::SessionState as S;
+        match state {
+            S::Created | S::Activated | S::Attached => InstanceStatus::Starting,
+            S::Running => InstanceStatus::Running,
+            S::Stopping => InstanceStatus::Stopping,
+            S::Exited => InstanceStatus::Exited,
+            S::Failed => InstanceStatus::Failed,
+        }
+    }
 }
 
 /// Audit Mode event schema v1 (ticket 20). One JSON object per line.

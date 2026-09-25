@@ -934,6 +934,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "envbox-broker"
+version = "0.1.0"
+dependencies = [
+ "envbox-core",
+ "envbox-launcher",
+ "uuid",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "envbox-cli"
 version = "0.1.0"
 dependencies = [

@@ -9,11 +9,11 @@
 //! HELLO / GET_PROFILE / PROFILE / RUNTIME_READY / HOOK_ERROR /
 //! PROCESS_CREATED / PROCESS_EXITED.
 //!
-//! Win32 keeps ENVBOX_* + profiles.toml as fallback; IPC is preferred for
-//! packaged roots that have no Environment Block.
+//! Win32 keeps ENVBOX_* structured values as fallback; IPC/Broker is preferred
+//! for all roots (including packaged, which have no Environment Block).
 
 use envbox_core::{DnsMode, EnvironmentProfile, LocaleProfile, RegistryProfile, TimezoneProfile};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -75,6 +75,27 @@ pub enum IpcMessage {
         pid: u32,
         exit_code: u32,
     },
+    /// Host → Broker: register a Profile payload in the Session Registry.
+    RegisterProfile {
+        profile_id: String,
+        instance_id: String,
+        locale_name: String,
+        ui_language: String,
+        region: String,
+        tz_windows: String,
+        tz_iana: String,
+        inherit_children: bool,
+        audit: bool,
+        dns_mode: bool,
+        dns_servers: Vec<String>,
+        registry_paths: Vec<String>,
+    },
+    /// Host → Broker: bind a PID to a session profile (and optional parent).
+    BindPid {
+        pid: u32,
+        profile_id: String,
+        parent_pid: u32,
+    },
     /// Unknown / future message (forward compatible).
     Other {
         name: String,
@@ -92,6 +113,8 @@ impl IpcMessage {
             IpcMessage::HookError { .. } => "HOOK_ERROR",
             IpcMessage::ProcessCreated { .. } => "PROCESS_CREATED",
             IpcMessage::ProcessExited { .. } => "PROCESS_EXITED",
+            IpcMessage::RegisterProfile { .. } => "REGISTER_PROFILE",
+            IpcMessage::BindPid { .. } => "BIND_PID",
             IpcMessage::Other { .. } => "OTHER",
         }
     }
@@ -171,6 +194,51 @@ impl IpcMessage {
             }
             IpcMessage::ProcessExited { pid, exit_code } => {
                 format!("PROCESS_EXITED pid={pid} exit_code={exit_code}")
+            }
+            IpcMessage::RegisterProfile {
+                profile_id,
+                instance_id,
+                locale_name,
+                ui_language,
+                region,
+                tz_windows,
+                tz_iana,
+                inherit_children,
+                audit,
+                dns_mode,
+                dns_servers,
+                registry_paths,
+            } => {
+                let mut s = format!(
+                    "REGISTER_PROFILE profile_id={} instance_id={} locale_name={} ui_language={} region={} tz_windows={} tz_iana={} inherit_children={} audit={} dns_mode={}",
+                    quote_value(profile_id),
+                    quote_value(instance_id),
+                    quote_value(locale_name),
+                    quote_value(ui_language),
+                    quote_value(region),
+                    quote_value(tz_windows),
+                    quote_value(tz_iana),
+                    if *inherit_children { 1 } else { 0 },
+                    if *audit { 1 } else { 0 },
+                    if *dns_mode { 1 } else { 0 },
+                );
+                for d in dns_servers {
+                    s.push_str(&format!(" dns_server={}", quote_value(d)));
+                }
+                for p in registry_paths {
+                    s.push_str(&format!(" registry_path={}", quote_value(p)));
+                }
+                s
+            }
+            IpcMessage::BindPid {
+                pid,
+                profile_id,
+                parent_pid,
+            } => {
+                format!(
+                    "BIND_PID pid={pid} profile_id={} parent_pid={parent_pid}",
+                    quote_value(profile_id)
+                )
             }
             IpcMessage::Other { name, fields } => {
                 let mut s = name.clone();
@@ -259,6 +327,25 @@ impl IpcMessage {
                 pid: get_u32("pid")?,
                 exit_code: first("exit_code").parse().unwrap_or(0),
             },
+            "REGISTER_PROFILE" => IpcMessage::RegisterProfile {
+                profile_id: first("profile_id"),
+                instance_id: first("instance_id"),
+                locale_name: first("locale_name"),
+                ui_language: first("ui_language"),
+                region: first("region"),
+                tz_windows: first("tz_windows"),
+                tz_iana: first("tz_iana"),
+                inherit_children: get_flag("inherit_children"),
+                audit: get_flag("audit"),
+                dns_mode: get_flag("dns_mode"),
+                dns_servers: list("dns_server"),
+                registry_paths: list("registry_path"),
+            },
+            "BIND_PID" => IpcMessage::BindPid {
+                pid: get_u32("pid")?,
+                profile_id: first("profile_id"),
+                parent_pid: first("parent_pid").parse().unwrap_or(0),
+            },
             other => IpcMessage::Other {
                 name: other.to_string(),
                 fields: map,
@@ -269,6 +356,16 @@ impl IpcMessage {
 
 /// Convert a domain Profile into a PROFILE message.
 pub fn profile_to_message(profile: &EnvironmentProfile, instance_id: &str) -> IpcMessage {
+    profile_to_message_with_flags(profile, instance_id, true, false)
+}
+
+/// PROFILE message with explicit inherit/audit flags from the Run request.
+pub fn profile_to_message_with_flags(
+    profile: &EnvironmentProfile,
+    instance_id: &str,
+    inherit_children: bool,
+    audit: bool,
+) -> IpcMessage {
     IpcMessage::Profile {
         profile_id: profile.id.to_string(),
         instance_id: instance_id.to_string(),
@@ -277,8 +374,8 @@ pub fn profile_to_message(profile: &EnvironmentProfile, instance_id: &str) -> Ip
         region: profile.locale.region.clone(),
         tz_windows: profile.timezone.windows_id.clone(),
         tz_iana: profile.timezone.iana_id.clone(),
-        inherit_children: true,
-        audit: false,
+        inherit_children,
+        audit,
         dns_mode: matches!(profile.dns.mode, DnsMode::VirtualView),
         dns_servers: profile
             .dns
@@ -408,14 +505,23 @@ fn tokenize_line(line: &str) -> Vec<String> {
     out
 }
 
-/// Host-side session table used by the IPC server.
+/// Host-side Session Registry used by the IPC / Broker server.
+///
+/// Maps PID → Profile and tracks process membership for one or more
+/// Environment Sessions (V0.3 ticket 43).
 #[derive(Default)]
 pub struct SessionTable {
     /// profile_id → PROFILE message
     profiles: HashMap<String, IpcMessage>,
     /// pid → profile_id
     bindings: HashMap<u32, String>,
+    /// pid → parent pid (session membership / Process Tracker)
+    parents: HashMap<u32, u32>,
+    /// live pids per profile_id
+    live: HashMap<String, HashSet<u32>>,
     instance_id: String,
+    /// lifecycle notices (best-effort log for broker observability)
+    pub events: Vec<IpcMessage>,
 }
 
 impl SessionTable {
@@ -432,20 +538,109 @@ impl SessionTable {
         self.profiles.insert(profile.id.to_string(), msg);
     }
 
+    pub fn register_profile_flags(
+        &mut self,
+        profile: &EnvironmentProfile,
+        inherit_children: bool,
+        audit: bool,
+    ) {
+        let msg = profile_to_message_with_flags(
+            profile,
+            &self.instance_id,
+            inherit_children,
+            audit,
+        );
+        self.profiles.insert(profile.id.to_string(), msg);
+    }
+
     pub fn bind_pid(&mut self, pid: u32, profile_id: &str) {
         self.bindings.insert(pid, profile_id.to_string());
+        self.live
+            .entry(profile_id.to_string())
+            .or_default()
+            .insert(pid);
+    }
+
+    pub fn register_profile_message(&mut self, msg: IpcMessage) {
+        if let IpcMessage::RegisterProfile { profile_id, .. } = &msg {
+            let profile_id = profile_id.clone();
+            let as_profile = match msg {
+                IpcMessage::RegisterProfile {
+                    profile_id,
+                    instance_id,
+                    locale_name,
+                    ui_language,
+                    region,
+                    tz_windows,
+                    tz_iana,
+                    inherit_children,
+                    audit,
+                    dns_mode,
+                    dns_servers,
+                    registry_paths,
+                } => IpcMessage::Profile {
+                    profile_id,
+                    instance_id,
+                    locale_name,
+                    ui_language,
+                    region,
+                    tz_windows,
+                    tz_iana,
+                    inherit_children,
+                    audit,
+                    dns_mode,
+                    dns_servers,
+                    registry_paths,
+                },
+                other => other,
+            };
+            self.profiles.insert(profile_id, as_profile);
+        }
+    }
+
+    /// Live process set for a profile (Process Tracker).
+    pub fn live_pids(&self, profile_id: &str) -> Vec<u32> {
+        self.live
+            .get(profile_id)
+            .map(|s| {
+                let mut v: Vec<u32> = s.iter().copied().collect();
+                v.sort_unstable();
+                v
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn profile_of(&self, pid: u32) -> Option<&str> {
+        self.bindings.get(&pid).map(String::as_str)
     }
 
     pub fn handle(&mut self, msg: &IpcMessage) -> Option<IpcMessage> {
         match msg {
-            IpcMessage::Hello { .. } => None,
+            IpcMessage::Hello { .. } => {
+                self.events.push(msg.clone());
+                None
+            }
             IpcMessage::GetProfile { pid, profile_id } => {
                 let key = if profile_id.is_empty() {
                     self.bindings.get(pid).cloned().unwrap_or_default()
                 } else {
                     profile_id.clone()
                 };
+                // Also accept parent binding: child inherits parent's profile.
+                let key = if key.is_empty() {
+                    self.parents
+                        .get(pid)
+                        .and_then(|pp| self.bindings.get(pp).cloned())
+                        .unwrap_or_default()
+                } else {
+                    key
+                };
+                if !key.is_empty() {
+                    self.bindings.insert(*pid, key.clone());
+                    self.live.entry(key.clone()).or_default().insert(*pid);
+                }
                 self.profiles.get(&key).cloned().or_else(|| {
+                    // Empty PROFILE fails closed in Runtime (required fields).
                     Some(IpcMessage::Profile {
                         profile_id: key,
                         instance_id: self.instance_id.clone(),
@@ -461,6 +656,54 @@ impl SessionTable {
                         registry_paths: vec![],
                     })
                 })
+            }
+            IpcMessage::RegisterProfile { .. } => {
+                self.register_profile_message(msg.clone());
+                None
+            }
+            IpcMessage::BindPid {
+                pid,
+                profile_id,
+                parent_pid,
+            } => {
+                if *parent_pid != 0 {
+                    self.parents.insert(*pid, *parent_pid);
+                }
+                if !profile_id.is_empty() {
+                    self.bind_pid(*pid, profile_id);
+                } else if *parent_pid != 0 {
+                    if let Some(p) = self.bindings.get(parent_pid).cloned() {
+                        self.bind_pid(*pid, &p);
+                    }
+                }
+                None
+            }
+            IpcMessage::ProcessCreated {
+                pid,
+                child_pid,
+                image: _,
+            } => {
+                self.parents.insert(*child_pid, *pid);
+                if let Some(p) = self.bindings.get(pid).cloned() {
+                    self.bind_pid(*child_pid, &p);
+                }
+                self.events.push(msg.clone());
+                None
+            }
+            IpcMessage::ProcessExited { pid, .. } => {
+                if let Some(key) = self.bindings.get(pid).cloned() {
+                    if let Some(set) = self.live.get_mut(&key) {
+                        set.remove(pid);
+                    }
+                }
+                self.bindings.remove(pid);
+                self.parents.remove(pid);
+                self.events.push(msg.clone());
+                None
+            }
+            IpcMessage::RuntimeReady { .. } | IpcMessage::HookError { .. } => {
+                self.events.push(msg.clone());
+                None
             }
             _ => None,
         }
@@ -667,5 +910,66 @@ mod tests {
             registry_paths: vec![],
         };
         assert!(message_to_profile(&msg).is_err());
+    }
+
+    #[test]
+    fn register_and_bind_round_trip() {
+        let reg = IpcMessage::RegisterProfile {
+            profile_id: "p1".into(),
+            instance_id: "i".into(),
+            locale_name: "en-US".into(),
+            ui_language: "en-US".into(),
+            region: "US".into(),
+            tz_windows: "Pacific Standard Time".into(),
+            tz_iana: "America/Los_Angeles".into(),
+            inherit_children: true,
+            audit: false,
+            dns_mode: false,
+            dns_servers: vec![],
+            registry_paths: vec![],
+        };
+        assert_eq!(round_trip(&reg), reg);
+        let bind = IpcMessage::BindPid {
+            pid: 10,
+            profile_id: "p1".into(),
+            parent_pid: 1,
+        };
+        assert_eq!(round_trip(&bind), bind);
+    }
+
+    #[test]
+    fn session_registry_tracks_children_and_exit() {
+        let mut t = SessionTable::new();
+        t.handle(&IpcMessage::RegisterProfile {
+            profile_id: "p1".into(),
+            instance_id: "i".into(),
+            locale_name: "en-US".into(),
+            ui_language: "en-US".into(),
+            region: "US".into(),
+            tz_windows: "PST".into(),
+            tz_iana: "UTC".into(),
+            inherit_children: true,
+            audit: false,
+            dns_mode: false,
+            dns_servers: vec![],
+            registry_paths: vec![],
+        });
+        t.handle(&IpcMessage::BindPid {
+            pid: 10,
+            profile_id: "p1".into(),
+            parent_pid: 0,
+        });
+        t.handle(&IpcMessage::ProcessCreated {
+            pid: 10,
+            child_pid: 11,
+            image: "child.exe".into(),
+        });
+        assert_eq!(t.profile_of(11), Some("p1"));
+        assert_eq!(t.live_pids("p1"), vec![10, 11]);
+        t.handle(&IpcMessage::ProcessExited {
+            pid: 11,
+            exit_code: 0,
+        });
+        assert_eq!(t.live_pids("p1"), vec![10]);
     }
 }

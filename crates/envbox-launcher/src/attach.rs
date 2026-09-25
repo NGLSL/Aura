@@ -122,8 +122,9 @@ fn win_inject_remote(pid: u32, dll: &Path) -> Result<(), AttachError> {
         VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
     };
     use windows::Win32::System::Threading::{
-        CreateRemoteThread, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_CREATE_THREAD,
-        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+        CreateRemoteThread, GetExitCodeThread, OpenProcess, WaitForSingleObject, INFINITE,
+        PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
     };
     use windows::core::PCWSTR;
 
@@ -220,6 +221,10 @@ fn win_inject_remote(pid: u32, dll: &Path) -> Result<(), AttachError> {
         })?;
 
         let wait = WaitForSingleObject(thread.0, INFINITE);
+        // LoadLibraryW / DllMain result is the thread exit code. 0 = fail
+        // (DllMain returned FALSE is Startup Fail Policy — never silent).
+        let mut load_result = 0u32;
+        let code_ok = GetExitCodeThread(thread.0, &mut load_result).is_ok();
         // Drop order: thread → remote → process (all RAII).
         drop(thread);
         drop(remote);
@@ -228,6 +233,23 @@ fn win_inject_remote(pid: u32, dll: &Path) -> Result<(), AttachError> {
             return Err(AttachError::InjectFailed {
                 pid,
                 message: "WaitForSingleObject on remote thread failed".into(),
+            });
+        }
+        if !code_ok {
+            return Err(AttachError::InjectFailed {
+                pid,
+                message: format!(
+                    "GetExitCodeThread failed after LoadLibraryW ({})",
+                    GetLastError().0
+                ),
+            });
+        }
+        if load_result == 0 {
+            return Err(AttachError::InjectFailed {
+                pid,
+                message:
+                    "LoadLibraryW returned NULL (Runtime DllMain Fail Closed or DLL rejected)"
+                        .into(),
             });
         }
         Ok(())

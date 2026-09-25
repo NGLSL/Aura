@@ -38,10 +38,10 @@ WindowsApps **不要按目录处理**，按 **Package Identity + Trust Level + R
 ## 实现（本轮）
 
 - `crates/envbox-app/src/package.rs`：`Packaging` / `InjectionSupport` / `Capability` + `classify_target`
-  - `shell:AppsFolder\…!App`、裸 AUMID → AppContainer / 不支持
+  - `shell:AppsFolder\…!App`、裸 AUMID → 按 Package Identity 解析（`PackageInstallPath` / WindowsApps `AppxManifest.xml`）：`FullTrustApplication` / `Executable=` → Packaged Win32 / 延迟注入；WinRT EntryPoint → UWP / 不支持；无法解析 → PackagedUnknown / 延迟（**不再**一刀切 AppContainer）
   - `WindowsApps` 路径 → 找 `AppxManifest.xml`：`FullTrustApplication` / `Executable=` → Packaged Win32 / 延迟注入；WinRT EntryPoint → UWP / 不支持
   - 其余 → Win32 / 可注入
-- `discover.rs`：分类字段、同 exe 只保留一条（start-menu 优先）
+- `discover.rs`：分类字段、同 exe 只保留一条（start-menu 优先）；AppsFolder 用 `PackageInstallPath` 调 `classify_install_dir`
 - 选择器：真图标 + 来源/包类型/注入能力徽章；选中带入后按能力给出状态提示
 
 ## Comments
@@ -49,3 +49,7 @@ WindowsApps **不要按目录处理**，按 **Package Identity + Trust Level + R
 ### 2026-09-26 design
 
 用户提供的策略：Full Trust 可激活后注入；AppContainer/签名策略 V0.2 直接拒绝；PSF 仅自控包可选。本轮先把「识别 + 徽章 + 不静默」落在添加应用交互，不改注入链路。
+
+### 2026-09-27 classification fix
+
+实测 `OpenAI.Codex`（ChatGPT，`shell:AppsFolder\OpenAi.Codex_…!App`）manifest 为 `runFullTrust` + `EntryPoint="Windows.FullTrustApplication"`，属决策表首行 Packaged Win32 / 延迟注入。原先「AppsFolder AUMID → AppContainer / 不支持」的捷径与决策表冲突，已改为按 Package Identity 分类。验收：`chat_query_matches_chatgpt` 断言 ChatGPT 为 `PackagedWin32` + `Delayed`。

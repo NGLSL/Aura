@@ -26,12 +26,21 @@ pub fn build_environment_block(
         }
     }
     let lower = |k: &str| k.to_ascii_lowercase();
-    env.retain(|k, _| {
-        lower(k) != "envbox_instance_id"
-            && lower(k) != "envbox_profile_id"
-            && lower(k) != "envbox_inherit_children"
-            && lower(k) != "envbox_audit"
-    });
+    const DROP: [&str; 12] = [
+        "envbox_instance_id",
+        "envbox_profile_id",
+        "envbox_inherit_children",
+        "envbox_audit",
+        "envbox_locale_name",
+        "envbox_ui_language",
+        "envbox_region",
+        "envbox_tz_windows",
+        "envbox_tz_iana",
+        "envbox_dns_mode",
+        "envbox_dns_servers",
+        "envbox_registry_paths",
+    ];
+    env.retain(|k, _| !DROP.contains(&lower(k).as_str()));
     env.insert("ENVBOX_INSTANCE_ID".into(), instance_id.to_string());
     env.insert("ENVBOX_PROFILE_ID".into(), profile_id.to_string());
     env.insert(
@@ -42,7 +51,54 @@ pub fn build_environment_block(
         "ENVBOX_AUDIT".into(),
         if audit { "1" } else { "0" }.into(),
     );
+    // ENVBOX_* value fallback (no C++ TOML). Used when Broker IPC is down.
+    if let Some(profile) = profile {
+        insert_profile_value_fallback(&mut env, profile);
+    }
     env
+}
+
+/// Write structured Profile fields as ENVBOX_* (Win32 fallback channel).
+/// Runtime prefers Broker PROFILE; these vars are the non-TOML fallback.
+pub fn insert_profile_value_fallback(
+    env: &mut HashMap<String, String>,
+    profile: &EnvironmentProfile,
+) {
+    env.insert(
+        "ENVBOX_LOCALE_NAME".into(),
+        profile.locale.locale_name.clone(),
+    );
+    env.insert(
+        "ENVBOX_UI_LANGUAGE".into(),
+        profile.locale.ui_language.clone(),
+    );
+    env.insert("ENVBOX_REGION".into(), profile.locale.region.clone());
+    env.insert(
+        "ENVBOX_TZ_WINDOWS".into(),
+        profile.timezone.windows_id.clone(),
+    );
+    env.insert("ENVBOX_TZ_IANA".into(), profile.timezone.iana_id.clone());
+    env.insert(
+        "ENVBOX_DNS_MODE".into(),
+        match profile.dns.mode {
+            envbox_core::DnsMode::Host => "0".into(),
+            envbox_core::DnsMode::VirtualView => "1".into(),
+        },
+    );
+    env.insert(
+        "ENVBOX_DNS_SERVERS".into(),
+        profile
+            .dns
+            .servers
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>()
+            .join(";"),
+    );
+    env.insert(
+        "ENVBOX_REGISTRY_PATHS".into(),
+        profile.registry.whitelist_paths.join(";"),
+    );
 }
 
 /// Encode as a Windows Unicode environment block: `k=v\0k=v\0\0`.
@@ -117,6 +173,37 @@ mod tests {
             Some("0")
         );
         assert_eq!(merged.get("ENVBOX_AUDIT").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn profile_value_fallback_written_without_toml() {
+        let host = HashMap::new();
+        let mut p = profile();
+        p.dns = envbox_core::DnsProfile {
+            mode: envbox_core::DnsMode::VirtualView,
+            servers: vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()],
+        };
+        p.registry = RegistryProfile {
+            whitelist_paths: vec!["HKCU\\Software\\EnvBox".into()],
+        };
+        let merged = build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        assert_eq!(
+            merged.get("ENVBOX_LOCALE_NAME").map(String::as_str),
+            Some("en-US")
+        );
+        assert_eq!(
+            merged.get("ENVBOX_TZ_WINDOWS").map(String::as_str),
+            Some("Pacific Standard Time")
+        );
+        assert_eq!(merged.get("ENVBOX_DNS_MODE").map(String::as_str), Some("1"));
+        assert_eq!(
+            merged.get("ENVBOX_DNS_SERVERS").map(String::as_str),
+            Some("1.1.1.1;8.8.8.8")
+        );
+        assert_eq!(
+            merged.get("ENVBOX_REGISTRY_PATHS").map(String::as_str),
+            Some("HKCU\\Software\\EnvBox")
+        );
     }
 
     #[test]

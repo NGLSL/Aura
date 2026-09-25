@@ -19,7 +19,11 @@
 | **TargetCapabilities** | 目标能力标志：can_suspend / can_inject_runtime / can_create_environment_block / can_assign_job / can_track_children |
 | **IsolationGuarantee** | 隔离保证级别：FullPreExecution / PostActivation / Partial |
 | **early-start race** | Packaged root 在激活后、注入前可能已读到 Host 值的窗口（PostActivation 已知限制） |
-| **Runtime IPC Bootstrap** | Runtime 经 Named Pipe 按 PID 向 Host 取 RuntimeProfile；ENVBOX_* 仅作 Win32 回退 |
+| **Runtime IPC Bootstrap** | Runtime 经 Named Pipe 按 PID 向 Host/Broker 取 RuntimeProfile；ENVBOX_* 结构化值仅作 Win32 回退。C++ 不解析 `profiles.toml` |
+| **Session Registry** | Broker/Host 侧 PID → Session/Profile 映射；含子进程归属与生命周期事件 |
+| **envbox-broker** | 独立 Host 进程：Session Registry + Runtime IPC 服务端；与进程内 HostBroker 共用同一协议 |
+| **ENVBOX_* value fallback** | Environment Block 中的结构化 Profile 字段（locale/tz/dns/registry 等）；Broker 不可用时的 Win32 回退通道，非 TOML |
+| **Process Tracker** | 会话进程集跟踪：Win32 用 Job Object，Packaged 用 PID + Package Identity |
 | **Packaging** | 目标的打包模型：Win32 / Packaged Win32（Full Trust）/ AppContainer（UWP）/ PackagedUnknown。按 Package Identity 判断，不按目录 |
 | **AUMID** | AppUserModelId；打包应用的激活标识（`PackageFamilyName!ApplicationId`） |
 | **Injection Support** | Runtime 注入能力：Supported（可注入）/ Delayed（AttachStrategy::PostActivation 激活后注入）/ Unsupported（AppContainer / mitigation Blocking 或 Unknown 等，拒绝启动，不静默降级） |

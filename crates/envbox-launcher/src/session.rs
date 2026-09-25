@@ -50,6 +50,8 @@ pub struct SessionHandle {
     pub profile_payload: Option<String>,
     /// Host Named Pipe broker (packaged / IPC bootstrap).
     pub broker: Option<crate::ipc_server::HostBroker>,
+    /// Process Tracker (Job + Package/PID dual backend).
+    pub tracker: crate::process_tracker::ProcessTracker,
     #[cfg(windows)]
     process: Option<crate::launcher::win::SafeHandle>,
     /// Primary thread handle kept for lifetime / resume bookkeeping.
@@ -120,7 +122,41 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
     }
 
     let host_env: HashMap<String, String> = std::env::vars().collect();
-    let pipe_path = crate::ipc_server::session_pipe_name(&instance_id.to_string());
+    let is_packaged = matches!(req.launch, LaunchTarget::Packaged { .. });
+    // Packaged roots have no Environment Block → must use the well-known
+    // default pipe (C++ cannot learn a per-session name). Win32 may use a
+    // per-session pipe via ENVBOX_IPC_PIPE.
+    let pipe_path = if is_packaged {
+        crate::ipc::DEFAULT_PIPE_NAME.to_string()
+    } else {
+        crate::ipc_server::session_pipe_name(&instance_id.to_string())
+    };
+
+    // Start HostBroker BEFORE activation/attach: DllMain loads Profile during
+    // LoadLibrary, so the pipe must already accept HELLO/GET_PROFILE.
+    let mut table = SessionTable::new();
+    if let Some(profile) = &req.profile {
+        table.set_instance_id(&instance_id.to_string());
+        table.register_profile_flags(profile, req.inherit_children, req.audit);
+    }
+    let shared: crate::ipc_server::SharedTable = std::sync::Arc::new(std::sync::Mutex::new(table));
+    let broker = if host_mode {
+        None
+    } else {
+        match crate::ipc_server::HostBroker::start_on(shared.clone(), pipe_path.clone()) {
+            Ok(b) => Some(b),
+            Err(err) => {
+                // Packaged cannot fall back to ENVBOX_*; Win32 still can.
+                if is_packaged {
+                    return Err(SessionError::Unsupported(format!(
+                        "IPC Broker bind failed for packaged root ({err})"
+                    )));
+                }
+                None // Fail open for Win32: ENVBOX_* value fallback still works.
+            }
+        }
+    };
+
     let env = if host_mode {
         host_env
     } else {
@@ -132,12 +168,10 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
             req.inherit_children,
             req.audit,
         );
-        // Point Runtime IPC Bootstrap at this session's Host pipe.
+        // Point Runtime IPC Bootstrap at this session's Host pipe (Win32 only).
         env.insert("ENVBOX_IPC_PIPE".into(), pipe_path.clone());
         env
     };
-
-    let is_packaged = matches!(req.launch, LaunchTarget::Packaged { .. });
 
     // Capability snapshot before activation (Win32 we create = full caps).
     let pre_caps = if is_packaged {
@@ -214,6 +248,28 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
     }
     session.state = SessionState::Activated;
 
+    // Bind root PID BEFORE attach: DllMain GET_PROFILE runs during LoadLibrary.
+    if req.profile.is_some() {
+        shared
+            .lock()
+            .unwrap()
+            .bind_pid(activated.pid, &profile_id.to_string());
+    }
+
+    // Process Tracker: Job for Win32, Package/PID for Packaged.
+    let mut tracker = if session.package_identity.is_some() {
+        crate::process_tracker::ProcessTracker::packaged(
+            session
+                .package_identity
+                .clone()
+                .expect("package identity checked"),
+        )
+    } else {
+        crate::process_tracker::ProcessTracker::win32()
+    };
+    tracker.register_root(activated.pid);
+    tracker.mark(SessionState::Activated);
+
     // Job (lifecycle only; best-effort for packaged).
     let mut job = InstanceJob::create()?;
     let _job_ok = job.assign_pid(activated.pid).is_ok();
@@ -250,23 +306,15 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
 
     session.state = SessionState::Running;
 
-    // IPC bootstrap table + Named Pipe host (packaged roots have no ENVBOX_*).
-    let mut table = SessionTable::new();
-    if let Some(profile) = &req.profile {
-        table.set_instance_id(&instance_id.to_string());
-        table.register_profile(profile);
-        table.bind_pid(activated.pid, &profile_id.to_string());
-    }
-    let shared: crate::ipc_server::SharedTable = std::sync::Arc::new(std::sync::Mutex::new(table));
-    let broker = match crate::ipc_server::HostBroker::start_on(shared, pipe_path) {
-        Ok(b) => Some(b),
-        Err(_) => None, // Fail open: Win32 ENVBOX_* fallback still works.
-    };
-
-    let profile_payload = req
-        .profile
-        .as_ref()
-        .map(|p| crate::ipc::profile_to_message(p, &instance_id.to_string()).encode_line());
+    let profile_payload = req.profile.as_ref().map(|p| {
+        crate::ipc::profile_to_message_with_flags(
+            p,
+            &instance_id.to_string(),
+            req.inherit_children,
+            req.audit,
+        )
+        .encode_line()
+    });
 
     let mut process_ids = HashSet::new();
     process_ids.insert(activated.pid);
@@ -310,6 +358,7 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
         child: None,
         profile_payload,
         broker,
+        tracker,
         #[cfg(windows)]
         process: root_process,
         #[cfg(windows)]
@@ -320,6 +369,15 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
 /// Register a child process with the session (unified Win32/Packaged).
 pub fn register_child(session: &mut EnvironmentSession, pid: u32) {
     session.register_child(pid);
+}
+
+/// Register a child on the Process Tracker (parent-aware).
+pub fn register_child_tracked(
+    tracker: &mut crate::process_tracker::ProcessTracker,
+    pid: u32,
+    parent: Option<u32>,
+) {
+    tracker.register_child(pid, parent);
 }
 
 /// Membership: root descendant OR package family + activation window.
@@ -421,5 +479,28 @@ mod tests {
         let line = msg.encode_line();
         assert!(line.contains("locale_name=en-US"));
         assert!(line.contains("region=US"));
+    }
+
+    /// Machine smoke: Full Trust packaged ChatGPT via AUMID (issue 36 / GUI run).
+    #[test]
+    #[ignore = "launches real ChatGPT; run explicitly"]
+    fn chatgpt_packaged_aumid_starts() {
+        let launch = crate::package_discovery::launch_target_from_user_path(
+            r"shell:AppsFolder\OpenAi.Codex_2p2nqsd0c76g0!App",
+        );
+        assert!(matches!(launch, LaunchTarget::Packaged { .. }), "{launch:?}");
+        let req = SessionStartRequest {
+            application_id: Uuid::nil(),
+            launch,
+            arguments: vec![],
+            working_directory: None,
+            profile: Some(profile()),
+            inherit_children: true,
+            audit: false,
+        };
+        let mut handle = start_session(req).expect("packaged session must start");
+        assert!(handle.instance.root_pid > 0);
+        assert!(handle.instance.aumid.is_some());
+        let _ = handle.job.as_mut().map(|j| j.terminate());
     }
 }

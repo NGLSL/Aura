@@ -178,6 +178,37 @@ impl EnvironmentSession {
     }
 }
 
+/// How the target was started (LaunchTarget mirror on the session).
+/// Kept as data so Process Tracker / Capability can branch on activation kind
+/// without string-matching paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivationType {
+    Win32,
+    Command,
+    PackagedApp,
+}
+
+impl ActivationType {
+    pub fn of(target: &LaunchTarget) -> Self {
+        match target {
+            LaunchTarget::Executable { .. } => ActivationType::Win32,
+            LaunchTarget::Command { .. } => ActivationType::Command,
+            LaunchTarget::Packaged { .. } => ActivationType::PackagedApp,
+        }
+    }
+
+    pub fn is_packaged(self) -> bool {
+        matches!(self, ActivationType::PackagedApp)
+    }
+}
+
+impl EnvironmentSession {
+    /// Activation kind derived from the LaunchTarget (never path heuristics).
+    pub fn activation_type(&self) -> ActivationType {
+        ActivationType::of(&self.target)
+    }
+}
+
 /// Choose attach strategy from capabilities (no path/type branches).
 pub fn select_attach_strategy(caps: &TargetCapabilities) -> Option<AttachStrategy> {
     if caps.can_suspend && caps.can_inject_runtime {
@@ -394,5 +425,63 @@ mod tests {
             isolation_for_strategy(AttachStrategy::PreExecution),
             IsolationGuarantee::FullPreExecution
         );
+    }
+
+    #[test]
+    fn activation_type_from_launch_target() {
+        assert_eq!(
+            ActivationType::of(&LaunchTarget::Executable {
+                path: "a.exe".into()
+            }),
+            ActivationType::Win32
+        );
+        assert_eq!(
+            ActivationType::of(&LaunchTarget::Command {
+                command: "cmd".into()
+            }),
+            ActivationType::Command
+        );
+        assert_eq!(
+            ActivationType::of(&LaunchTarget::Packaged {
+                aumid: "F!A".into(),
+                package_full_name: "F_1".into(),
+                package_family_name: "F".into(),
+            }),
+            ActivationType::PackagedApp
+        );
+    }
+
+    #[test]
+    fn runtime_instance_preserves_session_fields() {
+        let mut s = EnvironmentSession::new(
+            Uuid::nil(),
+            LaunchTarget::Packaged {
+                aumid: "Foo!App".into(),
+                package_full_name: "Foo_1".into(),
+                package_family_name: "Foo".into(),
+            },
+            Uuid::nil(),
+            IsolationGuarantee::PostActivation,
+            AttachStrategy::PostActivation,
+        );
+        s.register_root(1234);
+        s.register_child(1235);
+        s.package_identity = Some(PackageIdentity {
+            aumid: "Foo!App".into(),
+            package_full_name: "Foo_1".into(),
+            package_family_name: "Foo".into(),
+        });
+        s.state = SessionState::Running;
+        let inst = crate::RuntimeInstance::from_session(
+            &s,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(inst.root_pid, 1234);
+        assert!(inst.process_ids.contains(&1235));
+        assert_eq!(inst.package_family_name.as_deref(), Some("Foo"));
+        assert_eq!(inst.aumid.as_deref(), Some("Foo!App"));
+        assert_eq!(inst.isolation_guarantee, Some(IsolationGuarantee::PostActivation));
+        assert_eq!(inst.attach_strategy, Some(AttachStrategy::PostActivation));
+        assert_eq!(inst.status, crate::InstanceStatus::Running);
     }
 }

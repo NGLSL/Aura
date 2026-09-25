@@ -45,6 +45,7 @@ EnvBox 是 Windows 原生的进程级环境虚拟化启动器。目标程序直�
 ```powershell
 cargo build
 cargo test
+cargo build -p envbox-broker   # envbox-broker.exe（Session Registry / IPC Host）
 # runtime 使用 CMake/MSVC 构建 envbox-runtime64.dll 与 envbox-probe
 .\target\debug\envbox-probe.exe
 .\target\debug\envbox.exe profile list

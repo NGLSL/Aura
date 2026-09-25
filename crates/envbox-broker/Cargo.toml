@@ -1,0 +1,17 @@
+[package]
+name = "envbox-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "envbox-broker"
+path = "src/main.rs"
+
+[dependencies]
+envbox-core = { workspace = true }
+envbox-launcher = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

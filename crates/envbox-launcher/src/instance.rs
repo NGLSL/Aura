@@ -1,8 +1,11 @@
 //! RuntimeInstance lifecycle for GUI/CLI (ticket 10).
 //! Job Object tracks the Process Tree Instance; not a security boundary.
+//! Packaged / AUMID roots go through `start_session` (ActivationBackend).
 
 use crate::job::{JobError, JobStats};
-use crate::launcher::{launch, LaunchError, LaunchRequest, LaunchedProcess};
+use crate::launcher::LaunchError;
+use crate::package_discovery::normalize_launch_target;
+use crate::session::{start_session, SessionError, SessionHandle, SessionStartRequest};
 use envbox_core::{Application, EnvironmentProfile, InstanceStatus, RuntimeInstance};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -14,6 +17,8 @@ pub enum InstanceError {
     Launch(#[from] LaunchError),
     #[error(transparent)]
     Job(#[from] JobError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
     #[error("instance not found: {0}")]
     NotFound(Uuid),
 }
@@ -39,7 +44,8 @@ impl RunTarget {
 
 pub struct InstanceHandle {
     pub meta: RuntimeInstance,
-    pub child: LaunchedProcess,
+    /// Session pipeline handle (activation/attach/IPC/job).
+    pub session: SessionHandle,
 }
 
 /// Process-scoped instance registry (GUI holds one of these).
@@ -54,38 +60,15 @@ impl InstanceManager {
     }
 
     /// Run Application with a Profile or true Host (Run With; does not mutate
-    /// `Application.default_profile_id`).
+    /// `Application.default_profile_id`). Packaged/AUMID targets use
+    /// `start_session` (never CreateProcess a WindowsApps exe).
     pub fn run(&mut self, app: &Application, target: RunTarget) -> Result<Uuid, InstanceError> {
-        let profile_id = target.profile_id();
-        let request = build_launch_request(app, target, Uuid::new_v4());
-        let instance_id = request.instance_id;
-        let mut meta = RuntimeInstance {
-            id: instance_id,
-            application_id: app.id,
-            profile_id,
-            root_pid: 0,
-            process_ids: Default::default(),
-            started_at: std::time::SystemTime::now(),
-            status: InstanceStatus::Starting,
-            package_family_name: None,
-            aumid: None,
-            isolation_guarantee: None,
-            attach_strategy: None,
-        };
-
-        match launch(request) {
-            Ok(child) => {
-                meta.root_pid = child.pid;
-                meta.process_ids.insert(child.pid);
-                meta.status = InstanceStatus::Running;
-                self.instances.insert(instance_id, InstanceHandle { meta, child });
-                Ok(instance_id)
-            }
-            Err(err) => {
-                meta.status = InstanceStatus::Failed;
-                Err(InstanceError::Launch(err))
-            }
-        }
+        let request = build_session_request(app, target);
+        let session = start_session(request)?;
+        let id = session.instance.id;
+        let meta = session.instance.clone();
+        self.instances.insert(id, InstanceHandle { meta, session });
+        Ok(id)
     }
 
     /// Stop the Process Tree Instance by closing the Job
@@ -102,12 +85,12 @@ impl InstanceManager {
             return Ok(());
         }
         handle.meta.status = InstanceStatus::Stopping;
-        match handle.child.stop() {
-            Ok(()) => {
+        match handle.session.job.as_mut().map(|j| j.close()) {
+            Some(Ok(())) | None => {
                 handle.meta.status = InstanceStatus::Exited;
                 Ok(())
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 handle.meta.status = InstanceStatus::Failed;
                 Err(err.into())
             }
@@ -127,7 +110,10 @@ impl InstanceManager {
         ) {
             return Ok(handle.meta.status);
         }
-        let stats = handle.child.job_stats()?;
+        let Some(job) = handle.session.job.as_ref() else {
+            return Ok(handle.meta.status);
+        };
+        let stats = job.stats()?;
         handle.meta.status = status_from_stats(&stats, handle.meta.status);
         Ok(handle.meta.status)
     }
@@ -153,9 +139,10 @@ impl InstanceManager {
         let Some(handle) = self.instances.get(&id) else {
             return Err(InstanceError::NotFound(id));
         };
-        Ok(children_from_active_processes(
-            handle.child.job_stats()?.active_processes,
-        ))
+        let Some(job) = handle.session.job.as_ref() else {
+            return Ok(0);
+        };
+        Ok(children_from_active_processes(job.stats()?.active_processes))
     }
 }
 
@@ -164,22 +151,19 @@ fn children_from_active_processes(active: u32) -> u32 {
     active.saturating_sub(1)
 }
 
-/// Build LaunchRequest. Host → `profile: None` (no injection). Profile → `Some`.
-fn build_launch_request(
-    app: &Application,
-    target: RunTarget,
-    instance_id: Uuid,
-) -> LaunchRequest {
+/// Build SessionStartRequest. Host → `profile: None` (no injection).
+/// AUMID / shell:AppsFolder paths normalize to `LaunchTarget::Packaged`.
+fn build_session_request(app: &Application, target: RunTarget) -> SessionStartRequest {
     let (profile, inherit_children) = match &target {
         RunTarget::Profile(p) => (Some(p.clone()), app.inherit_children),
         RunTarget::Host => (None, app.inherit_children),
     };
-    LaunchRequest {
-        launch: app.launch.clone(),
+    SessionStartRequest {
+        application_id: app.id,
+        launch: normalize_launch_target(&app.launch),
         arguments: app.arguments.clone(),
         working_directory: app.working_directory.clone(),
         profile,
-        instance_id,
         inherit_children,
         audit: app.audit,
     }
@@ -317,21 +301,19 @@ mod tests {
     }
 
     #[test]
-    fn host_target_builds_unvirtualized_launch_request() {
+    fn host_target_builds_unvirtualized_session_request() {
         let app = sample_app(Uuid::new_v4());
-        let id = Uuid::new_v4();
-        let req = build_launch_request(&app, RunTarget::Host, id);
+        let req = build_session_request(&app, RunTarget::Host);
         assert!(req.profile.is_none(), "Host must not carry a Profile");
-        assert_eq!(req.instance_id, id);
         assert_eq!(req.arguments, app.arguments);
     }
 
     #[test]
-    fn profile_target_carries_profile_on_launch_request() {
+    fn profile_target_carries_profile_on_session_request() {
         let profile = sample_profile();
         let profile_id = profile.id;
         let app = sample_app(profile_id);
-        let req = build_launch_request(&app, RunTarget::Profile(profile), Uuid::new_v4());
+        let req = build_session_request(&app, RunTarget::Profile(profile));
         let p = req.profile.expect("Profile target must inject a Profile");
         assert_eq!(p.id, profile_id);
         assert_ne!(p.id, Uuid::nil());
@@ -343,5 +325,33 @@ mod tests {
         let p = sample_profile();
         let id = p.id;
         assert_eq!(RunTarget::Profile(p).profile_id(), id);
+    }
+
+    #[test]
+    fn aumid_executable_normalizes_to_packaged() {
+        let app = Application {
+            id: Uuid::new_v4(),
+            name: "ChatGPT".into(),
+            launch: LaunchTarget::Executable {
+                path: "shell:AppsFolder\\OpenAi.Codex_2p2nqsd0c76g0!App".into(),
+            },
+            working_directory: None,
+            arguments: vec![],
+            default_profile_id: Uuid::nil(),
+            inherit_children: true,
+            audit: false,
+        };
+        let req = build_session_request(&app, RunTarget::Host);
+        match req.launch {
+            LaunchTarget::Packaged {
+                aumid,
+                package_family_name,
+                ..
+            } => {
+                assert_eq!(aumid, "OpenAi.Codex_2p2nqsd0c76g0!App");
+                assert_eq!(package_family_name, "OpenAi.Codex_2p2nqsd0c76g0");
+            }
+            other => panic!("expected Packaged, got {other:?}"),
+        }
     }
 }

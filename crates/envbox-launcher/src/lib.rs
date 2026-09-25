@@ -12,6 +12,8 @@ pub mod ipc;
 pub mod ipc_server;
 pub mod job;
 pub mod launcher;
+pub mod package_discovery;
+pub mod process_tracker;
 pub mod session;
 
 pub use activation::{
@@ -37,4 +39,9 @@ pub use launcher::{
     format_args, launch, open_process_handle, parse_args, resume_activated, spawn_for_activation,
     LaunchError, LaunchRequest, LaunchedProcess,
 };
+pub use package_discovery::{
+    discover_packages, extract_aumid, launch_target_from_user_path, normalize_launch_target,
+    parse_aumid, resolve_package_identity, PackageAppInfo,
+};
+pub use process_tracker::{ProcessTracker, TrackMode};
 pub use session::{belongs, register_child, start_session, SessionError, SessionHandle, SessionStartRequest};

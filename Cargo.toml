@@ -4,6 +4,7 @@ members = [
     "crates/envbox-core",
     "crates/envbox-storage",
     "crates/envbox-launcher",
+    "crates/envbox-broker",
     "crates/envbox-cli",
     "crates/envbox-app",
     "tools/envbox-probe",
@@ -20,6 +21,7 @@ repository = "https://github.com/example/envbox"
 envbox-core = { path = "crates/envbox-core" }
 envbox-storage = { path = "crates/envbox-storage" }
 envbox-launcher = { path = "crates/envbox-launcher" }
+envbox-broker = { path = "crates/envbox-broker" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -36,6 +38,7 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
     "Win32_System_Memory",

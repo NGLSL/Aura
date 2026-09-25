@@ -1,6 +1,6 @@
-// IPC Bootstrap (ticket 40, Runtime side). Named Pipe client used when the
-// process carries no ENVBOX_* Profile environment (packaged root, no
-// Environment Block). Win32 env + profiles.toml remains the preferred path.
+// IPC Bootstrap (V0.3, Runtime side). Named Pipe client - preferred config
+// channel. ENVBOX_* structured value vars are the Win32 fallback; C++ never
+// parses profiles.toml.
 //
 // Wire protocol (must match the Rust Host/Broker side):
 //
@@ -36,6 +36,8 @@
 //                                   [detail=<string>]
 //   PROCESS_CREATED Client -> Host  pid=<u32> child_pid=<u32> [image=<string>]
 //   PROCESS_EXITED  Client -> Host  pid=<u32> [exit_code=<u32>]
+//   REGISTER_PROFILE Host -> Host   (same fields as PROFILE; Session Registry)
+//   BIND_PID        Host -> Host    pid= profile_id= parent_pid=
 //
 // PROFILE key mapping to RuntimeProfile: locale_name, ui_language, region,
 // tz_windows, tz_iana, dns_mode, dns_server* -> dns_servers[],
@@ -44,9 +46,9 @@
 //
 // Bootstrap flow: connect -> HELLO -> GET_PROFILE -> read until PROFILE ->
 // close (V1). RUNTIME_READY is best-effort on a fresh short-lived connection
-// after a successful Profile load (env path or IPC path). Every helper here
-// is Fail Open: connect/timeout/protocol errors return failure or no-op and
-// never crash or abort the process on their own.
+// after a successful Profile load (IPC path or ENVBOX_* fallback). Every
+// helper here is Fail Open: connect/timeout/protocol errors return failure
+// or no-op and never crash or abort the process on their own.
 
 #pragma once
 

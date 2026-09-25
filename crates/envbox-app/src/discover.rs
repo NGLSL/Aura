@@ -422,14 +422,21 @@ fn collect_apps_folder(
             let icon_src = if !logo.is_empty() && Path::new(&logo).is_file() {
                 logo
             } else if !install.is_empty() {
-                install
+                install.clone()
             } else {
                 format!("shell:AppsFolder\\{aumid}")
             };
             let target = format!("shell:AppsFolder\\{aumid}");
+            // Prefer PackageInstallPath → AppxManifest so Full Trust desktop
+            // packages are not mislabeled AppContainer just for using AUMID.
+            let capability = if !install.is_empty() && Path::new(&install).is_dir() {
+                crate::package::classify_install_dir(Path::new(&install))
+            } else {
+                crate::package::classify_target(&target, "")
+            };
             out.push(DiscoveredApp {
                 name,
-                capability: crate::package::classify_target(&target, ""),
+                capability,
                 path: target,
                 args: String::new(),
                 work_dir: String::new(),
@@ -603,5 +610,14 @@ mod tests {
         let app = chatgpt.unwrap();
         assert!(app.source == "apps-folder", "source={}", app.source);
         assert!(app.path.contains('!'), "path should be AUMID: {}", app.path);
+        // OpenAI.Codex is Packaged Win32 Full Trust (runFullTrust +
+        // Windows.FullTrustApplication) — must not be labeled AppContainer.
+        assert_eq!(
+            app.capability.injection,
+            crate::package::InjectionSupport::Delayed,
+            "ChatGPT Full Trust should be 延迟注入, got {:?}",
+            app.capability
+        );
+        assert_eq!(app.capability.packaging, crate::package::Packaging::PackagedWin32);
     }
 }
