@@ -11,8 +11,8 @@ use crate::icons::{icon, Icon};
 use crate::message::{browser_guarantee_label, DnsChoice, LaunchKind, Message, NamedId, WebRtcChoice};
 use crate::theme::*;
 use crate::widgets::{
-    app_icon_badge, badge, danger_btn, field_label, form_row, kv_row, primary_btn, secondary_btn,
-    status_dot, toggle,
+    app_icon_badge, badge, danger_btn, field_label, form_row, kv_row, primary_btn, searchable_select,
+    secondary_btn, status_dot, toggle,
 };
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
@@ -270,25 +270,33 @@ fn app_detail(app: &EnvBoxApp) -> Element<'_, Message> {
             .align_y(Alignment::Center),
             if let Some(p) = profile {
                 let dns_label = match &p.dns.mode {
-                    envbox_core::DnsMode::Host => "DNS: 宿主",
-                    envbox_core::DnsMode::VirtualView => "DNS: 虚拟视图",
+                    envbox_core::DnsMode::Host => "DNS:宿主",
+                    envbox_core::DnsMode::VirtualView => "DNS:虚拟",
                 };
                 let webrtc = p.browser.webrtc;
                 let webrtc_choice = WebRtcChoice::from_policy(&webrtc);
                 let webrtc_active = webrtc != envbox_core::WebRtcPolicy::Host;
+                let tz_short = p
+                    .timezone
+                    .windows_id
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&p.timezone.windows_id)
+                    .to_string();
                 column![
                     row![
                         badge(&p.locale.region, ACCENT_BG, ACCENT_TEXT),
-                        badge(&p.timezone.windows_id, BORDER, MUTED),
+                        badge(&tz_short, BORDER, MUTED),
                         badge(dns_label, BORDER, MUTED),
-                        badge(
-                            webrtc_choice.short_label(),
-                            if webrtc_active { ACCENT_BG } else { BORDER },
-                            if webrtc_active { ACCENT_TEXT } else { MUTED },
-                        ),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
+                    row![badge(
+                        webrtc_choice.short_label(),
+                        if webrtc_active { ACCENT_BG } else { BORDER },
+                        if webrtc_active { ACCENT_TEXT } else { MUTED },
+                    )]
+                    .spacing(6),
                     kv_row("Region", &p.locale.region),
                     kv_row("Locale", &p.locale.locale_name),
                     kv_row("UI Language", &p.locale.ui_language),
@@ -385,6 +393,12 @@ fn profile_detail(app: &EnvBoxApp) -> Element<'_, Message> {
     ]
     .spacing(2);
 
+    let region_opts = app.combo_options(crate::message::ComboField::Region);
+    let locale_opts = app.combo_options(crate::message::ComboField::Locale);
+    let ui_opts = app.combo_options(crate::message::ComboField::Ui);
+    let tz_opts = app.combo_options(crate::message::ComboField::Timezone);
+    let tz_iana_opts = app.combo_options(crate::message::ComboField::TimezoneIana);
+
     let form = column![
         field_label("基础信息"),
         form_row(
@@ -397,48 +411,69 @@ fn profile_detail(app: &EnvBoxApp) -> Element<'_, Message> {
         ),
         form_row(
             "Region",
-            text_input("Region (ISO-2 代码，如 US/JP/CN)", &app.profile_draft.region)
-                .on_input(Message::ProfileRegion)
-                .padding(Padding::from([5, 8]))
-                .style(input_style)
-                .font(font::ui_font())
+            searchable_select(
+                crate::message::ComboField::Region,
+                &app.profile_draft.region,
+                "选择 Region",
+                app.open_combo == Some(crate::message::ComboField::Region),
+                &app.combo_query,
+                &region_opts,
+                Message::ComboQuery,
+                Message::ComboPick,
+            ),
         ),
         form_row(
             "Locale",
-            text_input("Locale (如 en-US, ja-JP)", &app.profile_draft.locale)
-                .on_input(Message::ProfileLocale)
-                .padding(Padding::from([5, 8]))
-                .style(input_style)
-                .font(font::ui_font())
+            searchable_select(
+                crate::message::ComboField::Locale,
+                &app.profile_draft.locale,
+                "选择 Locale",
+                app.open_combo == Some(crate::message::ComboField::Locale),
+                &app.combo_query,
+                &locale_opts,
+                Message::ComboQuery,
+                Message::ComboPick,
+            ),
         ),
         form_row(
             "UI Language",
-            text_input("UI Language (如 en-US)", &app.profile_draft.ui)
-                .on_input(Message::ProfileUi)
-                .padding(Padding::from([5, 8]))
-                .style(input_style)
-                .font(font::ui_font())
+            searchable_select(
+                crate::message::ComboField::Ui,
+                &app.profile_draft.ui,
+                "选择 UI Language",
+                app.open_combo == Some(crate::message::ComboField::Ui),
+                &app.combo_query,
+                &ui_opts,
+                Message::ComboQuery,
+                Message::ComboPick,
+            ),
         ),
         field_label("时间系统"),
         form_row(
             "Windows 时区",
-            pick_list(
-                app.timezones.clone(),
-                Some(app.profile_draft.tz.clone()),
-                Message::ProfileTz
-            )
-            .style(pick_style)
-            .menu_style(pick_menu)
-            .padding(Padding::from([5, 8]))
-            .font(font::ui_font()),
+            searchable_select(
+                crate::message::ComboField::Timezone,
+                &app.profile_draft.tz,
+                "选择 Windows 时区",
+                app.open_combo == Some(crate::message::ComboField::Timezone),
+                &app.combo_query,
+                &tz_opts,
+                Message::ComboQuery,
+                Message::ComboPick,
+            ),
         ),
         form_row(
             "IANA 时区",
-            text_input("IANA Timezone (如 America/New_York)", &app.profile_draft.tz_iana)
-                .on_input(Message::ProfileTzIana)
-                .padding(Padding::from([5, 8]))
-                .style(input_style)
-                .font(font::ui_font())
+            searchable_select(
+                crate::message::ComboField::TimezoneIana,
+                &app.profile_draft.tz_iana,
+                "选择 IANA 时区",
+                app.open_combo == Some(crate::message::ComboField::TimezoneIana),
+                &app.combo_query,
+                &tz_iana_opts,
+                Message::ComboQuery,
+                Message::ComboPick,
+            ),
         ),
         field_label("网络与 DNS"),
         form_row(

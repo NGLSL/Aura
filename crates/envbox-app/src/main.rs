@@ -6,11 +6,13 @@
 
 mod app;
 mod app_icon;
+mod combo_overlay;
 mod discover;
 mod package;
 mod font;
 mod icons;
 mod message;
+mod options;
 mod theme;
 mod views;
 mod widgets;

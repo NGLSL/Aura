@@ -57,8 +57,8 @@ impl DnsChoice {
 impl std::fmt::Display for DnsChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DnsChoice::Host => write!(f, "Host"),
-            DnsChoice::VirtualView => write!(f, "VirtualView"),
+            DnsChoice::Host => write!(f, "宿主"),
+            DnsChoice::VirtualView => write!(f, "虚拟视图"),
         }
     }
 }
@@ -112,10 +112,10 @@ impl WebRtcChoice {
 impl std::fmt::Display for WebRtcChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WebRtcChoice::Host => write!(f, "Host"),
-            WebRtcChoice::PublicInterfaceOnly => write!(f, "PublicInterfaceOnly"),
-            WebRtcChoice::ProxyOnly => write!(f, "ProxyOnly"),
-            WebRtcChoice::Strict => write!(f, "Strict"),
+            WebRtcChoice::Host => write!(f, "宿主"),
+            WebRtcChoice::PublicInterfaceOnly => write!(f, "仅公网"),
+            WebRtcChoice::ProxyOnly => write!(f, "仅代理"),
+            WebRtcChoice::Strict => write!(f, "严格"),
         }
     }
 }
@@ -182,6 +182,16 @@ pub enum StatusKind {
     Error,
 }
 
+/// Searchable select field identity (Profile editor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComboField {
+    Region,
+    Locale,
+    Ui,
+    Timezone,
+    TimezoneIana,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -232,6 +242,11 @@ pub enum Message {
     ProfileDnsServers(String),
     ProfileWebRtc(WebRtcChoice),
     ProfileEnv(String),
+    // Searchable select (Profile editor)
+    ComboToggle(ComboField),
+    ComboQuery(String),
+    ComboPick(ComboField, String),
+    ComboClose,
     ProfileSelect(Uuid),
     ProfileSave,
     ProfileDelete,
@@ -240,6 +255,7 @@ pub enum Message {
     InstanceRefresh,
     InstanceStop(Uuid),
     AuditRefresh,
+    AuditFilter(String),
     OpenAuditDir,
     // Settings / diagnostics
     OpenConfigDir,

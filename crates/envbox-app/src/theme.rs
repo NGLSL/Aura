@@ -216,6 +216,59 @@ pub fn pick_style(_t: &Theme, status: pick_list::Status) -> pick_list::Style {
     }
 }
 
+/// Searchable select closed/open header (mirrors pick_list body).
+pub fn combo_btn(_t: &Theme, status: button::Status) -> button::Style {
+    let active = matches!(
+        status,
+        button::Status::Hovered | button::Status::Pressed
+    );
+    button::Style {
+        background: Some(Background::Color(if active { CARD } else { INPUT })),
+        text_color: if active { INK } else { INK_2 },
+        border: Border {
+            color: if matches!(status, button::Status::Pressed) {
+                ACCENT_LINE
+            } else {
+                BORDER
+            },
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Searchable select option row.
+pub fn combo_option(_t: &Theme, status: button::Status) -> button::Style {
+    let (bg, fg) = match status {
+        button::Status::Hovered | button::Status::Pressed => (ACCENT_BG, ACCENT_TEXT),
+        _ => (Color::TRANSPARENT, INK_2),
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: fg,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Searchable select expanded panel shell.
+pub fn combo_panel(_t: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(CARD)),
+        border: Border {
+            color: BORDER_SOFT,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
 /// Dark pick_list popup menu.
 pub fn pick_menu(_t: &Theme) -> overlay::menu::Style {
     overlay::menu::Style {

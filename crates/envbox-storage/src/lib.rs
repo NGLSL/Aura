@@ -159,33 +159,77 @@ fn windows_id_exists(windows_id: &str) -> bool {
     }
 }
 
+/// Curated Windows ↔ IANA pairs for the Profile editor (common zones only).
+/// `None` in either direction means unmapped — never invent.
+pub const COMMON_TIMEZONE_PAIRS: &[(&str, &str)] = &[
+    ("Pacific Standard Time", "America/Los_Angeles"),
+    ("Mountain Standard Time", "America/Denver"),
+    ("Central Standard Time", "America/Chicago"),
+    ("Eastern Standard Time", "America/New_York"),
+    ("Alaskan Standard Time", "America/Anchorage"),
+    ("Hawaiian Standard Time", "Pacific/Honolulu"),
+    ("Atlantic Standard Time", "America/Halifax"),
+    ("SA Pacific Standard Time", "America/Bogota"),
+    ("E. South America Standard Time", "America/Sao_Paulo"),
+    ("Pacific SA Standard Time", "America/Santiago"),
+    ("Mexico Standard Time", "America/Mexico_City"),
+    ("GMT Standard Time", "Europe/London"),
+    ("W. Europe Standard Time", "Europe/Berlin"),
+    ("Romance Standard Time", "Europe/Paris"),
+    ("Central Europe Standard Time", "Europe/Budapest"),
+    ("Central European Standard Time", "Europe/Warsaw"),
+    ("FLE Standard Time", "Europe/Kyiv"),
+    ("Turkey Standard Time", "Europe/Istanbul"),
+    ("Russian Standard Time", "Europe/Moscow"),
+    ("Israel Standard Time", "Asia/Jerusalem"),
+    ("Arabian Standard Time", "Asia/Dubai"),
+    ("India Standard Time", "Asia/Kolkata"),
+    ("Bangladesh Standard Time", "Asia/Dhaka"),
+    ("SE Asia Standard Time", "Asia/Bangkok"),
+    ("China Standard Time", "Asia/Shanghai"),
+    ("Singapore Standard Time", "Asia/Singapore"),
+    ("Taipei Standard Time", "Asia/Taipei"),
+    ("Tokyo Standard Time", "Asia/Tokyo"),
+    ("Korea Standard Time", "Asia/Seoul"),
+    ("AUS Eastern Standard Time", "Australia/Sydney"),
+    ("W. Australia Standard Time", "Australia/Perth"),
+    ("New Zealand Standard Time", "Pacific/Auckland"),
+    ("South Africa Standard Time", "Africa/Johannesburg"),
+    ("Egypt Standard Time", "Africa/Cairo"),
+    ("UTC", "UTC"),
+];
+
 /// Windows timezone ID → IANA when known. `None` means unmapped — never invent.
 /// GUI/CLI must require a real `iana_id`; do not fall back to the Windows ID.
 pub fn windows_id_to_iana(windows_id: &str) -> Option<&'static str> {
-    let map = [
-        ("Pacific Standard Time", "America/Los_Angeles"),
-        ("Mountain Standard Time", "America/Denver"),
-        ("Central Standard Time", "America/Chicago"),
-        ("Eastern Standard Time", "America/New_York"),
-        ("China Standard Time", "Asia/Shanghai"),
-        ("Tokyo Standard Time", "Asia/Tokyo"),
-        ("GMT Standard Time", "Europe/London"),
-        ("W. Europe Standard Time", "Europe/Berlin"),
-        ("India Standard Time", "Asia/Kolkata"),
-        ("Singapore Standard Time", "Asia/Singapore"),
-        ("AUS Eastern Standard Time", "Australia/Sydney"),
-        ("Korea Standard Time", "Asia/Seoul"),
-        ("Taipei Standard Time", "Asia/Taipei"),
-        ("Arabian Standard Time", "Asia/Dubai"),
-        ("Israel Standard Time", "Asia/Jerusalem"),
-        ("Russian Standard Time", "Europe/Moscow"),
-        ("SA Pacific Standard Time", "America/Bogota"),
-        ("E. South America Standard Time", "America/Sao_Paulo"),
-        ("UTC", "UTC"),
-    ];
-    map.iter()
+    COMMON_TIMEZONE_PAIRS
+        .iter()
         .find(|(w, _)| w.eq_ignore_ascii_case(windows_id))
         .map(|(_, i)| *i)
+}
+
+/// IANA timezone ID → Windows ID when known. `None` means unmapped.
+pub fn iana_to_windows(iana_id: &str) -> Option<&'static str> {
+    COMMON_TIMEZONE_PAIRS
+        .iter()
+        .find(|(_, i)| i.eq_ignore_ascii_case(iana_id))
+        .map(|(w, _)| *w)
+}
+
+/// Common Windows timezone IDs for the Profile editor default list.
+pub fn common_windows_timezone_ids() -> Vec<String> {
+    COMMON_TIMEZONE_PAIRS
+        .iter()
+        .map(|(w, _)| (*w).to_string())
+        .collect()
+}
+
+/// Common IANA timezone IDs for the Profile editor default list.
+pub fn common_iana_timezone_ids() -> Vec<String> {
+    COMMON_TIMEZONE_PAIRS
+        .iter()
+        .map(|(_, i)| (*i).to_string())
+        .collect()
 }
 
 /// Windows timezone IDs from host enumeration (Profile editor dropdown).

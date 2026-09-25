@@ -13,7 +13,34 @@ static HANDLE g_audit = INVALID_HANDLE_VALUE;
 static int g_audit_on = 0;
 static DWORD g_pid = 0;
 static DWORD g_ppid = 0;  // 0 = unknown until first event (avoid Toolhelp under DllMain)
+static char g_image[64] = {0};  // process basename, UTF-8
 static SRWLOCK g_lock = SRWLOCK_INIT;
+// Flush is expensive (FlushFileBuffers). Batch writes; flush on threshold/interval
+// and at shutdown so a crash can lose at most a few events.
+static unsigned g_unflushed = 0;
+static ULONGLONG g_last_flush = 0;
+static const unsigned kAuditFlushEvery = 64;
+static const DWORD kAuditFlushIntervalMs = 1000;
+
+// Process image basename (e.g. chrome.exe) for per-software audit grouping.
+static void EnvBoxCurrentImageA(char* out, size_t cap) {
+  if (out == nullptr || cap == 0) {
+    return;
+  }
+  out[0] = '\0';
+  wchar_t path[MAX_PATH] = {};
+  DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) {
+    return;
+  }
+  const wchar_t* base = path;
+  for (const wchar_t* p = path; *p; ++p) {
+    if (*p == L'\\' || *p == L'/') {
+      base = p + 1;
+    }
+  }
+  WideCharToMultiByte(CP_UTF8, 0, base, -1, out, (int)cap, nullptr, nullptr);
+}
 
 // RAII + save GetLastError for the process snapshot HANDLE (AGENTS.md).
 static DWORD EnvBoxParentPid(void) {
@@ -114,6 +141,7 @@ void EnvBoxAuditInit(const RuntimeProfile* pfl) {
   }
   g_audit_on = 1;
   g_pid = GetCurrentProcessId();
+  EnvBoxCurrentImageA(g_image, sizeof(g_image));
   // ppid resolved lazily on first event (avoid Toolhelp under loader lock).
   EnvBoxAuditEvent("EnvBoxAuditInit", 0, "schema=v1");
 }
@@ -137,7 +165,9 @@ void EnvBoxAuditEvent(const char* api, int virtualized, const char* summary) {
   FormatUtc(ts, sizeof(ts));
   char api_esc[128];
   JsonEscape(api, api_esc, sizeof(api_esc));
-  char line[512];
+  char image_esc[80];
+  JsonEscape(g_image, image_esc, sizeof(image_esc));
+  char line[640];
   int len;
   if (summary != nullptr && summary[0] != '\0') {
     char esc[192];
@@ -145,23 +175,30 @@ void EnvBoxAuditEvent(const char* api, int virtualized, const char* summary) {
     len = _snprintf_s(
         line, sizeof(line), _TRUNCATE,
         "{\"v\":1,\"ts_utc\":\"%s\",\"pid\":%lu,\"ppid\":%lu,\"tid\":%lu,"
-        "\"api\":\"%s\",\"virtualized\":%s,\"summary\":\"%s\"}\n",
+        "\"api\":\"%s\",\"virtualized\":%s,\"summary\":\"%s\",\"image\":\"%s\"}\n",
         ts, (unsigned long)g_pid, (unsigned long)g_ppid,
         (unsigned long)GetCurrentThreadId(), api_esc,
-        virtualized ? "true" : "false", esc);
+        virtualized ? "true" : "false", esc, image_esc);
   } else {
     len = _snprintf_s(
         line, sizeof(line), _TRUNCATE,
         "{\"v\":1,\"ts_utc\":\"%s\",\"pid\":%lu,\"ppid\":%lu,\"tid\":%lu,"
-        "\"api\":\"%s\",\"virtualized\":%s}\n",
+        "\"api\":\"%s\",\"virtualized\":%s,\"image\":\"%s\"}\n",
         ts, (unsigned long)g_pid, (unsigned long)g_ppid,
         (unsigned long)GetCurrentThreadId(), api_esc,
-        virtualized ? "true" : "false");
+        virtualized ? "true" : "false", image_esc);
   }
   if (len > 0) {
     DWORD written = 0;
     WriteFile(g_audit, line, (DWORD)len, &written, nullptr);
-    FlushFileBuffers(g_audit);
+    g_unflushed++;
+    ULONGLONG now = GetTickCount64();
+    if (g_unflushed >= kAuditFlushEvery ||
+        now - g_last_flush >= kAuditFlushIntervalMs) {
+      FlushFileBuffers(g_audit);
+      g_unflushed = 0;
+      g_last_flush = now;
+    }
   }
   ReleaseSRWLockExclusive(&g_lock);
   SetLastError(last_err);
@@ -196,8 +233,10 @@ void EnvBoxAuditEventW(const char* api, int virtualized, const wchar_t* summary)
 void EnvBoxAuditShutdown(void) {
   AcquireSRWLockExclusive(&g_lock);
   if (g_audit != INVALID_HANDLE_VALUE) {
+    FlushFileBuffers(g_audit);
     CloseHandle(g_audit);
     g_audit = INVALID_HANDLE_VALUE;
+    g_unflushed = 0;
   }
   g_audit_on = 0;
   ReleaseSRWLockExclusive(&g_lock);

@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::message::{
-    BottomTab, DetailTab, DnsChoice, LaunchKind, Message, Nav, StatusKind, WebRtcChoice,
+    BottomTab, ComboField, DetailTab, DnsChoice, LaunchKind, Message, Nav, StatusKind, WebRtcChoice,
 };
+use crate::options;
 
 pub struct AppDraft {
     pub id: Option<Uuid>,
@@ -84,6 +85,11 @@ pub struct EnvBoxApp {
     pub app_draft: AppDraft,
     pub profile_draft: ProfileDraft,
     pub audit_events: Vec<AuditEvent>,
+    /// Empty = show all software.
+    pub audit_filter: String,
+    /// Open searchable-select field in the Profile editor.
+    pub open_combo: Option<ComboField>,
+    pub combo_query: String,
     pub status: String,
     pub status_kind: StatusKind,
     /// Local app picker (Kite-style discovery). `None` = closed.
@@ -146,6 +152,9 @@ impl EnvBoxApp {
             app_draft,
             profile_draft,
             audit_events: Vec::new(),
+            audit_filter: String::new(),
+            open_combo: None,
+            combo_query: String::new(),
             status: String::new(),
             status_kind: StatusKind::Info,
             app_picker: None,
@@ -398,6 +407,7 @@ impl EnvBoxApp {
     }
 
     pub fn load_audit(&mut self) {
+        const AUDIT_LIMIT: usize = 500;
         let dir = self.store.audit_dir();
         self.audit_events.clear();
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -418,10 +428,138 @@ impl EnvBoxApp {
                     self.audit_events.push(ev);
                 }
             }
-            if self.audit_events.len() >= 200 {
+            if self.audit_events.len() >= AUDIT_LIMIT {
                 break;
             }
         }
+        // Newest first in the table; keep the most recent AUDIT_LIMIT.
+        self.audit_events.reverse();
+        self.audit_events.truncate(AUDIT_LIMIT);
+    }
+
+    /// Display label for an audit row: configured app name if image matches, else image, else PID.
+    pub fn audit_software_label(&self, ev: &AuditEvent) -> String {
+        if let Some(img) = ev.image.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for a in &self.applications {
+                let matches = match &a.launch {
+                    envbox_core::LaunchTarget::Executable { path } => path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().eq_ignore_ascii_case(img))
+                        .unwrap_or(false),
+                    envbox_core::LaunchTarget::Command { command } => PathBuf::from(command)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().eq_ignore_ascii_case(img))
+                        .unwrap_or(false),
+                    envbox_core::LaunchTarget::Packaged { aumid, .. } => aumid
+                        .rsplit(['!', '\\', '/'])
+                        .next()
+                        .map(|n| {
+                            let n = n.trim_end_matches(".exe");
+                            img.trim_end_matches(".exe").eq_ignore_ascii_case(n)
+                        })
+                        .unwrap_or(false),
+                };
+                if matches {
+                    return a.name.clone();
+                }
+            }
+            return img.to_string();
+        }
+        format!("#{}", ev.pid)
+    }
+
+    /// Distinct software labels present in loaded audit events (sorted).
+    pub fn audit_software_options(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .audit_events
+            .iter()
+            .map(|ev| self.audit_software_label(ev))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Audit rows after per-software filter (newest first).
+    pub fn filtered_audit_events(&self) -> Vec<&AuditEvent> {
+        let q = self.audit_filter.trim();
+        self.audit_events
+            .iter()
+            .filter(|ev| {
+                if q.is_empty() || q == "全部软件" {
+                    return true;
+                }
+                self.audit_software_label(ev).eq_ignore_ascii_case(q)
+            })
+            .collect()
+    }
+
+    /// Options for a searchable select: common-first; query filters; Windows TZ search widens to host list.
+    pub fn combo_options(&self, field: ComboField) -> Vec<String> {
+        let q = self.combo_query.trim();
+        let base = match field {
+            ComboField::Region => options::common_regions(),
+            ComboField::Locale | ComboField::Ui => options::common_locales(),
+            ComboField::Timezone => {
+                if q.is_empty() {
+                    envbox_storage::common_windows_timezone_ids()
+                        .into_iter()
+                        .filter(|id| self.timezones.iter().any(|t| t.eq_ignore_ascii_case(id)))
+                        .collect()
+                } else {
+                    self.timezones.clone()
+                }
+            }
+            ComboField::TimezoneIana => envbox_storage::common_iana_timezone_ids(),
+        };
+        let cur = match field {
+            ComboField::Region => self.profile_draft.region.as_str(),
+            ComboField::Locale => self.profile_draft.locale.as_str(),
+            ComboField::Ui => self.profile_draft.ui.as_str(),
+            ComboField::Timezone => self.profile_draft.tz.as_str(),
+            ComboField::TimezoneIana => self.profile_draft.tz_iana.as_str(),
+        };
+        let with_cur = options::with_current(&base, cur);
+        let kind = match field {
+            ComboField::Region => options::OptionKind::Region,
+            ComboField::Locale | ComboField::Ui => options::OptionKind::Locale,
+            ComboField::Timezone | ComboField::TimezoneIana => options::OptionKind::Timezone,
+        };
+        options::filter_options(&with_cur, q, kind)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    pub fn open_combo(&mut self, field: ComboField) {
+        if self.open_combo == Some(field) {
+            self.open_combo = None;
+            self.combo_query.clear();
+        } else {
+            self.open_combo = Some(field);
+            self.combo_query.clear();
+        }
+    }
+
+    pub fn pick_combo(&mut self, field: ComboField, value: String) {
+        match field {
+            ComboField::Region => self.profile_draft.region = value,
+            ComboField::Locale => self.profile_draft.locale = value,
+            ComboField::Ui => self.profile_draft.ui = value,
+            ComboField::Timezone => {
+                self.profile_draft.tz_iana =
+                    windows_id_to_iana(&value).unwrap_or_default().to_string();
+                self.profile_draft.tz = value;
+            }
+            ComboField::TimezoneIana => {
+                if let Some(win) = envbox_storage::iana_to_windows(&value) {
+                    self.profile_draft.tz = win.to_string();
+                }
+                self.profile_draft.tz_iana = value;
+            }
+        }
+        self.open_combo = None;
+        self.combo_query.clear();
     }
 
     pub fn filtered_apps(&self) -> Vec<&Application> {        let q = self.search.trim().to_ascii_lowercase();
@@ -614,15 +752,30 @@ impl EnvBoxApp {
             Message::ProfileDnsServers(v) => self.profile_draft.dns_servers = v,
             Message::ProfileWebRtc(c) => self.profile_draft.webrtc = c,
             Message::ProfileEnv(v) => self.profile_draft.env = v,
+            Message::ComboToggle(field) => self.open_combo(field),
+            Message::ComboQuery(q) => self.combo_query = q,
+            Message::ComboPick(field, v) => self.pick_combo(field, v),
+            Message::ComboClose => {
+                self.open_combo = None;
+                self.combo_query.clear();
+            }
             Message::ProfileSelect(id) => {
                 if let Some(p) = self.profiles.iter().find(|p| p.id == id) {
                     self.profile_draft = profile_to_draft(p);
                 }
+                self.open_combo = None;
+                self.combo_query.clear();
             }
             Message::ProfileSave => return self.save_profile(),
             Message::ProfileDelete => return self.delete_profile(),
             Message::ProfileNew => {
-                let tz = self.timezones.first().cloned().unwrap_or_default();
+                let tz = self
+                    .timezones
+                    .iter()
+                    .find(|t| t.eq_ignore_ascii_case("Pacific Standard Time"))
+                    .cloned()
+                    .or_else(|| self.timezones.first().cloned())
+                    .unwrap_or_default();
                 let tz_iana = windows_id_to_iana(&tz).unwrap_or_default().to_string();
                 self.profile_draft = ProfileDraft {
                     id: None,
@@ -637,6 +790,8 @@ impl EnvBoxApp {
                     webrtc: WebRtcChoice::Host,
                     env: String::new(),
                 };
+                self.open_combo = None;
+                self.combo_query.clear();
             }
             Message::InstanceRefresh => {
                 self.instances.refresh_all();
@@ -656,6 +811,7 @@ impl EnvBoxApp {
                     format!("已加载 {} 条审计事件", self.audit_events.len()),
                 );
             }
+            Message::AuditFilter(v) => self.audit_filter = v,
             Message::OpenAuditDir => {
                 let _ = self.store.ensure_audit_dir();
                 let dir = self.store.audit_dir();

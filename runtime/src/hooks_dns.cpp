@@ -333,6 +333,83 @@ static void DnsAddrsClear(DnsAddrs* out) {
   memset(out, 0, sizeof(*out));
 }
 
+// Short-lived positive cache: Chrome re-resolves the same hosts constantly.
+// Key is (qname, want_a, want_aaaa). Only definitive DnsRouteName answers.
+#ifndef ENVBOX_DNS_CACHE_MAX
+#define ENVBOX_DNS_CACHE_MAX 64
+#endif
+struct DnsCacheEnt {
+  char name[256];
+  int want_a;
+  int want_aaaa;
+  ULONGLONG expire;
+  DnsAddrs addrs;
+};
+static DnsCacheEnt g_dns_cache[ENVBOX_DNS_CACHE_MAX];
+static SRWLOCK g_dns_cache_lock = SRWLOCK_INIT;
+static const DWORD kDnsCacheTtlMs = 30000;
+
+static int DnsCacheLookup(const char* qname, int want_a, int want_aaaa,
+                          DnsAddrs* out) {
+  ULONGLONG now = GetTickCount64();
+  int hit = 0;
+  AcquireSRWLockShared(&g_dns_cache_lock);
+  for (int i = 0; i < ENVBOX_DNS_CACHE_MAX; i++) {
+    const DnsCacheEnt* e = &g_dns_cache[i];
+    if (e->name[0] == '\0' || e->expire <= now) {
+      continue;
+    }
+    if (e->want_a == want_a && e->want_aaaa == want_aaaa &&
+        _stricmp(e->name, qname) == 0) {
+      *out = e->addrs;
+      hit = 1;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&g_dns_cache_lock);
+  return hit;
+}
+
+static void DnsCacheStore(const char* qname, int want_a, int want_aaaa,
+                          const DnsAddrs* addrs) {
+  if (qname == nullptr || qname[0] == '\0' || strlen(qname) >= 256) {
+    return;
+  }
+  ULONGLONG now = GetTickCount64();
+  AcquireSRWLockExclusive(&g_dns_cache_lock);
+  int slot = -1;
+  ULONGLONG oldest = ~0ULL;
+  int oldest_i = 0;
+  for (int i = 0; i < ENVBOX_DNS_CACHE_MAX; i++) {
+    DnsCacheEnt* e = &g_dns_cache[i];
+    if (e->name[0] == '\0' || e->expire <= now) {
+      if (slot < 0) {
+        slot = i;
+      }
+      continue;
+    }
+    if (e->want_a == want_a && e->want_aaaa == want_aaaa &&
+        _stricmp(e->name, qname) == 0) {
+      slot = i;
+      break;
+    }
+    if (e->expire < oldest) {
+      oldest = e->expire;
+      oldest_i = i;
+    }
+  }
+  if (slot < 0) {
+    slot = oldest_i;
+  }
+  DnsCacheEnt* e = &g_dns_cache[slot];
+  strncpy_s(e->name, qname, _TRUNCATE);
+  e->want_a = want_a;
+  e->want_aaaa = want_aaaa;
+  e->expire = now + kDnsCacheTtlMs;
+  e->addrs = *addrs;
+  ReleaseSRWLockExclusive(&g_dns_cache_lock);
+}
+
 static void WriteU16(unsigned char* p, unsigned v) {
   p[0] = (unsigned char)((v >> 8) & 0xff);
   p[1] = (unsigned char)(v & 0xff);
@@ -649,6 +726,9 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
   if (qname == nullptr || qname[0] == '\0') {
     return 0;
   }
+  if (DnsCacheLookup(qname, want_a, want_aaaa, out)) {
+    return 1;
+  }
 
   char current[256];
   size_t qn = strlen(qname);
@@ -746,12 +826,14 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
       out->got = 1;
       out->nxdomain = 1;
       out->noerror = 0;
+      DnsCacheStore(qname, want_a, want_aaaa, out);
       return 1;
     }
     if (out->n_v4 > 0 || out->n_v6 > 0) {
       out->got = 1;
       out->noerror = 1;
       out->nxdomain = 0;
+      DnsCacheStore(qname, want_a, want_aaaa, out);
       return 1;
     }
     if (saw_ok && has_cname && next_name[0] != '\0') {

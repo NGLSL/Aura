@@ -320,6 +320,9 @@ pub struct AuditEvent {
     pub virtualized: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Process image name (e.g. `chrome.exe`). Present on new events; optional on old logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 impl AuditEvent {
@@ -486,6 +489,7 @@ mod tests {
             api: "GetDynamicTimeZoneInformation".into(),
             virtualized: true,
             summary: Some("Pacific Standard Time".into()),
+            image: Some("probe.exe".into()),
         };
         let line = ev.to_json_line().unwrap();
         assert!(!line.contains('\n'));
@@ -504,10 +508,18 @@ mod tests {
             api: "EnvBoxAuditInit".into(),
             virtualized: false,
             summary: None,
+            image: None,
         };
         let line = ev.to_json_line().unwrap();
         assert!(!line.contains("summary"));
         assert_eq!(AuditEvent::parse_json_line(&line).unwrap(), ev);
+    }
+
+    #[test]
+    fn audit_event_parses_legacy_line_without_image() {
+        let legacy = r#"{"v":1,"ts_utc":"2026-09-24T12:00:00.000Z","pid":1,"ppid":0,"tid":1,"api":"GetTimeZoneInformation","virtualized":true}"#;
+        let ev = AuditEvent::parse_json_line(legacy).unwrap();
+        assert!(ev.image.is_none());
     }
 
     #[test]

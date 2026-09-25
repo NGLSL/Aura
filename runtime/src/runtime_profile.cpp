@@ -56,7 +56,23 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
   if (!windows_id || !out) {
     return 0;
   }
+  // Hot path: GetTimeZoneInformation hooks call this every time. EnumDynamic-
+  // TimeZoneInformation walks the whole host table (100+ rows), which made
+  // Chrome-style workloads ~300x slower. Profile tz is process-immutable, so
+  // cache the first successful lookup (and the miss for the same id).
+  static DYNAMIC_TIME_ZONE_INFORMATION s_cache = {};
+  static int s_cached = 0;
+  static int s_found = 0;
+  static wchar_t s_id[128] = {0};
+  if (s_cached && _wcsicmp(s_id, windows_id) == 0) {
+    if (s_found) {
+      *out = s_cache;
+    }
+    return s_found;
+  }
   DWORD index = 0;
+  int found = 0;
+  DYNAMIC_TIME_ZONE_INFORMATION hit = {};
   for (;;) {
     DYNAMIC_TIME_ZONE_INFORMATION info = {};
     DWORD status = EnumDynamicTimeZoneInformation(index, &info);
@@ -64,15 +80,23 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
       break;
     }
     if (_wcsicmp(info.TimeZoneKeyName, windows_id) == 0) {
-      *out = info;
-      return 1;
+      hit = info;
+      found = 1;
+      break;
     }
     index++;
     if (index > 1024) {
       break;
     }
   }
-  return 0;
+  wcsncpy_s(s_id, windows_id, _TRUNCATE);
+  s_cache = hit;
+  s_found = found;
+  s_cached = 1;
+  if (found) {
+    *out = hit;
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------------------

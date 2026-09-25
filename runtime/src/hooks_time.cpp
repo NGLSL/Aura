@@ -80,13 +80,28 @@ static DWORD TimeZoneIdFromInfo(const DYNAMIC_TIME_ZONE_INFORMATION* info) {
   return TIME_ZONE_ID_STANDARD;
 }
 
+// TimeZone ID is derived from rules + current UTC; cache per process because
+// Chrome calls GetTimeZoneInformation in tight loops.
+static DWORD CachedTimeZoneId(const DYNAMIC_TIME_ZONE_INFORMATION* info) {
+  static DYNAMIC_TIME_ZONE_INFORMATION s_last = {};
+  static DWORD s_id = TIME_ZONE_ID_STANDARD;
+  static int s_ready = 0;
+  if (s_ready && memcmp(&s_last, info, sizeof(s_last)) == 0) {
+    return s_id;
+  }
+  s_id = TimeZoneIdFromInfo(info);
+  s_last = *info;
+  s_ready = 1;
+  return s_id;
+}
+
 static DWORD WINAPI HookGetDynamicTimeZoneInformation(
     PDYNAMIC_TIME_ZONE_INFORMATION p) {
   DYNAMIC_TIME_ZONE_INFORMATION info = {};
   if (p != nullptr && FillProfileDynamic(&info)) {
     *p = info;
     EnvBoxAuditEventW("GetDynamicTimeZoneInformation", 1, info.TimeZoneKeyName);
-    return TimeZoneIdFromInfo(&info);
+    return CachedTimeZoneId(&info);
   }
   EnvBoxAuditEvent("GetDynamicTimeZoneInformation", 0, nullptr);
   return TrueGetDynamicTimeZoneInformation(p);
@@ -98,7 +113,7 @@ static DWORD WINAPI HookGetTimeZoneInformation(
   if (lpTimeZoneInformation != nullptr && FillProfileDynamic(&dyn)) {
     DynamicToClassic(&dyn, lpTimeZoneInformation);
     EnvBoxAuditEventW("GetTimeZoneInformation", 1, dyn.TimeZoneKeyName);
-    return TimeZoneIdFromInfo(&dyn);
+    return CachedTimeZoneId(&dyn);
   }
   EnvBoxAuditEvent("GetTimeZoneInformation", 0, nullptr);
   return TrueGetTimeZoneInformation(lpTimeZoneInformation);

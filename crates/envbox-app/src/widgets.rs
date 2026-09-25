@@ -6,7 +6,9 @@ use iced::{Alignment, Border, Color, Element, Fill, Length, Padding};
 use crate::font;
 use crate::icons::{icon, Icon};
 use crate::message::Message;
-use crate::theme::{self, ACCENT, ACCENT_BG, ACCENT_LINE, BORDER, BORDER_SOFT, INK, INK_2, MUTED};
+use crate::theme::{
+    self, input_style, ACCENT, ACCENT_BG, ACCENT_LINE, BORDER, BORDER_SOFT, INK, INK_2, MUTED,
+};
 
 pub fn field_label(s: &str) -> Element<'static, Message> {
     text(s.to_string())
@@ -25,12 +27,128 @@ pub fn form_row<'a>(
             .size(12)
             .color(MUTED)
             .font(font::ui_font())
-            .width(Length::Fixed(80.0)),
+            .width(Length::Fixed(88.0)),
         field.into(),
     ]
     .spacing(8)
-    .align_y(Alignment::Center)
+    .align_y(Alignment::Start)
     .into()
+}
+
+/// Combobox: closed = one pick_list-style row; open = search + option list
+/// under the same header (search lives in the dropdown, not a second permanent field).
+pub fn searchable_select(
+    field: crate::message::ComboField,
+    value: &str,
+    placeholder: &'static str,
+    open: bool,
+    query: &str,
+    options: &[String],
+    _on_query: fn(String) -> Message,
+    on_pick: fn(crate::message::ComboField, String) -> Message,
+) -> Element<'static, Message> {
+    use iced::widget::{scrollable, text_input};
+    use crate::icons::Icon;
+    use crate::message::ComboField;
+    use crate::options::{option_label, OptionKind};
+
+    let kind = match field {
+        ComboField::Region => OptionKind::Region,
+        ComboField::Locale | ComboField::Ui => OptionKind::Locale,
+        ComboField::Timezone | ComboField::TimezoneIana => OptionKind::Timezone,
+    };
+
+    let value = value.to_string();
+    let query = query.to_string();
+    let options = options.to_vec();
+
+    let display = if value.trim().is_empty() {
+        placeholder.to_string()
+    } else {
+        option_label(kind, &value)
+    };
+    let display_color = if value.trim().is_empty() {
+        MUTED
+    } else {
+        INK_2
+    };
+
+    let header = button(
+        row![
+            text(display)
+                .size(12)
+                .color(display_color)
+                .font(font::ui_font()),
+            iced::widget::Space::new(Fill, 1.0),
+            icon(Icon::ChevronDown, if open { ACCENT_LINE } else { MUTED }, 11.0),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center),
+    )
+    .width(Fill)
+    .padding(Padding::from([5, 8]))
+    .style(theme::combo_btn)
+    .on_press(Message::ComboToggle(field));
+
+    if !open {
+        return header.into();
+    }
+
+    let filtered = crate::options::filter_options(&options, &query, kind);
+    let mut list = column![].spacing(2);
+    if filtered.is_empty() {
+        list = list.push(
+            text("无匹配项")
+                .size(11)
+                .color(MUTED)
+                .font(font::ui_font())
+                .width(Fill),
+        );
+    } else {
+        for opt in filtered.iter().take(60) {
+            let raw = (*opt).to_string();
+            let label = option_label(kind, &raw);
+            let selected = raw == value;
+            list = list.push(
+                button(
+                    row![
+                        text(label)
+                            .size(12)
+                            .color(if selected { ACCENT_LINE } else { INK_2 })
+                            .font(font::ui_font()),
+                        iced::widget::Space::new(Fill, 1.0),
+                        icon(Icon::Check, if selected { ACCENT_LINE } else { Color::TRANSPARENT }, 11.0),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .width(Fill)
+                .padding(Padding::from([6, 8]))
+                .style(theme::combo_option)
+                .on_press(on_pick(field, raw)),
+            );
+        }
+    }
+
+    let panel = container(
+        column![
+            text_input("输入以搜索…", &query)
+                .on_input(Message::ComboQuery)
+                .padding(Padding::from([5, 8]))
+                .style(input_style)
+                .font(font::ui_font())
+                .width(Fill),
+            scrollable(list)
+                .height(Length::Fixed(160.0))
+                .style(theme::dark_scrollable),
+        ]
+        .spacing(6)
+        .padding(Padding::from([8, 6])),
+    )
+    .width(Fill)
+    .style(theme::combo_panel);
+
+    crate::combo_overlay::DropdownOverlay::new(header, Some(panel)).into()
 }
 
 pub fn kv_row(label: &str, value: &str) -> Element<'static, Message> {
