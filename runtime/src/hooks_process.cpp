@@ -275,6 +275,18 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
     vars.emplace_back(key, val);
   };
 
+  // EnvironmentProfile overrides. Apply these before internal identity so a
+  // user value can never replace ENVBOX_* bookkeeping.
+  for (int i = 0; i < pfl->environment_count && i < ENVBOX_ENV_MAX; i++) {
+    const wchar_t* entry = pfl->environment[i];
+    const wchar_t* eq = wcschr(entry, L'=');
+    if (eq == nullptr || eq == entry) {
+      continue;
+    }
+    std::wstring key(entry, (size_t)(eq - entry));
+    upsert(key.c_str(), eq + 1);
+  }
+
   upsert(L"ENVBOX_PROFILE_ID", pfl->profile_id);
   upsert(L"ENVBOX_INSTANCE_ID", pfl->instance_id);
   upsert(L"ENVBOX_INHERIT_CHILDREN", pfl->inherit_children ? L"1" : L"0");
@@ -457,10 +469,18 @@ static BOOL SpawnInjected(
     return FALSE;
   }
 
+  // Bind the child before its loader runs. The injected DLL asks the Broker
+  // for its Profile during DllMain, so notifying after ResumeThread races and
+  // can return an empty Profile.
+  if (lpProcessInformation != nullptr) {
+    EnvBoxIpcNotifyProcessCreated(lpProcessInformation->dwProcessId, nullptr);
+  }
+
   if (!caller_requested_suspended) {
     if (ResumeThread(lpProcessInformation->hThread) == (DWORD)-1) {
       DWORD err = GetLastError();
       TerminateProcess(lpProcessInformation->hProcess, 1);
+      EnvBoxIpcNotifyProcessExitedPid(lpProcessInformation->dwProcessId, 1);
       CloseHandle(lpProcessInformation->hThread);
       CloseHandle(lpProcessInformation->hProcess);
       lpProcessInformation->dwProcessId = 0;
@@ -474,10 +494,6 @@ static BOOL SpawnInjected(
   // Never log command bodies or environment blocks (ticket 21).
   EnvBoxAuditEvent("CreateProcessW", 1,
                    caller_requested_suspended ? "inject-suspended" : "inject-resumed");
-  // V0.3: notify Broker so the child joins this EnvironmentSession.
-  if (lpProcessInformation != nullptr) {
-    EnvBoxIpcNotifyProcessCreated(lpProcessInformation->dwProcessId, nullptr);
-  }
   return TRUE;
 }
 

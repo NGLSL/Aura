@@ -1,0 +1,4 @@
+LIBRARY "envbox-runtime64"
+EXPORTS
+  EnvBoxDetourFinishHelperProcess @1 NONAME
+  EnvBoxRuntimeLoaded @2

@@ -176,9 +176,8 @@ impl EnvBoxApp {
                 name: app.name.clone(),
                 kind: match &app.launch {
                     LaunchTarget::Command { .. } => LaunchKind::Command,
-                    LaunchTarget::Executable { .. } | LaunchTarget::Packaged { .. } => {
-                        LaunchKind::Executable
-                    }
+                    LaunchTarget::Executable { .. } => LaunchKind::Executable,
+                    LaunchTarget::Packaged { .. } => LaunchKind::Packaged,
                 },
                 path: match &app.launch {
                     LaunchTarget::Command { command } => command.clone(),
@@ -367,7 +366,16 @@ impl EnvBoxApp {
         self.app_draft = AppDraft {
             id: None,
             name: item.name.clone(),
-            kind: LaunchKind::Executable,
+            kind: if matches!(
+                cap.packaging,
+                crate::package::Packaging::PackagedWin32
+                    | crate::package::Packaging::AppContainer
+                    | crate::package::Packaging::PackagedUnknown
+            ) {
+                LaunchKind::Packaged
+            } else {
+                LaunchKind::Executable
+            },
             path: item.path.clone(),
             args: item.args.clone(),
             work_dir: item.work_dir.clone(),
@@ -913,7 +921,7 @@ impl EnvBoxApp {
             LaunchKind::Command => LaunchTarget::Command {
                 command: self.app_draft.path.clone(),
             },
-            LaunchKind::Executable => LaunchTarget::Executable {
+            LaunchKind::Executable | LaunchKind::Packaged => LaunchTarget::Executable {
                 path: PathBuf::from(self.app_draft.path.clone()),
             },
         };

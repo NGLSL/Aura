@@ -10,10 +10,12 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
   set(ENVBOX_RT_TARGET envbox-runtime64)
   set(ENVBOX_RT_NAME envbox-runtime64)
   set(ENVBOX_RT_ARCH 64)
+  set(ENVBOX_RT_EXPORTS src/envbox-runtime64.def)
 else()
   set(ENVBOX_RT_TARGET envbox-runtime32)
   set(ENVBOX_RT_NAME envbox-runtime32)
   set(ENVBOX_RT_ARCH 32)
+  set(ENVBOX_RT_EXPORTS src/envbox-runtime32.def)
 endif()
 
 if(ENVBOX_WITH_DETOURS AND NOT DETOURS_ROOT)
@@ -25,6 +27,7 @@ if(ENVBOX_WITH_DETOURS AND NOT DETOURS_ROOT)
 endif()
 
 add_library(${ENVBOX_RT_TARGET} SHARED
+  ${ENVBOX_RT_EXPORTS}
   src/dllmain.cpp
   src/audit.cpp
   src/runtime_profile.cpp

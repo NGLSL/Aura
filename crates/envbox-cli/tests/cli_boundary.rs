@@ -109,12 +109,20 @@ fn make_profile_inner(root: &Path, path_dir: Option<&Path>) -> String {
         args.push("--env");
         args.push(p);
     }
-    let out = envbox_with_root(root).args(&args).output().expect("profile add");
+    let out = envbox_with_root(root)
+        .args(&args)
+        .output()
+        .expect("profile add");
     assert!(out.status.success(), "{out:?}");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn run_envbox(root: &Path, profile_id: &str, program: &Path, args: &[&str]) -> std::process::Output {
+fn run_envbox(
+    root: &Path,
+    profile_id: &str,
+    program: &Path,
+    args: &[&str],
+) -> std::process::Output {
     run_envbox_cmd(root, profile_id, &program.display().to_string(), args)
 }
 
@@ -333,8 +341,8 @@ fn t31_x86_inject_matrix_or_dll_product() {
     assert_eq!(pe_machine(&dll32), 0x014c);
 
     // Optional x86 probe: tools/envbox-probe-x86.exe or envbox-probe32.exe.
-    let x86_probe = find_sibling_bin("envbox-probe-x86.exe")
-        .or_else(|| find_sibling_bin("envbox-probe32.exe"));
+    let x86_probe =
+        find_sibling_bin("envbox-probe-x86.exe").or_else(|| find_sibling_bin("envbox-probe32.exe"));
     let Some(x86) = x86_probe else {
         eprintln!("skip: no x86 probe exe; verified runtime32 PE only");
         return;
@@ -357,6 +365,56 @@ fn t31_x86_inject_matrix_or_dll_product() {
         "x86 child not injected:\n{stdout}"
     );
     assert_eq!(field_after(&stdout, "GetUserDefaultGeoName:"), "US");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Ticket 31: a hooked x64 parent can create an x86 child. Detours rewrites
+/// the injected DLL name from runtime64 to runtime32 and calls ordinal 1 in the
+/// x86 DLL, so this covers the paired Runtime cache and helper export together.
+#[test]
+fn t31_x64_parent_injects_syswow64_child_from_paired_runtime_cache() {
+    let Some(dll64) = test_runtime_dll() else {
+        eprintln!("skip: envbox-runtime64.dll not present");
+        return;
+    };
+    let Some(dll32) = test_runtime_dll32() else {
+        eprintln!("skip: envbox-runtime32.dll not present");
+        return;
+    };
+    if dll64.parent() != dll32.parent() {
+        eprintln!("skip: Runtime DLL products are not siblings");
+        return;
+    }
+
+    let x86_cmd = PathBuf::from(r"C:\Windows\SysWOW64\cmd.exe");
+    if !x86_cmd.is_file() {
+        eprintln!("skip: SysWOW64 cmd.exe not present");
+        return;
+    }
+    assert_eq!(pe_machine(&dll64), 0x8664);
+    assert_eq!(pe_machine(&dll32), 0x014c);
+    assert_eq!(pe_machine(&x86_cmd), 0x014c);
+
+    let root = std::env::temp_dir().join(format!("envbox-b31-cross-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let profile_id = make_profile(&root);
+    let wrapper = root.join("x64-parent-to-x86-child.cmd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "@echo off\r\n\"{}\" /d /s /c set ENVBOX_PROFILE_ID\r\n",
+            x86_cmd.display()
+        ),
+    )
+    .unwrap();
+
+    let out = run_envbox(&root, &profile_id, &wrapper, &[]);
+    assert!(out.status.success(), "cross-bitness launch failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("ENVBOX_PROFILE_ID={profile_id}")),
+        "x86 child did not inherit the Profile through the x64 parent:\n{stdout}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -434,8 +492,11 @@ fn t32_path_resolution_prefers_cmd_wrapper() {
     let path_dir = root.join("pathbin");
     std::fs::create_dir_all(&path_dir).unwrap();
     // npm-style non-PE shim must lose to the .cmd wrapper.
-    std::fs::write(path_dir.join("edge-tool"), b"#!/usr/bin/env node\nconsole.log('shim')\n")
-        .unwrap();
+    std::fs::write(
+        path_dir.join("edge-tool"),
+        b"#!/usr/bin/env node\nconsole.log('shim')\n",
+    )
+    .unwrap();
     let probe_s = probe.display().to_string();
     std::fs::write(
         path_dir.join("edge-tool.cmd"),
@@ -512,7 +573,11 @@ fn t33_multi_child_all_injected_same_profile() {
         let pid = field_after(chunk, "ENVBOX_PROFILE_ID:");
         assert_eq!(pid, profile_id, "child escaped Profile view:\n{chunk}");
         profile_ids.push(pid.clone());
-        assert_eq!(field_after(chunk, "GetUserDefaultGeoName:"), "US", "{chunk}");
+        assert_eq!(
+            field_after(chunk, "GetUserDefaultGeoName:"),
+            "US",
+            "{chunk}"
+        );
         assert_eq!(
             field_after(chunk, "GetUserDefaultLocaleName:"),
             "en-US",
@@ -541,9 +606,7 @@ fn t33_multi_child_all_injected_same_profile() {
 // ---------------------------------------------------------------------------
 
 fn sample_profile() -> envbox_core::EnvironmentProfile {
-    use envbox_core::{
-        DnsMode, DnsProfile, LocaleProfile, RegistryProfile, TimezoneProfile,
-    };
+    use envbox_core::{DnsMode, DnsProfile, LocaleProfile, RegistryProfile, TimezoneProfile};
     envbox_core::EnvironmentProfile {
         id: Uuid::new_v4(),
         name: "Boundary".into(),
@@ -562,7 +625,7 @@ fn sample_profile() -> envbox_core::EnvironmentProfile {
         },
         environment: Default::default(),
         registry: RegistryProfile::default(),
-            browser: Default::default(),
+        browser: Default::default(),
     }
 }
 
@@ -640,7 +703,7 @@ fn t34_self_terminate_status_is_terminal() {
     );
 }
 
-/// Ticket 34: Stop() closes the Job (`KILL_ON_JOB_CLOSE`) and leaves no residual process.
+/// Ticket 34: Stop() explicitly terminates the Job and leaves no residual process.
 #[test]
 fn t34_stop_kills_tree_without_residual_process() {
     use envbox_core::InstanceStatus;
@@ -649,10 +712,7 @@ fn t34_stop_kills_tree_without_residual_process() {
     let profile = sample_profile();
     let mut mgr = InstanceManager::new();
     // Long-running root so Stop has something to kill.
-    let app = sample_app(vec![
-        "/c".into(),
-        "ping -n 30 127.0.0.1 >nul".into(),
-    ]);
+    let app = sample_app(vec!["/c".into(), "ping -n 30 127.0.0.1 >nul".into()]);
     let id = mgr.run(&app, RunTarget::Profile(profile)).expect("run");
     let pid = mgr.get(id).expect("instance").root_pid;
     assert_ne!(pid, 0);
@@ -676,7 +736,7 @@ fn t34_stop_kills_tree_without_residual_process() {
         }
         std::thread::sleep(Duration::from_millis(40));
     }
-    assert!(!alive, "pid {pid} still alive after Stop (KILL_ON_JOB_CLOSE)");
+    assert!(!alive, "pid {pid} still alive after explicit Stop");
 }
 
 fn process_alive(pid: u32) -> bool {

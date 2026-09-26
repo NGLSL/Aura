@@ -48,7 +48,9 @@ pub struct JobStats {
     pub total_page_fault_count: u32,
 }
 
-/// RAII Job Object. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set at creation.
+/// RAII Job Object used for tracking and explicit Stop.
+/// Dropping the handle leaves the instance running so GUI exit and installer
+/// upgrades do not terminate user applications.
 pub struct InstanceJob {
     #[cfg(windows)]
     handle: win::SafeHandle,
@@ -59,29 +61,12 @@ impl InstanceJob {
     pub fn create() -> Result<Self, JobError> {
         #[cfg(windows)]
         {
-            use windows::Win32::System::JobObjects::{
-                CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            };
+            use windows::Win32::System::JobObjects::CreateJobObjectW;
             use windows::core::PCWSTR;
 
             unsafe {
                 let handle = CreateJobObjectW(None, PCWSTR::null())
                     .map_err(|_| JobError::Create(last_error()))?;
-
-                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                if SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const _,
-                    std::mem::size_of_val(&info) as u32,
-                )
-                .is_err()
-                {
-                    let code = last_error();
-                    return Err(JobError::Create(code));
-                }
 
                 Ok(Self {
                     handle: win::SafeHandle(handle),
@@ -166,9 +151,10 @@ impl InstanceJob {
         Ok(())
     }
 
-    /// Close the job handle. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` then stops
-    /// the Process Tree Instance (ticket 10 Stop contract — not TerminateJobObject).
+    /// Explicitly stop the Process Tree Instance, then release the Job handle.
+    /// Ordinary Drop only releases tracking and intentionally does not stop it.
     pub fn close(&mut self) -> Result<(), JobError> {
+        self.terminate()?;
         #[cfg(windows)]
         {
             use windows::Win32::Foundation::HANDLE;
@@ -181,6 +167,48 @@ impl InstanceJob {
 
 impl Drop for InstanceJob {
     fn drop(&mut self) {
-        // SafeHandle closes the job; KILL_ON_JOB_CLOSE stops the tree.
+        // SafeHandle closes only the tracking handle. Applications stay alive.
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+
+    #[test]
+    fn dropping_job_keeps_assigned_process_alive() {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/s", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn child");
+        let mut job = InstanceJob::create().expect("create job");
+        job.assign_pid(child.id()).expect("assign child");
+
+        drop(job);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(child.try_wait().expect("query child").is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn explicit_close_stops_assigned_process() {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/s", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn child");
+        let mut job = InstanceJob::create().expect("create job");
+        job.assign_pid(child.id()).expect("assign child");
+
+        job.close().expect("explicit stop");
+        let status = child.wait().expect("wait stopped child");
+
+        assert!(!status.success());
     }
 }

@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <string>
+
 #include "ipc_bootstrap.h"
 
 static RuntimeProfile g_profile = {};
@@ -232,9 +234,78 @@ static void ApplyIpcProfile(const RuntimeProfile* src) {
   for (int i = 0; i < src->registry_path_count && i < ENVBOX_REG_MAX; i++) {
     wcsncpy_s(g_profile.registry_paths[i], src->registry_paths[i], _TRUNCATE);
   }
+  g_profile.environment_count = src->environment_count;
+  for (int i = 0; i < src->environment_count && i < ENVBOX_ENV_MAX; i++) {
+    wcsncpy_s(g_profile.environment[i], src->environment[i], _TRUNCATE);
+  }
   if (src->webrtc_policy[0] != L'\0') {
     wcsncpy_s(g_profile.webrtc_policy, src->webrtc_policy, _TRUNCATE);
   }
+}
+
+// Apply Profile environment values to this process after IPC bootstrap. This
+// is required for packaged roots because AUMID activation cannot receive a
+// custom Environment Block. Internal ENVBOX_* identity always wins, matching
+// the Rust Win32 environment builder.
+static void ApplyCurrentProcessEnvironment(const RuntimeProfile* profile) {
+  if (profile == nullptr) {
+    return;
+  }
+  for (int i = 0; i < profile->environment_count && i < ENVBOX_ENV_MAX; i++) {
+    const wchar_t* entry = profile->environment[i];
+    const wchar_t* eq = wcschr(entry, L'=');
+    if (eq == nullptr || eq == entry) {
+      continue;
+    }
+    std::wstring key(entry, (size_t)(eq - entry));
+    if (_wcsnicmp(key.c_str(), L"ENVBOX_", 7) == 0) {
+      continue;
+    }
+    SetEnvironmentVariableW(key.c_str(), eq + 1);
+  }
+
+  SetEnvironmentVariableW(L"ENVBOX_PROFILE_ID", profile->profile_id);
+  SetEnvironmentVariableW(L"ENVBOX_INSTANCE_ID", profile->instance_id);
+  SetEnvironmentVariableW(L"ENVBOX_INHERIT_CHILDREN",
+                          profile->inherit_children ? L"1" : L"0");
+  SetEnvironmentVariableW(L"ENVBOX_AUDIT", profile->audit ? L"1" : L"0");
+
+  // Persist the complete structured fallback in the packaged root. Windows
+  // package activation cannot receive Aura's custom Environment Block. Once
+  // the Broker exits, descendants can still bootstrap from these inherited
+  // values and keep the same immutable Profile.
+  SetEnvironmentVariableW(L"ENVBOX_LOCALE_NAME", profile->locale_name);
+  SetEnvironmentVariableW(L"ENVBOX_UI_LANGUAGE", profile->ui_language);
+  SetEnvironmentVariableW(L"ENVBOX_REGION", profile->region);
+  SetEnvironmentVariableW(L"ENVBOX_TZ_WINDOWS", profile->tz_windows);
+  SetEnvironmentVariableW(L"ENVBOX_TZ_IANA", profile->tz_iana);
+  SetEnvironmentVariableW(L"ENVBOX_DNS_MODE",
+                          profile->dns_mode ? L"1" : L"0");
+
+  std::wstring dns_servers;
+  for (int i = 0; i < profile->dns_server_count && i < ENVBOX_DNS_MAX; i++) {
+    wchar_t server[64] = {};
+    if (MultiByteToWideChar(CP_UTF8, 0, profile->dns_servers[i], -1, server,
+                            64) <= 0) {
+      continue;
+    }
+    if (!dns_servers.empty()) {
+      dns_servers.push_back(L';');
+    }
+    dns_servers.append(server);
+  }
+  SetEnvironmentVariableW(L"ENVBOX_DNS_SERVERS", dns_servers.c_str());
+
+  std::wstring registry_paths;
+  for (int i = 0;
+       i < profile->registry_path_count && i < ENVBOX_REG_MAX; i++) {
+    if (!registry_paths.empty()) {
+      registry_paths.push_back(L';');
+    }
+    registry_paths.append(profile->registry_paths[i]);
+  }
+  SetEnvironmentVariableW(L"ENVBOX_REGISTRY_PATHS", registry_paths.c_str());
+  SetEnvironmentVariableW(L"ENVBOX_WEBRTC_POLICY", profile->webrtc_policy);
 }
 
 // Split `a;b;c` into rows. Returns count, or -1 on overflow (caller Fail Open).
@@ -415,7 +486,12 @@ int EnvBoxLoadProfile() {
     // Startup Fail Policy: never run without a Profile (IPC or ENVBOX_*).
     return 0;
   }
+  if (g_profile.profile_id[0] == L'\0' || g_profile.instance_id[0] == L'\0') {
+    OutputDebugStringA("EnvBox: Profile identity missing\n");
+    return 0;
+  }
 
+  ApplyCurrentProcessEnvironment(&g_profile);
   g_loaded = 1;
   // Best-effort readiness notice; never affects startup success.
   EnvBoxIpcNotifyRuntimeReady();

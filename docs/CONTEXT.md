@@ -10,6 +10,7 @@
 | **Environment Profile（Profile）** | 一套可复用的环境视图：Locale、UI Language、Region、Timezone、DNS View、Environment Variables、Registry 白名单 |
 | **EnvironmentSession** | 一次 Run 的控制面聚合：目标、Profile、Root/子进程集合、Package Identity、IsolationGuarantee、AttachStrategy、状态 |
 | **RuntimeInstance** | 一次 Run 的运行记录；同一 Application 可并存多个实例 |
+| **Detached RuntimeInstance** | Aura 控制面退出后仍继续运行的 RuntimeInstance 进程树；保持启动时的不可变 Profile，但不属于重新打开的 Aura 所维护的实例列表 |
 | **Process Tree Instance** | 隔离单位：Root Process 及其子进程树；不是可执行文件名 |
 | **Root Process** | EnvBox 直接创建或激活的进程；后续子进程经注入继承 Profile |
 | **LaunchTarget** | 启动方式：Executable / Command / Packaged（AUMID，禁止直接跑 WindowsApps exe） |

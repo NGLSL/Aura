@@ -71,6 +71,15 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
   return TRUE;
 }
 
-extern "C" __declspec(dllexport) const char* EnvBoxRuntimeLoaded() {
+// Detours launches the opposite-bitness rundll32 with `<runtime>,#1` when a
+// hooked process creates a child of the other architecture. Ordinal 1 must be
+// this CALLBACK entry point in both Runtime DLLs (see the architecture-specific
+// module definition files).
+extern "C" void CALLBACK EnvBoxDetourFinishHelperProcess(
+    HWND window, HINSTANCE instance, LPSTR command_line, int show) {
+  DetourFinishHelperProcess(window, instance, command_line, show);
+}
+
+extern "C" const char* EnvBoxRuntimeLoaded() {
   return "EnvBox Runtime Loaded";
 }

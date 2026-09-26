@@ -145,10 +145,15 @@ impl std::fmt::Display for NamedId {
 pub enum LaunchKind {
     Command,
     Executable,
+    Packaged,
 }
 
 impl LaunchKind {
-    pub const ALL: [LaunchKind; 2] = [LaunchKind::Command, LaunchKind::Executable];
+    pub const ALL: [LaunchKind; 3] = [
+        LaunchKind::Command,
+        LaunchKind::Executable,
+        LaunchKind::Packaged,
+    ];
 }
 
 impl std::fmt::Display for LaunchKind {
@@ -156,6 +161,7 @@ impl std::fmt::Display for LaunchKind {
         match self {
             LaunchKind::Command => write!(f, "Command"),
             LaunchKind::Executable => write!(f, "Executable"),
+            LaunchKind::Packaged => write!(f, "Packaged"),
         }
     }
 }

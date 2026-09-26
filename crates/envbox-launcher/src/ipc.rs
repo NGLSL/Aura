@@ -3,7 +3,7 @@
 //! Wire format matches `runtime/src/ipc_bootstrap.h`:
 //! one line per message, UTF-8, `MSG_NAME key=value ...`, values are bare
 //! tokens or double-quoted strings (`\\` `\"` `\n` `\r` `\t` escapes).
-//! Lists use repeated keys (`dns_server=`, `registry_path=`).
+//! Lists use repeated keys (`dns_server=`, `registry_path=`, `environment=`).
 //!
 //! Public message names (stable, case-sensitive):
 //! HELLO / GET_PROFILE / PROFILE / RUNTIME_READY / HOOK_ERROR /
@@ -19,6 +19,9 @@ use uuid::Uuid;
 
 /// Default pipe name. Override with `ENVBOX_IPC_PIPE`.
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\envbox-runtime";
+pub const IPC_MAX_LINE_BYTES: usize = 8192;
+pub const RUNTIME_ENVIRONMENT_MAX: usize = 32;
+pub const RUNTIME_ENVIRONMENT_ENTRY_MAX_BYTES: usize = 512;
 
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -56,6 +59,8 @@ pub enum IpcMessage {
         dns_mode: bool,
         dns_servers: Vec<String>,
         registry_paths: Vec<String>,
+        /// Profile environment overrides encoded as ordered key/value pairs.
+        environment: Vec<(String, String)>,
         /// Browser / Network Guard WebRTC policy (`host`/`public_interface_only`/`proxy_only`/`strict`).
         /// C++ stores the token; business semantics stay in envbox-core.
         webrtc: String,
@@ -92,6 +97,7 @@ pub enum IpcMessage {
         dns_mode: bool,
         dns_servers: Vec<String>,
         registry_paths: Vec<String>,
+        environment: Vec<(String, String)>,
         /// See `IpcMessage::Profile::webrtc`.
         webrtc: String,
     },
@@ -148,6 +154,7 @@ impl IpcMessage {
                 dns_mode,
                 dns_servers,
                 registry_paths,
+                environment,
                 webrtc,
             } => {
                 let mut s = format!(
@@ -169,6 +176,12 @@ impl IpcMessage {
                 }
                 for p in registry_paths {
                     s.push_str(&format!(" registry_path={}", quote_value(p)));
+                }
+                for (key, value) in environment {
+                    s.push_str(&format!(
+                        " environment={}",
+                        quote_value(&format!("{key}={value}"))
+                    ));
                 }
                 s
             }
@@ -215,6 +228,7 @@ impl IpcMessage {
                 dns_mode,
                 dns_servers,
                 registry_paths,
+                environment,
                 webrtc,
             } => {
                 let mut s = format!(
@@ -236,6 +250,12 @@ impl IpcMessage {
                 }
                 for p in registry_paths {
                     s.push_str(&format!(" registry_path={}", quote_value(p)));
+                }
+                for (key, value) in environment {
+                    s.push_str(&format!(
+                        " environment={}",
+                        quote_value(&format!("{key}={value}"))
+                    ));
                 }
                 s
             }
@@ -317,6 +337,14 @@ impl IpcMessage {
                 dns_mode: get_flag("dns_mode"),
                 dns_servers: list("dns_server"),
                 registry_paths: list("registry_path"),
+                environment: list("environment")
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                    })
+                    .collect(),
                 webrtc: first("webrtc"),
             },
             "RUNTIME_READY" => IpcMessage::RuntimeReady {
@@ -350,6 +378,14 @@ impl IpcMessage {
                 dns_mode: get_flag("dns_mode"),
                 dns_servers: list("dns_server"),
                 registry_paths: list("registry_path"),
+                environment: list("environment")
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                    })
+                    .collect(),
                 webrtc: first("webrtc"),
             },
             "BIND_PID" => IpcMessage::BindPid {
@@ -377,6 +413,12 @@ pub fn profile_to_message_with_flags(
     inherit_children: bool,
     audit: bool,
 ) -> IpcMessage {
+    let mut environment: Vec<(String, String)> = profile
+        .environment
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    environment.sort_by(|a, b| a.0.cmp(&b.0));
     IpcMessage::Profile {
         profile_id: profile.id.to_string(),
         instance_id: instance_id.to_string(),
@@ -395,6 +437,7 @@ pub fn profile_to_message_with_flags(
             .map(|s| s.to_string())
             .collect(),
         registry_paths: profile.registry.whitelist_paths.clone(),
+        environment,
         webrtc: profile.browser.webrtc.as_str().to_string(),
     }
 }
@@ -410,6 +453,7 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
         dns_mode,
         dns_servers,
         registry_paths,
+        environment,
         webrtc,
         ..
     } = msg
@@ -456,7 +500,7 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
             },
             servers,
         },
-        environment: HashMap::new(),
+        environment: environment.iter().cloned().collect(),
         registry: RegistryProfile {
             whitelist_paths: registry_paths.clone(),
         },
@@ -602,6 +646,7 @@ impl SessionTable {
                     dns_mode,
                     dns_servers,
                     registry_paths,
+                    environment,
                     webrtc,
                 } => IpcMessage::Profile {
                     profile_id,
@@ -616,6 +661,7 @@ impl SessionTable {
                     dns_mode,
                     dns_servers,
                     registry_paths,
+                    environment,
                     webrtc,
                 },
                 other => other,
@@ -680,6 +726,7 @@ impl SessionTable {
                         dns_mode: false,
                         dns_servers: vec![],
                         registry_paths: vec![],
+                        environment: vec![],
                         webrtc: "host".into(),
                     })
                 })
@@ -814,6 +861,7 @@ mod tests {
                 dns_mode: true,
                 dns_servers: vec!["1.1.1.1".into()],
                 registry_paths: vec!["HKCU\\Software\\EnvBox".into()],
+                environment: vec![("LANG".into(), "en_US.UTF-8".into())],
                 webrtc: "proxy_only".into(),
             },
             IpcMessage::RuntimeReady { pid: 1 },
@@ -867,7 +915,10 @@ mod tests {
                 mode: DnsMode::VirtualView,
                 servers: vec!["1.1.1.1".parse().unwrap()],
             },
-            environment: HashMap::new(),
+            environment: HashMap::from([
+                ("LANG".into(), "en_US.UTF-8".into()),
+                ("TOOL_OPTIONS".into(), "alpha beta=gamma".into()),
+            ]),
             registry: RegistryProfile {
                 whitelist_paths: vec!["HKCU\\Software\\EnvBox".into()],
             },
@@ -879,6 +930,7 @@ mod tests {
         assert_eq!(decoded.locale, profile.locale);
         assert_eq!(decoded.timezone, profile.timezone);
         assert_eq!(decoded.dns.servers, profile.dns.servers);
+        assert_eq!(decoded.environment, profile.environment);
         assert_eq!(
             decoded.registry.whitelist_paths,
             profile.registry.whitelist_paths
@@ -984,6 +1036,7 @@ mod tests {
             dns_mode: false,
             dns_servers: vec![],
             registry_paths: vec![],
+            environment: vec![],
             webrtc: "host".into(),
         };
         assert!(message_to_profile(&msg).is_err());
@@ -1004,6 +1057,7 @@ mod tests {
             dns_mode: false,
             dns_servers: vec![],
             registry_paths: vec![],
+            environment: vec![("LANG".into(), "en_US.UTF-8".into())],
             webrtc: "strict".into(),
         };
         assert_eq!(round_trip(&reg), reg);
@@ -1031,6 +1085,7 @@ mod tests {
             dns_mode: false,
             dns_servers: vec![],
             registry_paths: vec![],
+            environment: vec![("LANG".into(), "en_US.UTF-8".into())],
             webrtc: "host".into(),
         });
         t.handle(&IpcMessage::BindPid {

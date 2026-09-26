@@ -187,7 +187,7 @@ fn run_rejects_missing_working_directory() {
 #[test]
 fn run_probe_prints_runtime_loaded_marker() {
     let dll = test_runtime_dll().expect(
-        "envbox-runtime64.dll required for ticket 04 smoke (build via scripts/build.ps1 or set ENVBOX_TEST_RUNTIME_DLL)",
+        "envbox-runtime64.dll required for ticket 04 smoke (run scripts/build-installer.ps1 and set ENVBOX_TEST_RUNTIME_DLL to target/release/envbox-runtime64.dll)",
     );
     let probe = probe_exe().expect("envbox-probe.exe required for ticket 04 smoke");
     let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));

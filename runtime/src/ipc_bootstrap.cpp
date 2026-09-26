@@ -15,7 +15,7 @@ namespace {
 constexpr DWORD kConnectTimeoutMs = 2000;
 constexpr DWORD kIoTimeoutMs = 3000;
 constexpr size_t kMaxLine = 8192;
-constexpr int kMaxKv = 48;
+constexpr int kMaxKv = 96;
 
 // ---------------------------------------------------------------------------
 // Pipe name resolution: ENVBOX_IPC_PIPE (bare name or \\.\pipe\... path).
@@ -168,10 +168,10 @@ int ReadLine(PipeReader* r, char* out, size_t cap, ULONGLONG deadline) {
 // Connect: retry until deadline (covers PostActivation early-start race).
 // Opens with FILE_FLAG_OVERLAPPED so reads can time out.
 // ---------------------------------------------------------------------------
-HANDLE ConnectPipe(void) {
+HANDLE ConnectPipe(DWORD timeout_ms) {
   wchar_t path[256];
   GetPipePath(path, 256);
-  ULONGLONG deadline = GetTickCount64() + kConnectTimeoutMs;
+  ULONGLONG deadline = GetTickCount64() + timeout_ms;
   for (;;) {
     // Wait briefly for an instance; ignore failure and still try CreateFileW.
     WaitNamedPipeW(path, 100);
@@ -369,8 +369,12 @@ int MsgGetAll(const IpcMsg* m, const char* key, char out[][64], int max_items,
   return n;
 }
 
-int MsgGetAllW(const IpcMsg* m, const char* key, wchar_t out[][128],
+template <size_t Width>
+int MsgGetAllW(const IpcMsg* m, const char* key, wchar_t (*out)[Width],
                int max_items, size_t item_cap) {
+  if (item_cap > Width) {
+    item_cap = Width;
+  }
   int n = 0;
   for (int i = 0; i < m->count && n < max_items; i++) {
     if (strcmp(m->key[i], key) == 0) {
@@ -446,18 +450,26 @@ int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
   // Network Guard can close external UDP/53 (empty allowlist).
   out->registry_path_count =
       MsgGetAllW(m, "registry_path", out->registry_paths, ENVBOX_REG_MAX, 128);
+  out->environment_count = MsgGetAllW(m, "environment", out->environment,
+                                      ENVBOX_ENV_MAX, ENVBOX_ENV_ENTRY_MAX);
 
   // Browser / Network Guard WebRTC policy token (ticket 51). C++ stores only.
   if ((v = MsgGet(m, "webrtc")) != nullptr) {
     Utf8ToWide(v, out->webrtc_policy, 32);
   }
 
-  return out->has_locale && out->has_ui && out->has_region && out->has_tz;
+  return out->profile_id[0] != L'\0' && out->instance_id[0] != L'\0' &&
+         out->has_locale && out->locale_name[0] != L'\0' && out->has_ui &&
+         out->ui_language[0] != L'\0' && out->has_region &&
+         out->region[0] != L'\0' && out->has_tz &&
+         out->tz_windows[0] != L'\0';
 }
 
 // Send one fire-and-forget message on a fresh connection. Best-effort.
 void Notify(const char* name, const std::string& body) {
-  HANDLE h = ConnectPipe();
+  // Lifecycle notices are best-effort. After Aura exits, child creation must
+  // not stall for the full bootstrap timeout before using inherited values.
+  HANDLE h = ConnectPipe(100);
   if (h == INVALID_HANDLE_VALUE) {
     return;
   }
@@ -477,7 +489,12 @@ int EnvBoxIpcFetchProfile(RuntimeProfile* out) {
   memset(out, 0, sizeof(*out));
   out->inherit_children = 1;
 
-  HANDLE h = ConnectPipe();
+  wchar_t profile_hint[64] = {};
+  GetEnvironmentVariableW(L"ENVBOX_PROFILE_ID", profile_hint, 64);
+  // Packaged roots need a retry window because they have no Environment
+  // Block. Descendants already carry a complete ENVBOX_* fallback and only
+  // make a short broker attempt so they remain responsive after Aura exits.
+  HANDLE h = ConnectPipe(profile_hint[0] != L'\0' ? 100 : kConnectTimeoutMs);
   if (h == INVALID_HANDLE_VALUE) {
     return 0;
   }
@@ -581,8 +598,14 @@ void EnvBoxIpcNotifyProcessCreated(unsigned long child_pid,
 }
 
 void EnvBoxIpcNotifyProcessExited(unsigned long exit_code) {
+  EnvBoxIpcNotifyProcessExitedPid((unsigned long)GetCurrentProcessId(),
+                                 exit_code);
+}
+
+void EnvBoxIpcNotifyProcessExitedPid(unsigned long pid,
+                                    unsigned long exit_code) {
   std::string body;
-  AppendKvU32(&body, "pid", (unsigned long)GetCurrentProcessId());
+  AppendKvU32(&body, "pid", pid);
   AppendKvU32(&body, "exit_code", exit_code);
   Notify("PROCESS_EXITED", body);
 }

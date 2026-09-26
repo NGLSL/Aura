@@ -13,6 +13,12 @@
 #ifndef ENVBOX_REG_MAX
 #define ENVBOX_REG_MAX 16
 #endif
+#ifndef ENVBOX_ENV_MAX
+#define ENVBOX_ENV_MAX 32
+#endif
+#ifndef ENVBOX_ENV_ENTRY_MAX
+#define ENVBOX_ENV_ENTRY_MAX 512
+#endif
 
 struct RuntimeProfile {
   wchar_t locale_name[85];
@@ -36,6 +42,10 @@ struct RuntimeProfile {
   // Registry Virtual View (ticket 09): extra whitelist_paths from Profile.
   int registry_path_count;
   wchar_t registry_paths[ENVBOX_REG_MAX][128];
+  // Process environment overrides from EnvironmentProfile. Each row is a
+  // validated `NAME=value` pair supplied by the Rust Host over IPC.
+  int environment_count;
+  wchar_t environment[ENVBOX_ENV_MAX][ENVBOX_ENV_ENTRY_MAX];
   // Browser / Network Guard (ticket 51/56): WebRTC policy token.
   // host / public_interface_only / proxy_only / strict (C++ stores, does not
   // invent business semantics). Empty = host.

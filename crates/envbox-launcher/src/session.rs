@@ -126,6 +126,36 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
         profile
             .validate()
             .map_err(|e| SessionError::InvalidProfile(e.to_string()))?;
+        if profile.environment.len() > crate::ipc::RUNTIME_ENVIRONMENT_MAX {
+            return Err(SessionError::InvalidProfile(format!(
+                "environment has {} entries; Runtime supports at most {}",
+                profile.environment.len(),
+                crate::ipc::RUNTIME_ENVIRONMENT_MAX
+            )));
+        }
+        for (key, value) in &profile.environment {
+            if key.len() + 1 + value.len()
+                >= crate::ipc::RUNTIME_ENVIRONMENT_ENTRY_MAX_BYTES
+            {
+                return Err(SessionError::InvalidProfile(format!(
+                    "environment entry {key:?} is too large for Runtime IPC"
+                )));
+            }
+        }
+        let payload = crate::ipc::profile_to_message_with_flags(
+            profile,
+            &instance_id.to_string(),
+            req.inherit_children,
+            req.audit,
+        )
+        .encode_line();
+        if payload.len() + 1 > crate::ipc::IPC_MAX_LINE_BYTES {
+            return Err(SessionError::InvalidProfile(format!(
+                "encoded Runtime Profile is {} bytes; IPC limit is {}",
+                payload.len() + 1,
+                crate::ipc::IPC_MAX_LINE_BYTES
+            )));
+        }
         // Strict WebRTC requires Network Guard (Runtime hooks_network). We inject
         // the Runtime on this path, so process-tree UDP deny is available.
         // Host-mode (no profile) never hits this check.
@@ -228,10 +258,11 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
     let runtime_dll = if host_mode {
         None
     } else {
+        let source = crate::injection::resolve_runtime_dll()
+            .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?;
         Some(
-            crate::injection::resolve_runtime_dll().map_err(|e| {
-                SessionError::Activate(ActivateError::Inject(e))
-            })?,
+            crate::injection::stage_runtime_dll(&source, instance_id)
+                .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?,
         )
     };
 

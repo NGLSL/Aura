@@ -35,8 +35,11 @@ Runtime injection is process-scoped and runs at EnvBox’s integrity level. A ta
 ## Quick start
 
 ```powershell
-# build (see scripts/build.ps1)
-cargo build -p envbox-cli -p envbox-probe
+# Rust development build
+cargo build
+
+# Complete installer build (Rust workspace + x64/x86 Runtime + NSIS)
+.\scripts\build-installer.ps1
 
 # add a US profile and run Probe under it
 envbox profile add --name US --locale en-US --ui-language en-US --region US `
@@ -45,6 +48,10 @@ envbox run --profile <id> .\target\debug\envbox-probe.exe
 ```
 
 Config lives under `%LOCALAPPDATA%\com.aura.envbox\` (or `ENVBOX_CONFIG_ROOT`).
+
+## Instance lifecycle
+
+Closing Aura, or replacing Aura during an installer upgrade, leaves applications already launched by Aura running. Those detached instances keep the immutable Profile they received at launch, including for later child processes. The **Stop** action still explicitly terminates the tracked process tree. After Aura exits, its in-memory tracking is gone, so a reopened Aura cannot stop or inspect the detached instance.
 
 ## Performance
 

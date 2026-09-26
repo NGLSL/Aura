@@ -15,7 +15,7 @@
 //               \t -> TAB. Unknown escapes keep the escaped character.
 //               Integers are decimal; flags are 0|1. Senders quote any string
 //               that may contain spaces or empty text.
-//   Lists     : repeated keys (dns_server=, registry_path=), order preserved.
+//   Lists     : repeated keys (dns_server=, registry_path=, environment=), order preserved.
 //               Receivers must ignore unknown keys and unknown message names.
 //
 // Message names (exact, case-sensitive):
@@ -31,6 +31,7 @@
 //                                   audit=0|1 dns_mode=0|1
 //                                   [dns_server=<string>]*
 //                                   [registry_path=<string>]*
+//                                   [environment=<NAME=value>]*
 //   RUNTIME_READY   Client -> Host  pid=<u32>
 //   HOOK_ERROR      Client -> Host  pid=<u32> api=<string> code=<u32>
 //                                   [detail=<string>]
@@ -41,8 +42,9 @@
 //
 // PROFILE key mapping to RuntimeProfile: locale_name, ui_language, region,
 // tz_windows, tz_iana, dns_mode, dns_server* -> dns_servers[],
-// registry_path* -> registry_paths[], inherit_children, audit, instance_id,
-// profile_id. locale_name + ui_language + region + tz_windows are required.
+// registry_path* -> registry_paths[], environment* -> environment[],
+// inherit_children, audit, instance_id, profile_id. Identity plus
+// locale_name + ui_language + region + tz_windows must all be non-empty.
 //
 // Bootstrap flow: connect -> HELLO -> GET_PROFILE -> read until PROFILE ->
 // close (V1). RUNTIME_READY is best-effort on a fresh short-lived connection
@@ -66,8 +68,11 @@ void EnvBoxIpcNotifyRuntimeReady(void);
 void EnvBoxIpcNotifyHookError(const char* api_utf8, unsigned long code,
                               const char* detail_utf8);
 
-// Best-effort lifecycle notices (PROCESS_CREATED / PROCESS_EXITED). Not wired
-// into hooks in V1; provided so the Host side can implement the full set.
+// Best-effort lifecycle notices (PROCESS_CREATED / PROCESS_EXITED). Child
+// creation sends PROCESS_CREATED before ResumeThread so the Broker can bind
+// the Profile before the injected Runtime asks for it during DllMain.
 void EnvBoxIpcNotifyProcessCreated(unsigned long child_pid,
                                    const char* image_utf8);
 void EnvBoxIpcNotifyProcessExited(unsigned long exit_code);
+void EnvBoxIpcNotifyProcessExitedPid(unsigned long pid,
+                                    unsigned long exit_code);

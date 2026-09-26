@@ -26,6 +26,12 @@ pub enum InjectError {
     RuntimeDllInvalid(PathBuf),
     #[error("runtime DLL path encode failed (GetLastError={1}): {0}")]
     RuntimeDllPathEncode(PathBuf, u32),
+    #[error("cannot stage runtime DLL for detached instance ({source_path} -> {destination}): {message}")]
+    RuntimeDllStage {
+        source_path: PathBuf,
+        destination: PathBuf,
+        message: String,
+    },
     #[error("DetourCreateProcessWithDllExW failed (GetLastError={0})")]
     DetourCreateProcess(u32),
     #[error(
@@ -135,6 +141,219 @@ fn arch_suffix(arch: PeArch) -> &'static str {
         PeArch::X64 => "64",
         PeArch::Unknown(_) => "64",
     }
+}
+
+/// Copy the paired Runtime DLL products into a content-addressed cache outside
+/// the install directory. A running instance can then survive Aura exit or an
+/// installer upgrade without holding the installed DLLs open.
+pub fn stage_runtime_dll(source: &Path, instance_id: uuid::Uuid) -> Result<PathBuf, InjectError> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    stage_runtime_dll_at(source, instance_id, &base)
+}
+
+fn stage_runtime_dll_at(
+    source: &Path,
+    instance_id: uuid::Uuid,
+    base: &Path,
+) -> Result<PathBuf, InjectError> {
+    let selected_name = source
+        .file_name()
+        .ok_or_else(|| InjectError::RuntimeDllInvalid(source.to_path_buf()))?
+        .to_os_string();
+    let bundle = runtime_bundle(source, base)?;
+    let cache_key = runtime_bundle_cache_key(&bundle);
+    let cache_root = base.join("com.aura.envbox").join("runtime");
+    let primary_dir = cache_root.join(&cache_key);
+
+    if runtime_bundle_matches(&primary_dir, &bundle) {
+        return Ok(primary_dir.join(selected_name));
+    }
+
+    // A partial directory containing only matching files is safe to complete.
+    // An incompatible existing entry must never be overwritten while a running
+    // instance may still have it loaded, so isolate this launch by instance id.
+    let destination_dir = if runtime_bundle_conflicts(&primary_dir, &bundle) {
+        cache_root.join(format!("{cache_key}-{instance_id}"))
+    } else {
+        primary_dir
+    };
+    std::fs::create_dir_all(&destination_dir).map_err(|err| InjectError::RuntimeDllStage {
+        source_path: source.to_path_buf(),
+        destination: destination_dir.clone(),
+        message: err.to_string(),
+    })?;
+
+    for file in &bundle {
+        stage_runtime_bundle_file(file, instance_id, &destination_dir)?;
+    }
+    if !runtime_bundle_matches(&destination_dir, &bundle) {
+        return Err(InjectError::RuntimeDllStage {
+            source_path: source.to_path_buf(),
+            destination: destination_dir.clone(),
+            message: "staged Runtime bundle fingerprint mismatch".into(),
+        });
+    }
+    Ok(destination_dir.join(selected_name))
+}
+
+#[derive(Debug)]
+struct RuntimeBundleFile {
+    source: PathBuf,
+    file_name: std::ffi::OsString,
+    fingerprint: (u64, u64),
+}
+
+/// Detours switches `envbox-runtime64.dll` to `envbox-runtime32.dll` (and the
+/// reverse) when a process creates a child of the other architecture. Both
+/// products therefore have to remain together at the exact same directory.
+fn runtime_bundle(
+    source: &Path,
+    error_destination: &Path,
+) -> Result<Vec<RuntimeBundleFile>, InjectError> {
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| InjectError::RuntimeDllInvalid(source.to_path_buf()))?;
+    let mut sources = vec![source.to_path_buf()];
+    let source_name_text = source_name.to_string_lossy();
+    let sibling_name = if source_name_text.eq_ignore_ascii_case("envbox-runtime64.dll") {
+        Some("envbox-runtime32.dll")
+    } else if source_name_text.eq_ignore_ascii_case("envbox-runtime32.dll") {
+        Some("envbox-runtime64.dll")
+    } else {
+        None
+    };
+    if let (Some(parent), Some(sibling_name)) = (source.parent(), sibling_name) {
+        let sibling = parent.join(sibling_name);
+        if sibling.is_file() {
+            sources.push(sibling);
+        }
+    }
+    sources.sort_by_key(|path| {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    });
+
+    sources
+        .into_iter()
+        .map(|source| {
+            let file_name = source
+                .file_name()
+                .ok_or_else(|| InjectError::RuntimeDllInvalid(source.clone()))?
+                .to_os_string();
+            let fingerprint =
+                runtime_fingerprint(&source).map_err(|err| InjectError::RuntimeDllStage {
+                    source_path: source.clone(),
+                    destination: error_destination.to_path_buf(),
+                    message: err.to_string(),
+                })?;
+            Ok(RuntimeBundleFile {
+                source,
+                file_name,
+                fingerprint,
+            })
+        })
+        .collect()
+}
+
+fn runtime_bundle_cache_key(bundle: &[RuntimeBundleFile]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut total_length = 0u64;
+    for file in bundle {
+        let name = file.file_name.to_string_lossy().to_ascii_lowercase();
+        for byte in name
+            .as_bytes()
+            .iter()
+            .chain([0xff].iter())
+            .chain(file.fingerprint.0.to_le_bytes().iter())
+            .chain(file.fingerprint.1.to_le_bytes().iter())
+        {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        total_length = total_length.wrapping_add(file.fingerprint.0);
+    }
+    format!("bundle-{}-{total_length:016x}-{hash:016x}", bundle.len())
+}
+
+fn runtime_bundle_matches(directory: &Path, bundle: &[RuntimeBundleFile]) -> bool {
+    bundle.iter().all(|file| {
+        let destination = directory.join(&file.file_name);
+        destination.is_file() && runtime_fingerprint(&destination).ok() == Some(file.fingerprint)
+    })
+}
+
+fn runtime_bundle_conflicts(directory: &Path, bundle: &[RuntimeBundleFile]) -> bool {
+    bundle.iter().any(|file| {
+        let destination = directory.join(&file.file_name);
+        destination.exists()
+            && (!destination.is_file()
+                || runtime_fingerprint(&destination).ok() != Some(file.fingerprint))
+    })
+}
+
+fn stage_runtime_bundle_file(
+    file: &RuntimeBundleFile,
+    instance_id: uuid::Uuid,
+    directory: &Path,
+) -> Result<(), InjectError> {
+    let destination = directory.join(&file.file_name);
+    if destination.is_file() && runtime_fingerprint(&destination).ok() == Some(file.fingerprint) {
+        return Ok(());
+    }
+    let stage_error = |err: std::io::Error| InjectError::RuntimeDllStage {
+        source_path: file.source.clone(),
+        destination: destination.clone(),
+        message: err.to_string(),
+    };
+    let temporary = directory.join(format!(
+        ".{}-{}.tmp",
+        file.file_name.to_string_lossy(),
+        instance_id.simple()
+    ));
+    std::fs::copy(&file.source, &temporary).map_err(&stage_error)?;
+    if runtime_fingerprint(&temporary).map_err(&stage_error)? != file.fingerprint {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(InjectError::RuntimeDllStage {
+            source_path: file.source.clone(),
+            destination,
+            message: "copy fingerprint mismatch".into(),
+        });
+    }
+    if let Err(err) = std::fs::rename(&temporary, &destination) {
+        if destination.is_file() && runtime_fingerprint(&destination).ok() == Some(file.fingerprint)
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&temporary);
+        return Err(stage_error(err));
+    }
+    Ok(())
+}
+
+fn runtime_fingerprint(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut length = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        length += read as u64;
+        for byte in &buffer[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    Ok((length, hash))
 }
 
 /// Resolve `envbox-runtime64.dll` / `envbox-runtime32.dll` for the **host** pointer
@@ -304,6 +523,31 @@ mod tests {
         assert_eq!(pe_arch(&x86).unwrap(), PeArch::X86);
         assert_eq!(pe_arch(&x64).unwrap(), PeArch::X64);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_bundle_is_staged_outside_install_directory_and_reused_by_content() {
+        let dir = std::env::temp_dir().join(format!("envbox-stage-{}", uuid::Uuid::new_v4()));
+        let install = dir.join("install");
+        let local = dir.join("local");
+        std::fs::create_dir_all(&install).unwrap();
+        let source64 = install.join("envbox-runtime64.dll");
+        let source32 = install.join("envbox-runtime32.dll");
+        std::fs::write(&source64, b"runtime-64").unwrap();
+        std::fs::write(&source32, b"runtime-32").unwrap();
+
+        let staged64 = stage_runtime_dll_at(&source64, uuid::Uuid::new_v4(), &local).unwrap();
+        let staged32 = stage_runtime_dll_at(&source32, uuid::Uuid::new_v4(), &local).unwrap();
+        let reused64 = stage_runtime_dll_at(&source64, uuid::Uuid::new_v4(), &local).unwrap();
+
+        assert!(staged64.starts_with(local.join("com.aura.envbox").join("runtime")));
+        assert!(staged64.ends_with("envbox-runtime64.dll"));
+        assert!(staged32.ends_with("envbox-runtime32.dll"));
+        assert_eq!(staged64.parent(), staged32.parent());
+        assert_eq!(std::fs::read(&staged64).unwrap(), b"runtime-64");
+        assert_eq!(std::fs::read(&staged32).unwrap(), b"runtime-32");
+        assert_eq!(reused64, staged64);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Ticket 30: elevation/integrity error codes map to a clear message that

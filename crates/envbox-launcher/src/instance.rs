@@ -71,8 +71,8 @@ impl InstanceManager {
         Ok(id)
     }
 
-    /// Stop the Process Tree Instance by closing the Job
-    /// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). On failure status becomes Failed
+    /// Explicitly stop the Process Tree Instance through its Job Object.
+    /// On failure status becomes Failed
     /// (never stuck at Stopping).
     pub fn stop(&mut self, id: Uuid) -> Result<(), InstanceError> {
         let Some(handle) = self.instances.get_mut(&id) else {

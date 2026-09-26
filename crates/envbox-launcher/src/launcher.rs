@@ -129,8 +129,7 @@ impl LaunchedProcess {
         }
     }
 
-    /// Stop the Process Tree Instance by closing the Job handle
-    /// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), not TerminateJobObject.
+    /// Explicitly stop the Process Tree Instance through its Job Object.
     pub fn stop(&mut self) -> Result<(), crate::job::JobError> {
         self.job.close()
     }
@@ -263,7 +262,10 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     };
 
     // PATH search uses the merged environment (Profile PATH overrides Host).
-    let path_env = env.get("PATH").cloned();
+    let path_env = env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone());
 
     let (resolved, user_args) = match &req.launch {
         LaunchTarget::Executable { path } => {
@@ -314,7 +316,9 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
     } else {
         // Startup Fail Policy: runtime DLL must exist, match target arch, and
         // inject; never launch un-hooked (tickets 04 / 30 / 31).
-        let runtime_dll = crate::injection::resolve_runtime_dll_for_target(&program)?;
+        let source_runtime = crate::injection::resolve_runtime_dll_for_target(&program)?;
+        let runtime_dll =
+            crate::injection::stage_runtime_dll(&source_runtime, req.instance_id)?;
         spawn_suspended(
             &program,
             &args,

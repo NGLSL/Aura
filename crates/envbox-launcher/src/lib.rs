@@ -26,7 +26,7 @@ pub use command::{resolve_command, ResolvedCommand};
 pub use environment::{build_environment_block, encode_environment_block};
 pub use injection::{
     is_elevation_integrity, map_create_process_error, pe_arch, resolve_runtime_dll,
-    resolve_runtime_dll_for_target, InjectError, PeArch,
+    resolve_runtime_dll_for_target, stage_runtime_dll, InjectError, PeArch,
 };
 pub use instance::{InstanceError, InstanceHandle, InstanceManager, RunTarget};
 pub use ipc::{

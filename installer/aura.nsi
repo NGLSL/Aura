@@ -1,5 +1,8 @@
 ﻿; Aura / EnvBox native installer (NSIS) — Kite-style per-machine install
 Unicode True
+!ifndef VERSION
+  !define VERSION "0.3.0"
+!endif
 Name "Aura"
 OutFile "..\artifacts\aura-setup.exe"
 InstallDir "$PROGRAMFILES64\Aura"
@@ -13,9 +16,6 @@ RequestExecutionLevel admin
 !define MUI_ABORTWARNING
 !define MUI_ICON "..\icons\icon.ico"
 !define MUI_UNICON "..\icons\icon.ico"
-!define MUI_FINISHPAGE_RUN
-!define MUI_FINISHPAGE_RUN_TEXT "安装完成后启动 Aura"
-!define MUI_FINISHPAGE_RUN_FUNCTION LaunchAuraUnelevated
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
@@ -25,12 +25,6 @@ RequestExecutionLevel admin
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
 !insertmacro MUI_LANGUAGE "English"
-
-Function LaunchAuraUnelevated
-  ; 安装器以管理员权限运行，但 Aura 本身不需要提权。
-  ; ShellExecute 让 Explorer 使用当前用户上下文启动，避免 UIPI 阻断外部快捷键。
-  ExecShell "open" "$INSTDIR\envbox-app.exe"
-FunctionEnd
 
 ; 用户确认开始安装后才关闭旧 Aura。取消安装向导时，旧版继续运行。
 Section "-关闭旧版 Aura" SEC_CLOSE_OLD
@@ -59,7 +53,7 @@ Section "Aura 主程序" SEC_MAIN
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\Aura" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Aura" "DisplayName" "Aura"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Aura" "DisplayVersion" "0.3.0"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Aura" "DisplayVersion" "${VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Aura" "Publisher" "EnvBox"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Aura" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Aura" "UninstallString" "$INSTDIR\uninstall.exe"
