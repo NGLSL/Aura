@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out Aura
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check out Microsoft Detours
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/Detours
+          ref: adb07604aa56508448b95bf037c2a6d0d3b6831a
+          path: third_party/Detours
+          persist-credentials: false
+
+      - name: Restore Detours libraries
+        id: detours-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/Detours/lib.X64
+            third_party/Detours/lib.X86
+            third_party/Detours/include
+          key: detours-windows-2022-adb07604aa56508448b95bf037c2a6d0d3b6831a
+
+      - name: Build Microsoft Detours for x64 and x86
+        env:
+          DETOURS_CACHE_HIT: ${{ steps.detours-cache.outputs.cache-hit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $detours = Join-Path $env:GITHUB_WORKSPACE 'third_party\Detours'
+          $revision = (git -C $detours rev-parse HEAD).Trim()
+          if ($revision -ne 'adb07604aa56508448b95bf037c2a6d0d3b6831a') {
+            throw "Unexpected Detours revision: $revision"
+          }
+          if ($env:DETOURS_CACHE_HIT -ne 'true') {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if (-not $vs) { throw 'Visual Studio C++ tools not found' }
+            $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat'
+            Push-Location (Join-Path $detours 'src')
+            try {
+              foreach ($arch in @('x64', 'x86')) {
+                $target = $arch.ToUpperInvariant()
+                $command = "call `"$vcvars`" $arch >nul && set `"DETOURS_TARGET_PROCESSOR=$target`" && nmake /nologo"
+                & cmd.exe /d /s /c $command
+                if ($LASTEXITCODE -ne 0) { throw "Detours $arch build failed ($LASTEXITCODE)" }
+              }
+            } finally {
+              Pop-Location
+            }
+          }
+          foreach ($target in @('X64', 'X86')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $detours "lib.$target\detours.lib"))) {
+              throw "Detours $target library missing"
+            }
+          }
+
+      - name: Build workspace binaries
+        run: cargo build --workspace --locked
+
+      - name: Build runtime DLLs for integration tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $detours = Join-Path $env:GITHUB_WORKSPACE 'third_party\Detours'
+          $debug = Join-Path $env:GITHUB_WORKSPACE 'target\debug'
+          foreach ($runtime in @(
+            @{ arch = 'x64'; dll = 'runtime64' },
+            @{ arch = 'Win32'; dll = 'runtime32' }
+          )) {
+            $build = Join-Path $env:GITHUB_WORKSPACE "target\ci-$($runtime.dll)"
+            & cmake -S runtime -B $build -G 'Visual Studio 17 2022' -A $runtime.arch "-DDETOURS_ROOT=$detours"
+            if ($LASTEXITCODE -ne 0) { throw "Runtime $($runtime.dll) configure failed ($LASTEXITCODE)" }
+            & cmake --build $build --config Release --target "envbox-$($runtime.dll)"
+            if ($LASTEXITCODE -ne 0) { throw "Runtime $($runtime.dll) build failed ($LASTEXITCODE)" }
+            $dll = Join-Path $build "Release\envbox-$($runtime.dll).dll"
+            if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) { throw "Runtime DLL missing: $dll" }
+            Copy-Item -LiteralPath $dll -Destination (Join-Path $debug "envbox-$($runtime.dll).dll") -Force
+          }
+
+      - name: Test workspace
+        run: cargo test --workspace --locked

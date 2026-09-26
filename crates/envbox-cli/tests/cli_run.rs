@@ -332,17 +332,13 @@ fn run_leaves_host_probe_snapshot_unchanged() {
 
 /// Ticket 05: four core APIs return Profile values under `envbox run`.
 /// Expected literals come from the Profile fixture (independent of Host).
-/// Also asserts the fields *changed* from the Host baseline (contrast).
+/// The Host may already use some of the fixture values.
 #[test]
 fn run_probe_four_core_apis_show_profile_values() {
     let dll = test_runtime_dll().expect("runtime DLL required");
     let probe = probe_exe().expect("envbox-probe.exe required");
     let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
     let profile_id = make_profile(&root); // US / en-US / Pacific Standard Time
-
-    let host = Command::new(&probe).output().expect("host probe");
-    assert!(host.status.success());
-    let host_out = String::from_utf8_lossy(&host.stdout).into_owned();
 
     let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
         .env("ENVBOX_CONFIG_ROOT", &root)
@@ -376,21 +372,7 @@ fn run_probe_four_core_apis_show_profile_values() {
         "Timezone not virtualized:\n{stdout}"
     );
 
-    // Host contrast: these four fields must differ from the Host baseline
-    // (or at least the run side equals the fixture, which differs from CN host).
-    for key in [
-        "GetUserDefaultGeoName:",
-        "GetUserDefaultLocaleName:",
-        "GetUserDefaultUILanguage:",
-        "GetDynamicTimeZoneInformation:",
-    ] {
-        let host_val = field_after(&host_out, key);
-        let run_val = field_after(&stdout, key);
-        assert_ne!(
-            host_val, run_val,
-            "expected Host vs Profile contrast for {key} (host={host_val})"
-        );
-    }
+    assert!(stdout.contains("EnvBox Runtime Loaded"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -640,6 +622,10 @@ fn run_no_inherit_children_leaves_child_unhooked() {
     let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
     let profile_id = make_profile(&root);
 
+    let host = Command::new(&probe).output().expect("host probe");
+    assert!(host.status.success());
+    let host_out = String::from_utf8_lossy(&host.stdout);
+
     let run = Command::new(env!("CARGO_BIN_EXE_envbox"))
         .env("ENVBOX_CONFIG_ROOT", &root)
         .env("ENVBOX_RUNTIME_DLL", &dll)
@@ -666,9 +652,9 @@ fn run_no_inherit_children_leaves_child_unhooked() {
         !child.contains("EnvBox Runtime Loaded"),
         "child should not be injected when inherit is off:\n{child}"
     );
-    assert_ne!(
+    assert_eq!(
         field_after(child, "GetUserDefaultGeoName:"),
-        "US",
+        field_after(&host_out, "GetUserDefaultGeoName:"),
         "child should keep Host geo when inherit is off:\n{child}"
     );
     let _ = std::fs::remove_dir_all(&root);

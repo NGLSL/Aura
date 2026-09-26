@@ -117,9 +117,10 @@ fn host_probe_fields() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Ticket 12: Host vs US Probe — virtualized fields differ; non-virtualized match.
+/// Ticket 12: Host vs US Probe — Profile fields match the fixture, while
+/// non-virtualized fields match the Host baseline.
 #[test]
-fn acceptance_host_vs_us_probe_contrast() {
+fn acceptance_host_and_us_probe_values() {
     let dll = test_runtime_dll().expect("runtime DLL required");
     let probe = probe_exe().expect("envbox-probe.exe required");
     let root = std::env::temp_dir().join(format!("envbox-acc-{}", Uuid::new_v4()));
@@ -148,17 +149,10 @@ fn acceptance_host_vs_us_probe_contrast() {
         "Pacific Standard Time"
     );
 
-    // Host contrast for virtualized fields (CN host vs US profile).
-    for key in [
-        "GetUserDefaultGeoName:",
-        "GetUserDefaultLocaleName:",
-        "GetUserDefaultUILanguage:",
-        "GetDynamicTimeZoneInformation:",
-    ] {
-        let h = field_after(&host_out, key);
-        let r = field_after(&run_out, key);
-        assert_ne!(h, r, "expected Host vs Profile contrast for {key}");
-    }
+    // A Host can already use US/en-US, so contrast is not a portable
+    // assertion. The Profile literals above and the loaded marker prove the
+    // target received the virtualized view.
+    assert!(run_out.contains("EnvBox Runtime Loaded"));
 
     // Non-virtualized timeline marker stays real (same absolute date line if present).
     if host_out.contains("SystemTimeAsFileTime") {

@@ -53,7 +53,9 @@ Config lives under `%LOCALAPPDATA%\com.aura.envbox\` (or `ENVBOX_CONFIG_ROOT`).
 
 `scripts/build-installer.ps1` builds the Rust workspace, both C++ Runtime DLLs, and the NSIS installer. The version shown in Aura and the version registered by the installer both come from `workspace.package.version` in `Cargo.toml`. When bumping it, update and commit `Cargo.lock` too; an explicit `-Version` value is accepted only when it matches the Cargo version.
 
-For a build in the private GitHub repository, run **Actions → Build Windows installer → Run workflow**. Download the `aura-windows-installer` artifact from the completed run; it contains `aura-setup.exe` and its SHA-256 checksum. The workflow uses a Windows 2022 runner, builds pinned Microsoft Detours for x64 and x86, then runs the same installer script. It does not publish a GitHub Release.
+For a test build in the private GitHub repository, run **Actions → Build Windows installer → Run workflow**. Download the `aura-windows-installer` artifact from the completed run; it contains `aura-setup.exe` and its SHA-256 checksum.
+
+For a release, update `Cargo.toml` and `Cargo.lock`, add `docs/releases/v<version>.md`, then push `main` and wait for `ci.yml` to pass on that exact commit. Create and push an annotated `v<version>` tag on the same commit. `release.yml` checks the tag, version, `main` commit and CI result, builds the complete Windows installer, and publishes a GitHub Release with the installer and checksum. Both workflows build pinned Microsoft Detours for x64 and x86 on a Windows 2022 runner.
 
 ## Instance lifecycle
 
