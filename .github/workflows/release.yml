@@ -182,15 +182,15 @@ jobs:
 
           $notePath = Join-Path $env:GITHUB_WORKSPACE "docs\releases\$env:AURA_RELEASE_TAG.md"
           $note = Get-Content -LiteralPath $notePath -Raw
-          $body = @"
-$note
-
-## Installer
-
-- File: aura-setup.exe
-- Size: $size bytes
-- SHA-256: $hash
-"@
+          $body = @(
+            $note.TrimEnd()
+            ''
+            '## Installer'
+            ''
+            '- File: aura-setup.exe'
+            "- Size: $size bytes"
+            "- SHA-256: $hash"
+          ) -join "`n"
           Set-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'release-body.md') -Value $body -Encoding utf8
           Write-Host "Installer size: $size bytes"
           Write-Host "Installer SHA-256: $hash"

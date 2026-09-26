@@ -78,6 +78,7 @@ jobs:
               throw "Detours $target library missing"
             }
           }
+          "DETOURS_ROOT=$detours" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build workspace binaries
         run: cargo build --workspace --locked
