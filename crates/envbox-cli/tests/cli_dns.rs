@@ -149,11 +149,26 @@ fn run_probe_dnsquery_ex(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_envbox"));
     cmd.env("ENVBOX_CONFIG_ROOT", root)
         .env("ENVBOX_RUNTIME_DLL", dll)
-        .args(["run", "--profile", profile_id, "--audit"])
+        .args(["run", "--profile", profile_id])
         .arg(probe_exe().expect("envbox-probe.exe required"))
         .args(["--resolve-dnsquery-ex", name]);
     apply_dns_port(&mut cmd);
     cmd.output().expect("run probe --resolve-dnsquery-ex")
+}
+
+fn run_probe_dns_system_settings(
+    root: &std::path::Path,
+    dll: &std::path::Path,
+    profile_id: &str,
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_envbox"));
+    cmd.env("ENVBOX_CONFIG_ROOT", root)
+        .env("ENVBOX_RUNTIME_DLL", dll)
+        .args(["run", "--profile", profile_id, "--audit"])
+        .arg(probe_exe().expect("envbox-probe.exe required"))
+        .arg("--dns-system-settings");
+    apply_dns_port(&mut cmd);
+    cmd.output().expect("run probe --dns-system-settings")
 }
 
 // --- fixture DNS server (UDP 127.0.0.1:53) ---
@@ -902,6 +917,28 @@ fn getaddrinfo_referral_fails_open() {
     assert_eq!(
         virtual_value, host_value,
         "NS-only referral must Fail Open to the Host resolver (virtual={virtual_value} host={host_value})"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Chromium reads search/domain/devolution policy from HKLM in addition to
+/// GetAdaptersAddresses.  The Profile currently models DNS servers only, so
+/// VirtualView must hide the host Domain value rather than combine it with the
+/// Profile server list.  The host value is an empty REG_SZ on the acceptance
+/// image; skip this red-capable check on images where the value is absent.
+#[test]
+fn virtual_view_hides_chromium_host_dns_policy() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-dns-policy-test-{}", Uuid::new_v4()));
+    let virtual_id = make_profile(&root, &["127.0.0.1"], true);
+    let virtual_out = run_probe_dns_system_settings(&root, &dll, &virtual_id);
+    assert!(virtual_out.status.success(), "virtual run failed: {virtual_out:?}");
+    let virtual_stdout = String::from_utf8_lossy(&virtual_out.stdout);
+    let virtual_domain = field_after(&virtual_stdout, "Domain:");
+    assert_eq!(
+        virtual_domain, "<missing>",
+        "VirtualView must hide host Chromium DNS Domain policy:\n{virtual_stdout}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

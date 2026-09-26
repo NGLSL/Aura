@@ -11,10 +11,13 @@ use windows::core::{Interface, HSTRING, PWSTR};
 use windows::Globalization::Calendar;
 use windows::Win32::Globalization::{
     GetACP, GetGeoInfoA, GetGeoInfoW, GetLocaleInfoA, GetLocaleInfoEx, GetLocaleInfoW, GetOEMCP,
-    GetProcessPreferredUILanguages, GetSystemDefaultLCID, GetSystemDefaultLocaleName,
-    GetSystemDefaultUILanguage, GetSystemPreferredUILanguages, GetThreadPreferredUILanguages,
+    GetProcessPreferredUILanguages, GetSystemDefaultLCID, GetSystemDefaultLangID,
+    GetSystemDefaultLocaleName, GetSystemDefaultUILanguage, GetSystemPreferredUILanguages,
+    GetThreadLocale, GetThreadPreferredUILanguages,
     GetUserDefaultGeoName, GetUserDefaultLCID, GetUserDefaultLocaleName, GetUserDefaultUILanguage,
-    GetUserGeoID, GetUserPreferredUILanguages, GEO_ISO2, LOCALE_SNAME, MUI_LANGUAGE_NAME,
+    GetUserDefaultLangID, GetUserGeoID, GetUserPreferredUILanguages, MultiByteToWideChar,
+    WideCharToMultiByte, CP_ACP, CP_OEMCP, CP_THREAD_ACP, GEO_ISO2, LOCALE_IDEFAULTANSICODEPAGE,
+    LOCALE_IDEFAULTCODEPAGE, LOCALE_SNAME, MUI_LANGUAGE_NAME, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
     SYSGEOCLASS,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -99,9 +102,49 @@ fn collect_locale() -> Section {
     unsafe {
         // Chromium/ICU also reads these process code pages directly. Keep
         // them visible even though the current Profile does not virtualize
-        // ANSI/OEM conversion semantics.
+        // ANSI/OEM conversion semantics. The Runtime derives the expected
+        // pages from the Profile locale and routes CP_ACP/CP_OEMCP through
+        // those pages, so these fields also expose conversion behavior.
         fields.push(field("GetACP", GetACP().to_string()));
         fields.push(field("GetOEMCP", GetOEMCP().to_string()));
+        fields.push(field("GetThreadLocale", GetThreadLocale().to_string()));
+        fields.push(field("GetUserDefaultLangID", GetUserDefaultLangID().to_string()));
+        fields.push(field(
+            "GetSystemDefaultLangID",
+            GetSystemDefaultLangID().to_string(),
+        ));
+        fields.push(field(
+            "GetLocaleInfoEx_IDEFAULTANSICODEPAGE",
+            locale_info_string(LOCALE_IDEFAULTANSICODEPAGE),
+        ));
+        fields.push(field(
+            "GetLocaleInfoEx_IDEFAULTCODEPAGE",
+            locale_info_string(LOCALE_IDEFAULTCODEPAGE),
+        ));
+        fields.push(field(
+            "WideCharToMultiByte_CP_ACP_e_acute",
+            wide_char_to_code_page(CP_ACP, 'é'),
+        ));
+        fields.push(field(
+            "WideCharToMultiByte_CP_OEMCP_e_acute",
+            wide_char_to_code_page(CP_OEMCP, 'é'),
+        ));
+        fields.push(field(
+            "WideCharToMultiByte_CP_THREAD_ACP_e_acute",
+            wide_char_to_code_page(CP_THREAD_ACP, 'é'),
+        ));
+        fields.push(field(
+            "MultiByteToWideChar_CP_ACP_e9",
+            code_page_to_wide(CP_ACP, &[0xe9]),
+        ));
+        fields.push(field(
+            "MultiByteToWideChar_CP_OEMCP_82",
+            code_page_to_wide(CP_OEMCP, &[0x82]),
+        ));
+        fields.push(field(
+            "MultiByteToWideChar_CP_THREAD_ACP_e9",
+            code_page_to_wide(CP_THREAD_ACP, &[0xe9]),
+        ));
         let mut user = [0u16; LOCALE_NAME_MAX_LENGTH];
         let user_ok = GetUserDefaultLocaleName(&mut user);
         fields.push(field(
@@ -182,6 +225,50 @@ fn collect_locale() -> Section {
         title: SECTION_LOCALE.to_string(),
         fields,
     }
+}
+
+fn locale_info_string(lctype: u32) -> String {
+    unsafe {
+        let mut value = [0u16; 16];
+        let result = GetLocaleInfoEx(windows::core::PCWSTR::null(), lctype, Some(&mut value));
+        if result > 0 {
+            wstr_from_until_nul(&value)
+        } else {
+            "<error>".into()
+        }
+    }
+}
+
+fn wide_char_to_code_page(code_page: u32, character: char) -> String {
+    let mut source_buffer = [0u16; 2];
+    let source = character.encode_utf16(&mut source_buffer);
+    let mut output = [0u8; 8];
+    let written =
+        unsafe { WideCharToMultiByte(code_page, 0, &source, Some(&mut output), None, None) };
+    if written <= 0 {
+        return "<error>".into();
+    }
+    output[..written as usize]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn code_page_to_wide(code_page: u32, bytes: &[u8]) -> String {
+    let mut output = [0u16; 8];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
+            bytes,
+            Some(&mut output),
+        )
+    };
+    if written <= 0 {
+        return "<error>".into();
+    }
+    String::from_utf16_lossy(&output[..written as usize])
 }
 
 fn collect_language() -> Section {

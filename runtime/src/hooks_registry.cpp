@@ -40,6 +40,93 @@ static const wchar_t* kIntlPath = L"HKEY_CURRENT_USER\\Control Panel\\Internatio
 static const wchar_t* kTzPath =
     L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation";
 
+static int PathEqualsOrUnder(const wchar_t* path, const wchar_t* root);
+
+// Chromium's Windows DNS system-settings reader obtains search/devolution
+// policy from these HKLM keys in addition to the adapter DNS addresses.  The
+// Profile model currently contains DNS servers only; it has no search-list,
+// domain, devolution, NRPT, or proxy-policy fields.  In VirtualView, exposing
+// the host values would therefore make Chromium combine a Profile server list
+// with host DNS policy.  Hide only these exact, read-only DNS configuration
+// values/trees so Chromium observes them as unset and uses the Profile DNS
+// view.  Host mode remains completely transparent.
+static const wchar_t* kTcpipPath =
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters";
+static const wchar_t* kTcpip6Path =
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters";
+static const wchar_t* kDnscachePath =
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters";
+static const wchar_t* kPolicyPath =
+    L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient";
+static const wchar_t* kPrimaryDnsSuffixPath =
+    L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\System\\DNSClient";
+static const wchar_t* kNrptPath =
+    L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient\\DnsPolicyConfig";
+static const wchar_t* kControlSetNrptPath =
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters\\DnsPolicyConfig";
+static const wchar_t* kDnsConnectionsPath =
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters\\DnsConnections";
+static const wchar_t* kDnsConnectionsProxiesPath =
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters\\DnsConnectionsProxies";
+
+static int IsVirtualDnsView() {
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  return pfl != nullptr && pfl->dns_mode == 1;
+}
+
+// Return nonzero when a Chromium DNS policy subtree must appear absent in a
+// Profile VirtualView.  These trees contain host-specific NRPT/proxy rules;
+// there is no corresponding Profile field from which to synthesize them.
+static int IsHiddenDnsTree(const wchar_t* path) {
+  if (!IsVirtualDnsView() || path == nullptr) {
+    return 0;
+  }
+  return PathEqualsOrUnder(path, kNrptPath) ||
+         PathEqualsOrUnder(path, kControlSetNrptPath) ||
+         PathEqualsOrUnder(path, kDnsConnectionsPath) ||
+         PathEqualsOrUnder(path, kDnsConnectionsProxiesPath);
+}
+
+static int IsDnsVirtualPath(const wchar_t* path) {
+  if (!IsVirtualDnsView() || path == nullptr) {
+    return 0;
+  }
+  return PathEqualsOrUnder(path, kTcpipPath) ||
+         PathEqualsOrUnder(path, kTcpip6Path) ||
+         PathEqualsOrUnder(path, kDnscachePath) ||
+         PathEqualsOrUnder(path, kPolicyPath) ||
+         PathEqualsOrUnder(path, kPrimaryDnsSuffixPath) ||
+         IsHiddenDnsTree(path);
+}
+
+// Return nonzero when Chromium's host DNS policy value must appear unset in a
+// Profile VirtualView.  Keep this list deliberately narrow: this is a
+// process-scoped DNS view, not a general registry sandbox.
+static int IsHiddenDnsValue(const wchar_t* path, const wchar_t* value_name) {
+  if (!IsVirtualDnsView() || path == nullptr || value_name == nullptr) {
+    return 0;
+  }
+  if (PathEqualsOrUnder(path, kTcpipPath) ||
+      PathEqualsOrUnder(path, kTcpip6Path)) {
+    return _wcsicmp(value_name, L"SearchList") == 0 ||
+           _wcsicmp(value_name, L"Domain") == 0 ||
+           _wcsicmp(value_name, L"UseDomainNameDevolution") == 0 ||
+           _wcsicmp(value_name, L"DomainNameDevolutionLevel") == 0;
+  }
+  if (PathEqualsOrUnder(path, kDnscachePath) ||
+      PathEqualsOrUnder(path, kPolicyPath)) {
+    return _wcsicmp(value_name, L"UseDomainNameDevolution") == 0 ||
+           _wcsicmp(value_name, L"DomainNameDevolutionLevel") == 0 ||
+           _wcsicmp(value_name, L"AppendToMultiLabelName") == 0 ||
+           (PathEqualsOrUnder(path, kPolicyPath) &&
+            _wcsicmp(value_name, L"SearchList") == 0);
+  }
+  if (PathEqualsOrUnder(path, kPrimaryDnsSuffixPath)) {
+    return _wcsicmp(value_name, L"PrimaryDnsSuffix") == 0;
+  }
+  return 0;
+}
+
 struct TrackedKey {
   HKEY handle;
   wchar_t path[260];
@@ -71,7 +158,8 @@ static int IsWhitelisted(const wchar_t* path) {
   if (path == nullptr || path[0] == L'\0') {
     return 0;
   }
-  if (PathEqualsOrUnder(path, kIntlPath) || PathEqualsOrUnder(path, kTzPath)) {
+  if (PathEqualsOrUnder(path, kIntlPath) || PathEqualsOrUnder(path, kTzPath) ||
+      IsDnsVirtualPath(path)) {
     return 1;
   }
   const RuntimeProfile* pfl = EnvBoxProfile();
@@ -176,6 +264,9 @@ enum VirtualResult {
   kVirtualMiss = 0,
   kVirtualOk = 1,
   kVirtualMoreData = 2,
+  // The Profile intentionally has no value for this DNS policy.  Report the
+  // value as absent instead of falling through to the host registry.
+  kVirtualHidden = 3,
 };
 
 // Size-query (lpData==NULL) returns kVirtualOk and required size (Windows
@@ -217,8 +308,22 @@ static VirtualResult VirtualValue(const wchar_t* path, const wchar_t* value_name
                                   LPDWORD lpType, LPBYTE lpData,
                                   LPDWORD lpcbData) {
   const RuntimeProfile* pfl = EnvBoxProfile();
-  if (pfl == nullptr || value_name == nullptr) {
+  if (pfl == nullptr) {
     return kVirtualMiss;
+  }
+
+  // RegGetValue can address a policy value directly without first opening
+  // the hidden subtree. Treat every value there as absent, including its
+  // default value.
+  if (IsHiddenDnsTree(path)) {
+    return kVirtualHidden;
+  }
+  if (value_name == nullptr) {
+    return kVirtualMiss;
+  }
+
+  if (IsHiddenDnsValue(path, value_name)) {
+    return kVirtualHidden;
   }
 
   if (PathEqualsOrUnder(path, kIntlPath)) {
@@ -267,7 +372,17 @@ static LSTATUS VirtualToStatus(VirtualResult v) {
   if (v == kVirtualMoreData) {
     return ERROR_MORE_DATA;
   }
+  if (v == kVirtualHidden) {
+    return ERROR_FILE_NOT_FOUND;
+  }
   return ERROR_SUCCESS;  // unused for miss
+}
+
+static LSTATUS HiddenRegGetValueStatus(DWORD flags, PVOID data, LPDWORD size) {
+  if ((flags & RRF_ZEROONFAILURE) && data != nullptr && size != nullptr) {
+    memset(data, 0, *size);
+  }
+  return ERROR_FILE_NOT_FOUND;
 }
 
 // Registry A APIs use the process ANSI code page for names and REG_SZ data.
@@ -296,6 +411,7 @@ static VirtualResult VirtualValueA(const wchar_t* path, LPCSTR name,
   VirtualResult v = VirtualValue(path, name ? wide_name.c_str() : nullptr,
                                  &type, nullptr, &wide_size);
   if (v == kVirtualMiss) return v;
+  if (v == kVirtualHidden) return v;
   std::vector<BYTE> wide_data(wide_size);
   DWORD actual = wide_size;
   v = VirtualValue(path, name ? wide_name.c_str() : nullptr, &type,
@@ -331,10 +447,16 @@ static int TypeAllowed(DWORD flags, DWORD type) {
 static LSTATUS WINAPI HookRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey,
                                         DWORD ulOptions, REGSAM samDesired,
                                         PHKEY phkResult) {
+  wchar_t path[260];
+  if (phkResult != nullptr && JoinPath(hKey, lpSubKey, path, 260) &&
+      IsHiddenDnsTree(path)) {
+    *phkResult = nullptr;
+    EnvBoxAuditEventW("RegOpenKeyExW", 1, path);
+    return ERROR_FILE_NOT_FOUND;
+  }
   LSTATUS st =
       TrueRegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
   if (st == ERROR_SUCCESS && phkResult != nullptr && *phkResult != nullptr) {
-    wchar_t path[260];
     // Track every open so nested relative opens resolve (Hard #1).
     if (JoinPath(hKey, lpSubKey, path, 260)) {
       TrackKey(*phkResult, path);
@@ -346,11 +468,18 @@ static LSTATUS WINAPI HookRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey,
 static LSTATUS WINAPI HookRegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey,
                                         DWORD ulOptions, REGSAM samDesired,
                                         PHKEY phkResult) {
+  std::wstring subkey;
+  wchar_t path[260];
+  if (phkResult != nullptr && AnsiToWide(lpSubKey, &subkey) &&
+      JoinPath(hKey, lpSubKey ? subkey.c_str() : nullptr, path, 260) &&
+      IsHiddenDnsTree(path)) {
+    *phkResult = nullptr;
+    EnvBoxAuditEventW("RegOpenKeyExA", 1, path);
+    return ERROR_FILE_NOT_FOUND;
+  }
   LSTATUS st =
       TrueRegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult);
   if (st == ERROR_SUCCESS && phkResult != nullptr && *phkResult != nullptr) {
-    std::wstring subkey;
-    wchar_t path[260];
     if (AnsiToWide(lpSubKey, &subkey) &&
         JoinPath(hKey, lpSubKey ? subkey.c_str() : nullptr, path, 260)) {
       TrackKey(*phkResult, path);
@@ -409,6 +538,11 @@ static LSTATUS WINAPI HookRegGetValueW(HKEY hkey, LPCWSTR lpSubKey,
     VirtualResult v =
         VirtualValue(path, lpValue, type_out, (LPBYTE)pvData, pcbData);
     if (v != kVirtualMiss) {
+      if (v == kVirtualHidden) {
+        EnvBoxAuditEventW("RegGetValueW", 1,
+                          lpValue ? lpValue : L"(default)");
+        return HiddenRegGetValueStatus(dwFlags, pvData, pcbData);
+      }
       // Honor RRF_RT_* type mask when the caller set one.
       DWORD want = dwFlags & 0x0000ffff;
       if (want != 0 && want != RRF_RT_ANY) {
@@ -457,6 +591,12 @@ static LSTATUS WINAPI HookRegGetValueA(HKEY hkey, LPCSTR lpSubKey,
                                     pcbData);
     std::wstring name;
     if (v != kVirtualMiss) {
+      if (v == kVirtualHidden) {
+        if (AnsiToWide(lpValue, &name))
+          EnvBoxAuditEventW("RegGetValueA", 1,
+                            lpValue ? name.c_str() : L"(default)");
+        return HiddenRegGetValueStatus(dwFlags, pvData, pcbData);
+      }
       if (pdwType) *pdwType = type;
       LSTATUS st = TypeAllowed(dwFlags, type) ? VirtualToStatus(v)
                                               : ERROR_UNSUPPORTED_TYPE;

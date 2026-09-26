@@ -14,6 +14,7 @@ fn main() -> ExitCode {
     let mut resolve_name: Option<String> = None;
     let mut resolve_dnsquery: Option<String> = None;
     let mut resolve_dnsquery_ex: Option<String> = None;
+    let dns_system_settings = args.iter().any(|a| a == "--dns-system-settings");
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--resolve" && i + 1 < args.len() {
@@ -48,6 +49,11 @@ fn main() -> ExitCode {
     if let Some(name) = resolve_dnsquery_ex {
         print_runtime_marker();
         print_resolve_dnsquery_ex(&name);
+        return ExitCode::SUCCESS;
+    }
+    if dns_system_settings {
+        print_runtime_marker();
+        print_dns_system_settings();
         return ExitCode::SUCCESS;
     }
 
@@ -160,6 +166,236 @@ fn print_resolve_dnsquery_ex(name: &str) {
         Err(status) => println!("<error {status}>"),
     }
     println!();
+}
+
+/// Probe the registry values Chromium reads while building its Windows DNS
+/// system-settings snapshot.  This is intentionally a read-only probe: it
+/// makes the Profile-vs-Host behavior visible without changing host policy.
+fn print_dns_system_settings() {
+    println!("=== DNS SYSTEM SETTINGS ===");
+    let entries = [
+        (
+            r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+            &["SearchList", "Domain", "UseDomainNameDevolution", "DomainNameDevolutionLevel"][..],
+        ),
+        (
+            r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+            &["SearchList", "Domain", "UseDomainNameDevolution", "DomainNameDevolutionLevel"][..],
+        ),
+        (
+            r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
+            &["UseDomainNameDevolution", "DomainNameDevolutionLevel"][..],
+        ),
+        (
+            r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient",
+            &[
+                "SearchList",
+                "UseDomainNameDevolution",
+                "DomainNameDevolutionLevel",
+                "AppendToMultiLabelName",
+            ][..],
+        ),
+        (
+            r"SOFTWARE\Policies\Microsoft\System\DNSClient",
+            &["PrimaryDnsSuffix"][..],
+        ),
+        (
+            r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\DnsPolicyConfig",
+            &[][..],
+        ),
+        (
+            r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig",
+            &[][..],
+        ),
+        (
+            r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsConnections",
+            &[][..],
+        ),
+        (
+            r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsConnectionsProxies",
+            &[][..],
+        ),
+    ];
+    for (key, values) in entries {
+        println!("Key:");
+        println!("HKLM\\{key}");
+        if values.is_empty() {
+            println!("Open:");
+            println!("{}", dns_registry_key_state(key));
+            println!();
+            continue;
+        }
+        for value in values {
+            println!("{value}:");
+            println!("{}", dns_registry_value(key, value));
+        }
+        println!();
+    }
+}
+
+#[cfg(windows)]
+fn dns_registry_key_state(path: &str) -> String {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+
+    type Hkey = *mut c_void;
+    const HKEY_LOCAL_MACHINE: Hkey = -2147483646isize as Hkey;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hkey: Hkey,
+            subkey: *const u16,
+            options: u32,
+            sam_desired: u32,
+            result: *mut Hkey,
+        ) -> i32;
+        fn RegCloseKey(hkey: Hkey) -> i32;
+    }
+
+    let wide: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut key: Hkey = std::ptr::null_mut();
+        let status = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            wide.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        );
+        if status == ERROR_SUCCESS {
+            let _ = RegCloseKey(key);
+            "present".to_string()
+        } else if status == ERROR_FILE_NOT_FOUND {
+            "<missing>".to_string()
+        } else {
+            format!("<error {status}>")
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn dns_registry_key_state(_path: &str) -> String {
+    "<unsupported>".to_string()
+}
+
+#[cfg(windows)]
+fn dns_registry_value(path: &str, name: &str) -> String {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+
+    type Hkey = *mut c_void;
+    const HKEY_LOCAL_MACHINE: Hkey = -2147483646isize as Hkey;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const REG_DWORD: u32 = 4;
+    const REG_MULTI_SZ: u32 = 7;
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hkey: Hkey,
+            subkey: *const u16,
+            options: u32,
+            sam_desired: u32,
+            result: *mut Hkey,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: Hkey,
+            value_name: *const u16,
+            reserved: *mut u32,
+            value_type: *mut u32,
+            data: *mut u8,
+            data_size: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hkey: Hkey) -> i32;
+    }
+
+    let key_wide: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let name_wide: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut key: Hkey = std::ptr::null_mut();
+        let status = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            key_wide.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        );
+        if status != ERROR_SUCCESS {
+            return if status == ERROR_FILE_NOT_FOUND {
+                "<missing>".to_string()
+            } else {
+                format!("<error {status}>")
+            };
+        }
+        let mut value_type = 0;
+        let mut size = 0;
+        let status = RegQueryValueExW(
+            key,
+            name_wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut size,
+        );
+        if status != ERROR_SUCCESS {
+            let _ = RegCloseKey(key);
+            return if status == ERROR_FILE_NOT_FOUND {
+                "<missing>".to_string()
+            } else {
+                format!("<error {status}>")
+            };
+        }
+        let mut data = vec![0u8; size as usize];
+        let status = RegQueryValueExW(
+            key,
+            name_wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            data.as_mut_ptr(),
+            &mut size,
+        );
+        let _ = RegCloseKey(key);
+        if status != ERROR_SUCCESS {
+            return format!("<error {status}>");
+        }
+        if matches!(value_type, REG_SZ | REG_EXPAND_SZ | REG_MULTI_SZ) {
+            let words = data[..size as usize]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .take_while(|word| *word != 0)
+                .collect::<Vec<_>>();
+            let value = String::from_utf16_lossy(&words);
+            return if value.is_empty() {
+                "<empty>".to_string()
+            } else {
+                value
+            };
+        }
+        if value_type == REG_DWORD && data.len() >= 4 {
+            return format!("{}", u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+        }
+        format!("<type {value_type}, {size} bytes>")
+    }
+}
+
+#[cfg(not(windows))]
+fn dns_registry_value(_path: &str, _name: &str) -> String {
+    "<unsupported>".to_string()
 }
 
 /// Minimal DnsQuery_A via dnsapi (A records only). status 0 on success.

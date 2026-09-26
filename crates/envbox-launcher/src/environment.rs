@@ -18,6 +18,20 @@ pub fn build_environment_block(
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = host.clone();
     if let Some(profile) = profile {
+        // POSIX locale variables outrank LANG. When a Profile explicitly
+        // chooses LANG, inherited category overrides would silently defeat
+        // that choice. Explicit Profile LC_* / LANGUAGE values are reinserted
+        // below and retain their intended precedence.
+        if profile
+            .environment
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("LANG"))
+        {
+            env.retain(|key, _| {
+                !key.eq_ignore_ascii_case("LANGUAGE")
+                    && !key.to_ascii_uppercase().starts_with("LC_")
+            });
+        }
         for (key, value) in &profile.environment {
             // Drop any host key that matches case-insensitively before insert.
             let lower = key.to_ascii_lowercase();
@@ -246,6 +260,34 @@ mod tests {
             .collect();
         assert_eq!(langs.len(), 1);
         assert_eq!(langs[0].1, "en_US.UTF-8");
+    }
+
+    #[test]
+    fn profile_lang_does_not_leave_inherited_locale_overrides() {
+        let host = HashMap::from([
+            ("LANG".into(), "zh_CN.UTF-8".into()),
+            ("LC_ALL".into(), "C.UTF-8".into()),
+            ("LC_MESSAGES".into(), "zh_CN.UTF-8".into()),
+            ("LANGUAGE".into(), "zh_CN".into()),
+            ("PATH".into(), r"C:\Windows".into()),
+        ]);
+        let mut p = profile();
+        p.environment
+            .insert("LC_TIME".into(), "en_US.UTF-8".into());
+        let merged =
+            build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        assert_eq!(merged.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
+        assert_eq!(
+            merged.get("LC_TIME").map(String::as_str),
+            Some("en_US.UTF-8")
+        );
+        for key in ["LC_ALL", "LC_MESSAGES", "LANGUAGE"] {
+            assert!(!merged.contains_key(key), "inherited {key} overrides LANG");
+        }
+        assert!(merged.contains_key("PATH"));
+
+        let plain = build_environment_block(&host, None, Uuid::nil(), Uuid::nil(), true, false);
+        assert_eq!(plain.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
     }
 
     #[test]

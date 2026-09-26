@@ -135,4 +135,34 @@ mod tests {
             "missing ANSI registry query contract field"
         );
     }
+
+    #[test]
+    fn locale_snapshot_contains_code_page_consistency_fields() {
+        let snapshot = collect_host_snapshot();
+        let locale = snapshot
+            .sections
+            .iter()
+            .find(|section| section.title == SECTION_LOCALE)
+            .expect("LOCALE section");
+        for expected in [
+            "GetACP",
+            "GetOEMCP",
+            "GetThreadLocale",
+            "GetUserDefaultLangID",
+            "GetSystemDefaultLangID",
+            "GetLocaleInfoEx_IDEFAULTANSICODEPAGE",
+            "GetLocaleInfoEx_IDEFAULTCODEPAGE",
+            "WideCharToMultiByte_CP_ACP_e_acute",
+            "WideCharToMultiByte_CP_OEMCP_e_acute",
+            "WideCharToMultiByte_CP_THREAD_ACP_e_acute",
+            "MultiByteToWideChar_CP_ACP_e9",
+            "MultiByteToWideChar_CP_OEMCP_82",
+            "MultiByteToWideChar_CP_THREAD_ACP_e9",
+        ] {
+            assert!(
+                locale.fields.iter().any(|field| field.name == expected),
+                "missing code-page field {expected}"
+            );
+        }
+    }
 }

@@ -531,6 +531,9 @@ fn run_probe_spawn_child_inherits_profile() {
     let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
         .env("ENVBOX_CONFIG_ROOT", &root)
         .env("ENVBOX_RUNTIME_DLL", &dll)
+        .env("LC_ALL", "C.UTF-8")
+        .env("LC_MESSAGES", "zh_CN.UTF-8")
+        .env("LANGUAGE", "zh_CN")
         .args(["run", "--profile", &profile_id])
         .arg(&probe)
         .arg("--spawn-child")
@@ -572,6 +575,20 @@ fn run_probe_spawn_child_inherits_profile() {
     }
     assert_eq!(field_after(child, "GetUserDefaultGeoName:"), "US");
     assert_eq!(field_after(child, "GetUserDefaultLocaleName:"), "en-US");
+    for (index, view) in [parent, child].into_iter().enumerate() {
+        assert_eq!(field_after(view, "LANG:"), "en_US.UTF-8");
+        assert_eq!(
+            field_after(view, "LC_ALL:"),
+            "<unset>",
+            "inherited LC_ALL overrides profile LANG in view {index}"
+        );
+        for key in ["LC_MESSAGES", "LANGUAGE"] {
+            assert!(
+                !view.contains(&format!("\n{key}:\n")),
+                "inherited {key} overrides profile LANG in view {index}"
+            );
+        }
+    }
     assert_eq!(
         field_after(child, "GetDynamicTimeZoneInformation:"),
         "Pacific Standard Time"
@@ -704,6 +721,45 @@ fn run_powershell_child_sees_profile_when_available() {
         "powershell child not injected:\n{stdout}"
     );
     assert_eq!(field_after(&stdout, "GetUserDefaultGeoName:"), "US");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_lang_removes_caller_locale_overrides_from_child() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let root = std::env::temp_dir().join(format!("envbox-run-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root);
+    let ps = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .expect("SystemRoot")
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let script = concat!(
+        "$env:LC_ALL='C.UTF-8'; $env:LC_MESSAGES='zh_CN.UTF-8'; ",
+        "$env:LANGUAGE='zh_CN'; ",
+        "& cmd.exe /d /c 'if defined LC_ALL (echo BAD-LC_ALL) else (echo CLEAN-LC_ALL)'; ",
+        "& cmd.exe /d /c 'if defined LC_MESSAGES (echo BAD-LC_MESSAGES) else (echo CLEAN-LC_MESSAGES)'; ",
+        "& cmd.exe /d /c 'if defined LANGUAGE (echo BAD-LANGUAGE) else (echo CLEAN-LANGUAGE)'"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_envbox"))
+        .env("ENVBOX_CONFIG_ROOT", &root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile_id])
+        .arg(ps)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .expect("run powershell child locale probe");
+    assert!(out.status.success(), "child launch failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for key in ["LC_ALL", "LC_MESSAGES", "LANGUAGE"] {
+        assert!(
+            stdout.contains(&format!("CLEAN-{key}")),
+            "child inherited {key}: {stdout}"
+        );
+        assert!(!stdout.contains(&format!("BAD-{key}")));
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
