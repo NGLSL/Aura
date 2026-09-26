@@ -182,6 +182,12 @@ HANDLE ConnectPipe(DWORD timeout_ms) {
       SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
       return h;
     }
+    // Short connections are optional notices or Win32 descendants with a
+    // complete ENVBOX_* fallback. Once their Broker has exited, waiting for
+    // a nonexistent pipe would delay every child CreateProcess call.
+    if (timeout_ms <= 100 && GetLastError() == ERROR_FILE_NOT_FOUND) {
+      return INVALID_HANDLE_VALUE;
+    }
     if (RemainingMs(deadline) == 0) {
       char msg[128];
       _snprintf_s(msg, sizeof(msg), _TRUNCATE,
