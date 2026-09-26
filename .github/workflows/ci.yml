@@ -27,6 +27,8 @@ jobs:
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Check out Microsoft Detours
         uses: actions/checkout@v4

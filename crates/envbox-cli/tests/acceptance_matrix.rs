@@ -225,6 +225,7 @@ fn acceptance_tool_matrix_short_commands() {
 
 /// Ticket 12: real Node CLI agent (`my-claude` / Claude Code CLI) under Profile.
 #[test]
+#[ignore = "requires the locally installed my-claude CLI"]
 fn acceptance_node_cli_agent_scenario() {
     let root = std::env::temp_dir().join(format!("envbox-acc-{}", Uuid::new_v4()));
     let profile_id = make_us_profile(&root);
