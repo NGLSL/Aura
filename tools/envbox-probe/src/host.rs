@@ -100,11 +100,9 @@ fn collect_geo() -> Section {
 fn collect_locale() -> Section {
     let mut fields = Vec::new();
     unsafe {
-        // Chromium/ICU also reads these process code pages directly. Keep
-        // them visible even though the current Profile does not virtualize
-        // ANSI/OEM conversion semantics. The Runtime derives the expected
-        // pages from the Profile locale and routes CP_ACP/CP_OEMCP through
-        // those pages, so these fields also expose conversion behavior.
+        // Chromium/ICU also reads these process code pages directly. The
+        // Runtime derives them from the Profile locale and routes CP_ACP /
+        // CP_OEMCP conversions through the same pages.
         fields.push(field("GetACP", GetACP().to_string()));
         fields.push(field("GetOEMCP", GetOEMCP().to_string()));
         fields.push(field("GetThreadLocale", GetThreadLocale().to_string()));
