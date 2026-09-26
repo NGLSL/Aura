@@ -5,7 +5,7 @@
 //! WindowsApps exe path.
 
 use envbox_core::{LaunchTarget, PackageIdentity};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Honest capability / packaging metadata for a discovered package app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +71,257 @@ pub fn extract_aumid(path: &str) -> Option<String> {
     None
 }
 
+/// `/` and `\` are both used in hand-edited paths; package roots always match on `\`.
+fn normalize_seps(path: &str) -> String {
+    path.trim().trim_matches('"').replace('/', "\\")
+}
+
+/// True when the path points at a packaged image under a WindowsApps root
+/// (install dir or App Execution Alias). Those must never be CreateProcess'd.
+pub fn is_windows_apps_path(path: &str) -> bool {
+    let p = normalize_seps(path);
+    if p.is_empty() {
+        return false;
+    }
+    let lower = p.to_ascii_lowercase();
+    lower.contains("\\windowsapps\\") || lower.starts_with("windowsapps\\")
+}
+
+/// Package full-name folder under any `*\WindowsApps\` install root.
+fn package_full_name_from_windows_apps_path(path: &str) -> Option<String> {
+    let p = normalize_seps(path);
+    let lower = p.to_ascii_lowercase();
+    let idx = lower.find("\\windowsapps\\")?;
+    let rest = &p[idx + "\\windowsapps\\".len()..];
+    let folder = rest.split('\\').next()?.trim();
+    if folder.is_empty() {
+        return None;
+    }
+    // App Execution Alias (`...\Microsoft\WindowsApps\ChatGPT.exe`) is not a
+    // package folder; require the `Name_Ver_Arch__Hash` shape.
+    if folder.contains('.') && folder.matches('_').count() >= 2 {
+        return Some(folder.to_string());
+    }
+    None
+}
+
+/// `Name_PublisherHash` (no path / AUMID separators).
+fn looks_like_package_family(s: &str) -> bool {
+    if s.is_empty() || s.contains(['\\', '/', '!', ' ']) {
+        return false;
+    }
+    match s.rsplit_once('_') {
+        Some((name, hash)) => {
+            !name.is_empty() && hash.len() >= 10 && hash.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+fn identity_from_family(family: &str) -> PackageIdentity {
+    let full = find_package_full_name(family).unwrap_or_else(|| family.to_string());
+    let app_id = find_install_dir_by_family(family)
+        .and_then(|d| application_id_from_manifest_dir(&d))
+        .unwrap_or_else(|| "App".into());
+    PackageIdentity {
+        aumid: format!("{family}!{app_id}"),
+        package_full_name: full,
+        package_family_name: family.to_string(),
+    }
+}
+
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\` App Execution Alias / family alias
+/// stubs — never CreateProcess; map to the package identity instead.
+fn resolve_execution_alias_identity(path: &str) -> Option<PackageIdentity> {
+    let p = normalize_seps(path);
+    let lower = p.to_ascii_lowercase();
+    let marker = "\\microsoft\\windowsapps\\";
+    let idx = lower.find(marker)?;
+    let rest = &p[idx + marker.len()..];
+    let parts: Vec<&str> = rest.split('\\').filter(|s| !s.is_empty()).collect();
+    match parts.as_slice() {
+        // ...\Microsoft\WindowsApps\<PackageFamilyName>\<file>.exe
+        [family, _file] if looks_like_package_family(family) => {
+            return Some(identity_from_family(family));
+        }
+        // ...\Microsoft\WindowsApps\<file>.exe
+        [file] => {
+            let stem = Path::new(file)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())?;
+            return find_identity_by_exe_stem(&stem);
+        }
+        _ => None,
+    }
+}
+
+/// Match an alias stem (`ChatGPT`) to a package Application Executable.
+fn find_identity_by_exe_stem(stem: &str) -> Option<PackageIdentity> {
+    let stem_l = stem.to_ascii_lowercase();
+    if stem_l.is_empty() {
+        return None;
+    }
+    for root in windows_apps_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(dir.join("AppxManifest.xml")) else {
+                continue;
+            };
+            let full_name = entry.file_name().to_string_lossy().to_string();
+            let family = package_family_from_full_name(&full_name);
+            if let Some(exe) = extract_attr_near(&text, "Application", "Executable") {
+                let exe_stem = Path::new(&exe)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if exe_stem == stem_l {
+                    let app_id = application_id_from_manifest_dir(&dir).unwrap_or_else(|| "App".into());
+                    return Some(PackageIdentity {
+                        aumid: format!("{family}!{app_id}"),
+                        package_full_name: full_name,
+                        package_family_name: family,
+                    });
+                }
+            }
+        }
+    }
+    // User alias folder family dirs without manifests are covered by
+    // `resolve_execution_alias_identity` (`...\Microsoft\WindowsApps\<Family>\*.exe`).
+    None
+}
+
+fn package_family_from_full_name(full_name: &str) -> String {
+    // Foo_Bar_1.0.0.0_x64__hash → Foo_Bar_hash (approx; exact identity comes
+    // from the package graph when available).
+    let parts: Vec<&str> = full_name.split('_').collect();
+    if parts.len() >= 5 {
+        format!("{}_{}", parts[0], parts[parts.len() - 1])
+    } else {
+        full_name.to_string()
+    }
+}
+
+fn windows_apps_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        roots.push(PathBuf::from(pf).join("WindowsApps"));
+    }
+    // Side-loaded / other-volume installs (e.g. D:\WindowsApps).
+    for drive in b'C'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\WindowsApps", drive as char));
+        if root.is_dir() && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn find_package_full_name(family: &str) -> Option<String> {
+    let family_l = family.to_ascii_lowercase();
+    let (name, hash) = family.rsplit_once('_').unwrap_or((family, ""));
+    let name_l = name.to_ascii_lowercase();
+    let suffix = format!("__{}", hash.to_ascii_lowercase());
+    for root in windows_apps_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let folder_l = file_name.to_ascii_lowercase();
+            if folder_l == family_l
+                || (folder_l.starts_with(&format!("{name_l}_")) && folder_l.ends_with(&suffix))
+            {
+                return Some(file_name);
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort Application Id from `AppxManifest.xml` next to a package folder.
+fn application_id_from_manifest_dir(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("AppxManifest.xml")).ok()?;
+    // Prefer Application Id="..." on a real <Application> element.
+    let lower = text.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(hit) = lower[search..].find("<application") {
+        let start = search + hit;
+        let after = start + "<application".len();
+        let boundary = lower.as_bytes().get(after).copied().unwrap_or(b'x');
+        if matches!(boundary, b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r') {
+            if let Some(gt_off) = lower[after..].find('>') {
+                let gt = after + gt_off;
+                let attrs = &text[start..gt];
+                let key = "id=\"";
+                if let Some(pos) = attrs.to_ascii_lowercase().find(key) {
+                    let rest = &attrs[pos + key.len()..];
+                    if let Some(end) = rest.find('"') {
+                        let id = rest[..end].trim();
+                        if !id.is_empty() {
+                            return Some(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        search = after;
+    }
+    None
+}
+
+fn find_install_dir_by_family(family: &str) -> Option<PathBuf> {
+    let full = find_package_full_name(family)?;
+    for root in windows_apps_roots() {
+        let dir = root.join(&full);
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// Any user-supplied target → Packaged identity when it is a Store/MSIX app.
+/// Handles bare AUMID, shell:AppsFolder, package family, WindowsApps paths,
+/// and `%LOCALAPPDATA%\Microsoft\WindowsApps` execution aliases.
+fn resolve_packaged_identity(path: &str) -> Option<PackageIdentity> {
+    let p = normalize_seps(path);
+    if let Some(aumid) = extract_aumid(&p) {
+        return Some(resolve_package_identity(&aumid));
+    }
+    // WindowsApps install path → package full name from folder segment.
+    if let Some(full) = package_full_name_from_windows_apps_path(&p) {
+        let family = package_family_from_full_name(&full);
+        // Install dir is the folder that contains the path.
+        let lower = p.to_ascii_lowercase();
+        if let Some(idx) = lower.find("\\windowsapps\\") {
+            let dir = PathBuf::from(&p[..idx + "\\windowsapps\\".len() + full.len()]);
+            let app_id = application_id_from_manifest_dir(&dir).unwrap_or_else(|| "App".into());
+            return Some(PackageIdentity {
+                aumid: format!("{family}!{app_id}"),
+                package_full_name: full,
+                package_family_name: family,
+            });
+        }
+    }
+    // App Execution Alias / family alias under the user WindowsApps folder.
+    if let Some(identity) = resolve_execution_alias_identity(&p) {
+        return Some(identity);
+    }
+    // Bare PackageFamilyName (`Name_PublisherHash`) — default to the primary
+    // Application Id. Require the publisher-hash shape so ordinary commands
+    // like `my_tool` are not misread as packages.
+    if looks_like_package_family(&p) {
+        return Some(identity_from_family(&p));
+    }
+    None
+}
+
 /// Resolve package identity for an AUMID (WindowsApps folder scan; fail-open).
 pub fn resolve_package_identity(aumid: &str) -> PackageIdentity {
     let family = parse_aumid(aumid.trim())
@@ -84,30 +335,9 @@ pub fn resolve_package_identity(aumid: &str) -> PackageIdentity {
     }
 }
 
-fn find_package_full_name(family: &str) -> Option<String> {
-    let program_files = std::env::var("ProgramFiles").ok()?;
-    let root = PathBuf::from(program_files).join("WindowsApps");
-    let entries = std::fs::read_dir(root).ok()?;
-    let family_l = family.to_ascii_lowercase();
-    let (name, hash) = family.rsplit_once('_').unwrap_or((family, ""));
-    let name_l = name.to_ascii_lowercase();
-    let suffix = format!("__{}", hash.to_ascii_lowercase());
-    for entry in entries.flatten() {
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let folder_l = file_name.to_ascii_lowercase();
-        if folder_l == family_l
-            || (folder_l.starts_with(&format!("{name_l}_")) && folder_l.ends_with(&suffix))
-        {
-            return Some(file_name);
-        }
-    }
-    None
-}
-
-/// User path → LaunchTarget. AUMID forms become `Packaged` (never CreateProcess).
+/// User path → LaunchTarget. Packaged forms become `Packaged` (never CreateProcess).
 pub fn launch_target_from_user_path(path: &str) -> LaunchTarget {
-    if let Some(aumid) = extract_aumid(path) {
-        let identity = resolve_package_identity(&aumid);
+    if let Some(identity) = resolve_packaged_identity(path) {
         return LaunchTarget::Packaged {
             aumid: identity.aumid,
             package_full_name: identity.package_full_name,
@@ -115,17 +345,28 @@ pub fn launch_target_from_user_path(path: &str) -> LaunchTarget {
         };
     }
     LaunchTarget::Executable {
-        path: PathBuf::from(path.trim()),
+        path: PathBuf::from(normalize_seps(path)),
     }
 }
 
-/// Re-map legacy Executable entries that actually hold an AUMID path.
+/// Re-map legacy Executable/Command entries that actually hold an AUMID /
+/// WindowsApps / execution-alias target.
 pub fn normalize_launch_target(launch: &LaunchTarget) -> LaunchTarget {
     match launch {
         LaunchTarget::Executable { path } => {
             let s = path.to_string_lossy();
-            if extract_aumid(&s).is_some() {
+            if resolve_packaged_identity(&s).is_some() {
                 launch_target_from_user_path(&s)
+            } else {
+                launch.clone()
+            }
+        }
+        LaunchTarget::Command { command } => {
+            if extract_aumid(command).is_some()
+                || is_windows_apps_path(command)
+                || resolve_packaged_identity(command).is_some()
+            {
+                launch_target_from_user_path(command)
             } else {
                 launch.clone()
             }
@@ -182,17 +423,6 @@ fn windows_discover_packages() -> Vec<PackageAppInfo> {
         }
     }
     out
-}
-
-fn package_family_from_full_name(full_name: &str) -> String {
-    // Foo_Bar_1.0.0.0_x64__hash → Foo_Bar_hash (approx; exact identity comes
-    // from the package graph when available).
-    let parts: Vec<&str> = full_name.split('_').collect();
-    if parts.len() >= 5 {
-        format!("{}_{}", parts[0], parts[parts.len() - 1])
-    } else {
-        full_name.to_string()
-    }
 }
 
 fn parse_manifest_app(text: &str, full_name: &str, family: &str) -> Option<PackageAppInfo> {
@@ -367,6 +597,103 @@ mod tests {
             LaunchTarget::Packaged { aumid, .. } => {
                 assert_eq!(aumid, "OpenAi.Codex_2p2nqsd0c76g0!App")
             }
+            other => panic!("expected Packaged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_apps_exe_path_becomes_packaged() {
+        assert!(is_windows_apps_path(
+            r"D:\WindowsApps\OpenAI.Codex_26.917.9434.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+        ));
+        let t = launch_target_from_user_path(
+            r"D:\WindowsApps\OpenAI.Codex_26.917.9434.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        );
+        match t {
+            LaunchTarget::Packaged {
+                aumid,
+                package_full_name,
+                package_family_name,
+            } => {
+                assert_eq!(aumid, "OpenAI.Codex_2p2nqsd0c76g0!App");
+                assert_eq!(
+                    package_full_name,
+                    "OpenAI.Codex_26.917.9434.0_x64__2p2nqsd0c76g0"
+                );
+                assert_eq!(package_family_name, "OpenAI.Codex_2p2nqsd0c76g0");
+            }
+            other => panic!("expected Packaged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_apps_legacy_executable_normalizes_to_packaged() {
+        let legacy = LaunchTarget::Executable {
+            path: r"D:\WindowsApps\OpenAI.Codex_26.917.9434.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+                .into(),
+        };
+        match normalize_launch_target(&legacy) {
+            LaunchTarget::Packaged { aumid, .. } => {
+                assert_eq!(aumid, "OpenAI.Codex_2p2nqsd0c76g0!App")
+            }
+            other => panic!("expected Packaged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_commands_are_not_packaged() {
+        assert!(!is_windows_apps_path("cmd"));
+        assert!(!is_windows_apps_path(r"C:\Program Files\Foo\foo.exe"));
+        match launch_target_from_user_path("my_helper") {
+            LaunchTarget::Executable { .. } => {}
+            other => panic!("expected Executable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_slash_windows_apps_path_is_detected() {
+        assert!(is_windows_apps_path(
+            "D:/WindowsApps/OpenAI.Codex_26.917.9434.0_x64__2p2nqsd0c76g0/app/ChatGPT.exe"
+        ));
+        match launch_target_from_user_path(
+            "D:/WindowsApps/OpenAI.Codex_26.917.9434.0_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
+        ) {
+            LaunchTarget::Packaged { aumid, .. } => {
+                assert_eq!(aumid, "OpenAI.Codex_2p2nqsd0c76g0!App");
+            }
+            other => panic!("expected Packaged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_aumid_normalizes_to_packaged() {
+        let legacy = LaunchTarget::Command {
+            command: "OpenAI.Codex_2p2nqsd0c76g0!App".into(),
+        };
+        match normalize_launch_target(&legacy) {
+            LaunchTarget::Packaged { aumid, .. } => {
+                assert_eq!(aumid, "OpenAI.Codex_2p2nqsd0c76g0!App")
+            }
+            other => panic!("expected Packaged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn family_alias_dir_under_user_windows_apps_resolves() {
+        // ...\Microsoft\WindowsApps\<PackageFamilyName>\<file>.exe
+        let alias = r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps\OpenAI.Codex_2p2nqsd0c76g0\codex-core-command-runner.exe";
+        match resolve_execution_alias_identity(alias) {
+            Some(id) => {
+                assert_eq!(id.package_family_name, "OpenAI.Codex_2p2nqsd0c76g0");
+                assert!(id.aumid.starts_with("OpenAI.Codex_2p2nqsd0c76g0!"));
+            }
+            None => panic!("expected family alias identity"),
+        }
+        match launch_target_from_user_path(alias) {
+            LaunchTarget::Packaged {
+                package_family_name,
+                ..
+            } => assert_eq!(package_family_name, "OpenAI.Codex_2p2nqsd0c76g0"),
             other => panic!("expected Packaged, got {other:?}"),
         }
     }

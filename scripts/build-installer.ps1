@@ -17,22 +17,28 @@ if (-not $SkipBuild) {
     & cargo build --release --manifest-path (Join-Path $root "Cargo.toml")
     if ($LASTEXITCODE -ne 0) { throw "cargo release build failed" }
 
-    # Runtime DLLs (CMake/MSVC). build.ps1 also rebuilds the workspace — SkipBuild
-    # callers already have binaries staged from a prior run.
+    # Runtime DLLs (CMake/MSVC) must match the release binaries — never ship
+    # a stale artifacts\envbox-runtime*.dll beside a new envbox-app.exe.
     $buildPs1 = Join-Path $PSScriptRoot "build.ps1"
     if (Test-Path -LiteralPath $buildPs1) {
         Write-Host "== scripts/build.ps1 -Release -X86 (runtime DLLs) =="
         & $buildPs1 -Release -X86
-        if ($LASTEXITCODE -ne 0) { Write-Warning "build.ps1 exited $LASTEXITCODE (continuing with existing DLLs)" }
+        if ($LASTEXITCODE -ne 0) { throw "runtime DLL build failed ($LASTEXITCODE)" }
     }
+} else {
+    Write-Host "SkipBuild: reusing existing binaries (ensure runtime DLLs are current)"
 }
 
-# Stage every binary the .nsi File list expects, preferring release then artifacts.
+# Stage every binary the .nsi File list expects.
+# Primary app/CLI/broker MUST come from target\release — never fall back to
+# debug (debug can lack the packaged-launch guards and ship a stale build).
 $rel = Join-Path $root "target\release"
-$bins = @(
+$releaseOnly = @(
     "envbox-app.exe",
     "envbox.exe",
-    "envbox-broker.exe",
+    "envbox-broker.exe"
+)
+$bins = $releaseOnly + @(
     "envbox-probe.exe",
     "envbox-browser-probe.exe",
     "envbox-suspended-helper.exe",
@@ -40,11 +46,18 @@ $bins = @(
     "envbox-runtime32.dll"
 )
 foreach ($name in $bins) {
-    $src = $null
-    foreach ($cand in @((Join-Path $rel $name), (Join-Path $artifacts $name), (Join-Path (Join-Path $root "target\debug") $name))) {
-        if (Test-Path -LiteralPath $cand) { $src = $cand; break }
+    if ($releaseOnly -contains $name) {
+        $src = Join-Path $rel $name
+        if (-not (Test-Path -LiteralPath $src)) {
+            throw "missing release binary (do not stage debug): $src"
+        }
+    } else {
+        $src = $null
+        foreach ($cand in @((Join-Path $rel $name), (Join-Path $artifacts $name), (Join-Path (Join-Path $root "target\debug") $name))) {
+            if (Test-Path -LiteralPath $cand) { $src = $cand; break }
+        }
+        if (-not $src) { throw "missing binary for installer: $name" }
     }
-    if (-not $src) { throw "missing binary for installer: $name" }
     Copy-Item -LiteralPath $src -Destination (Join-Path $artifacts $name) -Force
     Write-Host "  staged $name"
 }

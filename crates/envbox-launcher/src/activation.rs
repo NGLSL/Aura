@@ -83,6 +83,13 @@ impl ActivationBackend for Win32ActivationBackend {
     ) -> Result<ActivatedTarget, ActivateError> {
         let (resolved, user_args) = match target {
             LaunchTarget::Executable { path } => {
+                let s = path.to_string_lossy();
+                if crate::package_discovery::is_windows_apps_path(&s) {
+                    return Err(ActivateError::UnsupportedTarget(format!(
+                        "refusing CreateProcess of WindowsApps path (would drop package identity): {s}; \
+                         use AUMID / LaunchTarget::Packaged"
+                    )));
+                }
                 if !path.is_file() {
                     return Err(ActivateError::Resolve(path.display().to_string()));
                 }
@@ -96,6 +103,14 @@ impl ActivationBackend for Win32ActivationBackend {
                 )
             }
             LaunchTarget::Command { command } => {
+                if crate::package_discovery::is_windows_apps_path(command)
+                    || crate::package_discovery::extract_aumid(command).is_some()
+                {
+                    return Err(ActivateError::UnsupportedTarget(format!(
+                        "refusing CreateProcess of packaged target {command:?}; \
+                         use AUMID / LaunchTarget::Packaged"
+                    )));
+                }
                 let path_env = req
                     .environment
                     .iter()

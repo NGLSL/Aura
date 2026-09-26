@@ -40,8 +40,8 @@ pub use launcher::{
     LaunchError, LaunchRequest, LaunchedProcess,
 };
 pub use package_discovery::{
-    discover_packages, extract_aumid, launch_target_from_user_path, normalize_launch_target,
-    parse_aumid, resolve_package_identity, PackageAppInfo,
+    discover_packages, extract_aumid, is_windows_apps_path, launch_target_from_user_path,
+    normalize_launch_target, parse_aumid, resolve_package_identity, PackageAppInfo,
 };
 pub use process_tracker::{ProcessTracker, TrackMode};
 pub use session::{belongs, register_child, start_session, SessionError, SessionHandle, SessionStartRequest};

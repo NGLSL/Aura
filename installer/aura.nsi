@@ -68,13 +68,13 @@ SectionEnd
 
 Section "开始菜单快捷方式" SEC_START
   CreateDirectory "$SMPROGRAMS\Aura"
-  CreateShortcut "$SMPROGRAMS\Aura\Aura.lnk" "$INSTDIR\envbox-app.exe" "" "$INSTDIR\envbox-app.exe" 0
-  CreateShortcut "$SMPROGRAMS\Aura\EnvBox CLI.lnk" "$INSTDIR\envbox.exe" "" "$INSTDIR\envbox.exe" 0
-  CreateShortcut "$SMPROGRAMS\Aura\Environment Probe.lnk" "$INSTDIR\envbox-probe.exe" "" "$INSTDIR\envbox-probe.exe" 0
+  CreateShortCut "$SMPROGRAMS\Aura\Aura.lnk" "$INSTDIR\envbox-app.exe" "" "$INSTDIR\envbox-app.exe" 0 SW_SHOWNORMAL "" "Aura"
+  CreateShortCut "$SMPROGRAMS\Aura\EnvBox CLI.lnk" "$INSTDIR\envbox.exe" "" "$INSTDIR\envbox.exe" 0 SW_SHOWNORMAL "" "EnvBox CLI"
+  CreateShortCut "$SMPROGRAMS\Aura\Environment Probe.lnk" "$INSTDIR\envbox-probe.exe" "" "$INSTDIR\envbox-probe.exe" 0 SW_SHOWNORMAL "" "Environment Probe"
 SectionEnd
 
 Section "桌面快捷方式" SEC_DESKTOP
-  CreateShortcut "$DESKTOP\Aura.lnk" "$INSTDIR\envbox-app.exe" "" "$INSTDIR\envbox-app.exe" 0
+  CreateShortCut "$DESKTOP\Aura.lnk" "$INSTDIR\envbox-app.exe" "" "$INSTDIR\envbox-app.exe" 0 SW_SHOWNORMAL "" "Aura"
 SectionEnd
 
 Section "Uninstall"

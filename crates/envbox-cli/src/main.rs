@@ -341,11 +341,20 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // AUMID / WindowsApps paths must activate as Packaged (never CreateProcess).
+    let launch = if envbox_launcher::extract_aumid(command).is_some()
+        || envbox_launcher::is_windows_apps_path(command)
+    {
+        envbox_launcher::launch_target_from_user_path(command)
+    } else {
+        envbox_core::LaunchTarget::Command {
+            command: command.clone(),
+        }
+    };
+
     let request = envbox_launcher::SessionStartRequest {
         application_id: Uuid::nil(),
-        launch: envbox_core::LaunchTarget::Command {
-            command: command.clone(),
-        },
+        launch,
         arguments: command_args.to_vec(),
         working_directory,
         profile: Some(profile.clone()),
@@ -606,7 +615,7 @@ fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         i += 1;
     }
 
-    let launch = if !executable.is_empty() {
+    let launch_raw = if !executable.is_empty() {
         LaunchTarget::Executable {
             path: PathBuf::from(executable),
         }
@@ -616,6 +625,8 @@ fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         eprintln!("error: provide --command or --executable");
         return ExitCode::FAILURE;
     };
+    // AUMID / WindowsApps / execution-alias must become Packaged.
+    let launch = envbox_launcher::normalize_launch_target(&launch_raw);
 
     let default_profile_id = match profile_raw.parse::<Uuid>() {
         Ok(id) => id,

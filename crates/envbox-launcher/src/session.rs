@@ -111,6 +111,13 @@ pub struct SessionStartRequest {
 /// Host (no profile): plain create, no Runtime injection.
 /// Profile: activate → attach → resume (Win32) or activate → attach (Packaged).
 pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionError> {
+    // Safety net: every caller (GUI/CLI/tests) gets Packaged for AUMID /
+    // WindowsApps targets. Never CreateProcess a WindowsApps exe (package
+    // identity would be dropped — ChatGPT: "该进程没有程序包标识符").
+    let req = SessionStartRequest {
+        launch: crate::package_discovery::normalize_launch_target(&req.launch),
+        ..req
+    };
     let instance_id = Uuid::new_v4();
     let profile_id = req.profile.as_ref().map(|p| p.id).unwrap_or_default();
     let host_mode = req.profile.is_none();
@@ -515,6 +522,31 @@ mod tests {
         envbox_core::NetworkGuardCapability::browser_policy_only()
             .check_policy(p.browser.webrtc)
             .expect("proxy_only must not require network guard");
+    }
+
+    #[test]
+    fn windows_apps_executable_is_normalized_to_packaged() {
+        let req = SessionStartRequest {
+            application_id: Uuid::nil(),
+            launch: LaunchTarget::Executable {
+                path: r"C:\Program Files\WindowsApps\OpenAI.Codex_26.924.1866.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+                    .into(),
+            },
+            arguments: vec![],
+            working_directory: None,
+            profile: None,
+            inherit_children: true,
+            audit: false,
+        };
+        // start_session normalizes before any create; we only assert the mapping
+        // here (full start needs a live package).
+        let launch = crate::package_discovery::normalize_launch_target(&req.launch);
+        match launch {
+            LaunchTarget::Packaged { aumid, .. } => {
+                assert_eq!(aumid, "OpenAI.Codex_2p2nqsd0c76g0!App")
+            }
+            other => panic!("expected Packaged, got {other:?}"),
+        }
     }
 
     /// Machine smoke: Full Trust packaged ChatGPT via AUMID (issue 36 / GUI run).
