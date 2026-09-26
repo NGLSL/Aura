@@ -103,8 +103,10 @@ impl LaunchedProcess {
     pub fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
         #[cfg(windows)]
         {
-            use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
             use std::os::windows::process::ExitStatusExt;
+            use windows::Win32::System::Threading::{
+                GetExitCodeProcess, WaitForSingleObject, INFINITE,
+            };
 
             unsafe {
                 // WAIT_FAILED = 0xFFFFFFFF
@@ -141,7 +143,10 @@ impl LaunchedProcess {
 
 /// Join argv for display/edit (CommandLineToArgvW-safe; inverse of `parse_args`).
 pub fn format_args(args: &[String]) -> String {
-    args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
+    args.iter()
+        .map(|a| quote_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Split a Windows argument string into argv (CommandLineToArgvW rules).
@@ -228,8 +233,90 @@ pub fn quote_arg(arg: &str) -> String {
     out
 }
 
+/// `cmd.exe /c` parses its command tail itself rather than using the C runtime
+/// argument rules. Escaping the tail with `quote_arg` inserts literal
+/// backslashes before quotes and breaks paths such as `C:\Program Files`.
+fn create_process_command_line(program: &Path, args: &[String]) -> String {
+    let mut line = quote_arg(&program.display().to_string());
+    let cmd_tail = program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"))
+        && args.len() >= 2
+        && args[..args.len() - 1]
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case("/c"));
+    for (index, arg) in args.iter().enumerate() {
+        line.push(' ');
+        if cmd_tail && index == args.len() - 1 {
+            line.push_str(arg);
+        } else {
+            line.push_str(&quote_arg(arg));
+        }
+    }
+    line
+}
+
 fn host_environment() -> HashMap<String, String> {
     std::env::vars().collect()
+}
+
+/// Resolve the working directory used for a root launch.
+///
+/// Command targets represent CLI tools. When the caller has not supplied a
+/// directory, start those tools from the Windows user's profile directory so
+/// that a launcher/UI process's current directory does not leak into the CLI.
+/// Executable targets retain the Win32 `CreateProcess` inherited-current-
+/// directory behavior, and an explicit directory always wins.
+pub fn effective_working_directory(
+    target: &LaunchTarget,
+    requested: Option<&Path>,
+) -> Result<Option<PathBuf>, LaunchError> {
+    if let Some(path) = requested {
+        return Ok(Some(path.to_path_buf()));
+    }
+
+    if !matches!(target, LaunchTarget::Command { .. }) {
+        return Ok(None);
+    }
+
+    user_profile_directory().map(Some).ok_or_else(|| {
+        LaunchError::create_process_msg("failed to resolve Windows user profile directory")
+    })
+}
+
+/// Obtain the real user's profile directory without consulting the launching
+/// process's current directory. On Windows this is the shell known folder,
+/// which also avoids taking a potentially virtualized `USERPROFILE` value
+/// from an already injected parent process.
+fn user_profile_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
+
+        let path =
+            unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, Default::default(), None) }.ok()?;
+        let raw_path = path.0;
+        let path_len = unsafe { windows::Win32::Globalization::lstrlenW(PCWSTR(raw_path)) };
+        if path_len <= 0 {
+            unsafe { CoTaskMemFree(Some(raw_path.cast())) };
+            return None;
+        }
+        let path = unsafe { std::slice::from_raw_parts(raw_path, path_len as usize) };
+        let path = std::ffi::OsString::from_wide(path);
+        unsafe { CoTaskMemFree(Some(raw_path.cast())) };
+        Some(PathBuf::from(path))
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
 }
 
 pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
@@ -240,7 +327,10 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
             .map_err(|e| LaunchError::InvalidProfile(e.to_string()))?;
     }
 
-    if let Some(dir) = &req.working_directory {
+    let working_directory =
+        effective_working_directory(&req.launch, req.working_directory.as_deref())?;
+
+    if let Some(dir) = &working_directory {
         if !dir.is_dir() {
             return Err(LaunchError::WorkingDirectoryMissing(dir.clone()));
         }
@@ -310,21 +400,22 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
         spawn_plain(
             &program,
             &args,
-            req.working_directory.as_deref(),
+            working_directory.as_deref(),
             &encode_environment_block(&env),
+            false,
         )?
     } else {
         // Startup Fail Policy: runtime DLL must exist, match target arch, and
         // inject; never launch un-hooked (tickets 04 / 30 / 31).
         let source_runtime = crate::injection::resolve_runtime_dll_for_target(&program)?;
-        let runtime_dll =
-            crate::injection::stage_runtime_dll(&source_runtime, req.instance_id)?;
+        let runtime_dll = crate::injection::stage_runtime_dll(&source_runtime, req.instance_id)?;
         spawn_suspended(
             &program,
             &args,
-            req.working_directory.as_deref(),
+            working_directory.as_deref(),
             &encode_environment_block(&env),
             &runtime_dll,
+            false,
         )?
     };
 
@@ -401,9 +492,8 @@ pub fn spawn_for_activation(
     req: &crate::activation::ActivationRequest,
 ) -> Result<ActivationSpawn, crate::activation::ActivateError> {
     let env_block = encode_environment_block(&req.environment);
-    let (program, mut args) = spawn_args(resolved, user_args, &req.environment).map_err(|e| {
-        crate::activation::ActivateError::Resolve(e.to_string())
-    })?;
+    let (program, mut args) = spawn_args(resolved, user_args, &req.environment)
+        .map_err(|e| crate::activation::ActivateError::Resolve(e.to_string()))?;
 
     // Browser Policy on the activation seam (Win32 root).
     if let Some(policy) = req.webrtc_policy {
@@ -425,6 +515,7 @@ pub fn spawn_for_activation(
             req.working_directory.as_deref(),
             &env_block,
             dll,
+            req.create_new_console,
         )
         .map_err(map_launch_to_activate)?;
         Ok(ActivationSpawn {
@@ -441,6 +532,7 @@ pub fn spawn_for_activation(
             &args,
             req.working_directory.as_deref(),
             &env_block,
+            req.create_new_console,
         )
         .map_err(map_launch_to_activate)?;
         Ok(ActivationSpawn {
@@ -456,9 +548,7 @@ pub fn spawn_for_activation(
 
 /// Open a process handle by PID (packaged attach path).
 #[cfg(windows)]
-pub fn open_process_handle(
-    pid: u32,
-) -> Result<win::SafeHandle, crate::activation::ActivateError> {
+pub fn open_process_handle(pid: u32) -> Result<win::SafeHandle, crate::activation::ActivateError> {
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
     };
@@ -468,17 +558,13 @@ pub fn open_process_handle(
             false,
             pid,
         )
-        .map_err(|_| {
-            crate::activation::ActivateError::OpenProcess(win::last_error())
-        })?;
+        .map_err(|_| crate::activation::ActivateError::OpenProcess(win::last_error()))?;
         Ok(win::SafeHandle(handle))
     }
 }
 
 #[cfg(not(windows))]
-pub fn open_process_handle(
-    pid: u32,
-) -> Result<(), crate::activation::ActivateError> {
+pub fn open_process_handle(pid: u32) -> Result<(), crate::activation::ActivateError> {
     let _ = pid;
     Err(crate::activation::ActivateError::UnsupportedTarget(
         "open_process_handle is Windows-only".into(),
@@ -541,19 +627,17 @@ fn spawn_suspended(
     working_directory: Option<&Path>,
     env_block: &[u16],
     runtime_dll: &Path,
+    create_new_console: bool,
 ) -> Result<SpawnedChild, LaunchError> {
-    use windows::Win32::System::Threading::{
-        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
-    };
     use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_CONSOLE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
 
     let dll_ansi = crate::injection::dll_path_ansi(runtime_dll)?;
 
-    let mut cmdline = quote_arg(&program.display().to_string());
-    for a in args {
-        cmdline.push(' ');
-        cmdline.push_str(&quote_arg(a));
-    }
+    let cmdline = create_process_command_line(program, args);
     let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
 
     let mut cwd_w: Option<Vec<u16>> = working_directory.map(|d| {
@@ -576,7 +660,14 @@ fn spawn_suspended(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            (CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT).0,
+            (CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                | if create_new_console {
+                    CREATE_NEW_CONSOLE
+                } else {
+                    Default::default()
+                })
+            .0,
             env_block.as_ptr() as *const _,
             cwd_w
                 .as_mut()
@@ -605,17 +696,15 @@ fn spawn_plain(
     args: &[String],
     working_directory: Option<&Path>,
     env_block: &[u16],
+    create_new_console: bool,
 ) -> Result<SpawnedChild, LaunchError> {
-    use windows::Win32::System::Threading::{
-        CreateProcessW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
-    };
     use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::System::Threading::{
+        CreateProcessW, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
 
-    let mut cmdline = quote_arg(&program.display().to_string());
-    for a in args {
-        cmdline.push(' ');
-        cmdline.push_str(&quote_arg(a));
-    }
+    let cmdline = create_process_command_line(program, args);
     let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
     let mut cwd_w: Option<Vec<u16>> = working_directory.map(|d| {
         d.display()
@@ -634,7 +723,12 @@ fn spawn_plain(
             None,
             None,
             false,
-            CREATE_UNICODE_ENVIRONMENT,
+            CREATE_UNICODE_ENVIRONMENT
+                | if create_new_console {
+                    CREATE_NEW_CONSOLE
+                } else {
+                    Default::default()
+                },
             Some(env_block.as_ptr() as *const _),
             cwd_w
                 .as_mut()
@@ -663,6 +757,7 @@ fn spawn_plain(
     _args: &[String],
     _working_directory: Option<&Path>,
     _env_block: &[u16],
+    _create_new_console: bool,
 ) -> Result<SpawnedChild, LaunchError> {
     Err(LaunchError::create_process_msg(
         "CreateProcessW is Windows-only",
@@ -695,6 +790,7 @@ fn spawn_suspended(
     working_directory: Option<&Path>,
     _env_block: &[u16],
     _runtime_dll: &Path,
+    _create_new_console: bool,
 ) -> Result<SpawnedChild, LaunchError> {
     let _ = (program, args, working_directory);
     Err(LaunchError::create_process_msg(
@@ -741,20 +837,25 @@ fn spawn_args(
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("ComSpec"))
             .map(|(_, v)| v.clone())
-            .or_else(|| std::env::var("ComSpec").ok().or_else(|| std::env::var("COMSPEC").ok()))
+            .or_else(|| {
+                std::env::var("ComSpec")
+                    .ok()
+                    .or_else(|| std::env::var("COMSPEC").ok())
+            })
             .ok_or(LaunchError::ComSpecMissing)?;
         let payload = resolved
             .comspec_payload
             .clone()
             .unwrap_or_else(|| resolved.program.display().to_string());
+        validate_cmd_value(&payload)?;
+        for arg in user_args {
+            validate_cmd_value(arg)?;
+        }
         // cmd /s /c "…" — outer quotes required when payload or args have spaces.
         let mut line = String::new();
-        let needs_outer = payload.contains(' ')
-            || payload.contains('\t')
-            || payload.contains('"')
-            || user_args.iter().any(|a| {
-                a.contains(' ') || a.contains('\t') || a.contains('"')
-            });
+        let needs_outer = std::iter::once(payload.as_str())
+            .chain(user_args.iter().map(String::as_str))
+            .any(cmd_token_needs_quotes);
         if needs_outer {
             line.push('"');
         }
@@ -766,7 +867,10 @@ fn spawn_args(
         if needs_outer {
             line.push('"');
         }
-        Ok((PathBuf::from(comspec), vec!["/d".into(), "/s".into(), "/c".into(), line]))
+        Ok((
+            PathBuf::from(comspec),
+            vec!["/d".into(), "/v:off".into(), "/s".into(), "/c".into(), line],
+        ))
     } else {
         Ok((resolved.program.clone(), user_args.to_vec()))
     }
@@ -777,16 +881,50 @@ fn quote_cmd_token(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".into();
     }
-    if s.contains(' ') || s.contains('\t') || s.contains('"') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
+    if !cmd_token_needs_quotes(s) {
         s.to_string()
+    } else {
+        let trailing_slashes = s.chars().rev().take_while(|ch| *ch == '\\').count();
+        format!("\"{}{}\"", s, "\\".repeat(trailing_slashes))
     }
+}
+
+fn cmd_token_needs_quotes(s: &str) -> bool {
+    s.is_empty()
+        || s.chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '&' | '|' | '<' | '>' | '^' | '(' | ')'))
+}
+
+fn validate_cmd_value(value: &str) -> Result<(), LaunchError> {
+    if value
+        .chars()
+        .any(|ch| matches!(ch, '%' | '!' | '"' | '\r' | '\n' | '\0'))
+    {
+        return Err(LaunchError::create_process_msg(
+            "cmd.exe cannot preserve arguments containing %, !, quotes, or control characters; use an .exe target",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmd_command_tail_keeps_its_own_quotes() {
+        let args = [
+            "/d".into(),
+            "/s".into(),
+            "/c".into(),
+            r#"""C:\Program Files\nodejs\node.exe" check.js""#.into(),
+        ];
+        let line = create_process_command_line(Path::new("cmd.exe"), &args);
+        assert_eq!(
+            line,
+            r#"cmd.exe /d /s /c ""C:\Program Files\nodejs\node.exe" check.js""#
+        );
+    }
 
     #[test]
     fn quote_arg_plain() {
@@ -838,6 +976,11 @@ mod tests {
     #[test]
     fn quote_cmd_token_spaces() {
         assert_eq!(quote_cmd_token(r"C:\a b\x.cmd"), r#""C:\a b\x.cmd""#);
+        assert_eq!(
+            quote_cmd_token("C:\\dir with space\\"),
+            "\"C:\\dir with space\\\\\""
+        );
+        assert_eq!(quote_cmd_token("safe&ver"), "\"safe&ver\"");
     }
 
     #[test]
@@ -851,10 +994,112 @@ mod tests {
         let (prog, args) = spawn_args(&resolved, &["a b".into()], &env).unwrap();
         assert!(prog.ends_with("cmd.exe"));
         assert_eq!(args[0], "/d");
-        assert_eq!(args[2], "/c");
-        let line = &args[3];
+        assert_eq!(args[3], "/c");
+        let line = &args[4];
         assert!(line.starts_with('"') && line.ends_with('"'));
         assert!(line.contains(r#"C:\Program Files\app\run.cmd"#));
         assert!(line.contains("\"a b\""));
+    }
+
+    #[test]
+    fn comspec_rejects_expanding_arguments() {
+        let resolved = ResolvedCommand {
+            program: PathBuf::from(r"C:\app\run.cmd"),
+            via_comspec: true,
+            comspec_payload: None,
+        };
+        let env = HashMap::from([("ComSpec".into(), r"C:\Windows\System32\cmd.exe".into())]);
+        assert!(spawn_args(&resolved, &["%PATH%".into()], &env).is_err());
+        assert!(spawn_args(&resolved, &["a!b".into()], &env).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "starts a real cmd.exe process"]
+    fn comspec_metacharacters_reach_batch_as_one_argument() {
+        let base = std::env::temp_dir().join(format!("envbox-batch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let script = base.join("read-arg.cmd");
+        let output = base.join("arg.txt");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\n>\"{}\" echo %1\r\n", output.display()),
+        )
+        .unwrap();
+        let resolved = classify_exe(&script).unwrap();
+        let environment = host_environment();
+        let block = encode_environment_block(&environment);
+        for argument in ["safe&ver", "safe|ver", "safe>ver", "safe^ver", "safe(ver)"] {
+            let (program, args) = spawn_args(&resolved, &[argument.into()], &environment).unwrap();
+            let child = spawn_plain(&program, &args, None, &block, false).unwrap();
+            let wait = unsafe {
+                windows::Win32::System::Threading::WaitForSingleObject(child.process.0, 5_000)
+            };
+            assert_eq!(wait.0, 0, "batch did not exit for {argument:?}");
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap().trim(),
+                format!("\"{argument}\""),
+                "batch changed argument {argument:?}"
+            );
+            std::fs::remove_file(&output).unwrap();
+        }
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn explicit_working_directory_wins_for_commands() {
+        let explicit = Path::new(r"C:\work\project");
+        let selected = effective_working_directory(
+            &LaunchTarget::Command {
+                command: "my-cli".into(),
+            },
+            Some(explicit),
+        )
+        .unwrap();
+        assert_eq!(selected.as_deref(), Some(explicit));
+    }
+
+    #[test]
+    fn executable_without_working_directory_keeps_inherited_semantics() {
+        let selected = effective_working_directory(
+            &LaunchTarget::Executable {
+                path: PathBuf::from(r"C:\Program Files\my-gui.exe"),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn command_without_working_directory_uses_user_profile_not_launcher_directory() {
+        let selected = effective_working_directory(
+            &LaunchTarget::Command {
+                command: "my-cli".into(),
+            },
+            None,
+        )
+        .unwrap()
+        .expect("user profile directory should be available");
+        let launcher_directory = std::env::current_exe()
+            .expect("test executable path")
+            .parent()
+            .expect("test executable directory")
+            .to_path_buf();
+        assert_ne!(selected, launcher_directory);
+
+        #[cfg(windows)]
+        assert_eq!(
+            selected,
+            user_profile_directory().expect("known user profile directory")
+        );
+
+        #[cfg(not(windows))]
+        assert_eq!(
+            selected,
+            PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+        );
     }
 }

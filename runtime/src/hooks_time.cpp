@@ -10,6 +10,7 @@
 
 static DWORD(WINAPI* TrueGetDynamicTimeZoneInformation)(
     PDYNAMIC_TIME_ZONE_INFORMATION) = GetDynamicTimeZoneInformation;
+static VOID(WINAPI* TrueGetLocalTime)(LPSYSTEMTIME) = GetLocalTime;
 static DWORD(WINAPI* TrueGetTimeZoneInformation)(LPTIME_ZONE_INFORMATION) =
     GetTimeZoneInformation;
 static BOOL(WINAPI* TrueGetTimeZoneInformationForYear)(
@@ -105,6 +106,26 @@ static DWORD WINAPI HookGetDynamicTimeZoneInformation(
   }
   EnvBoxAuditEvent("GetDynamicTimeZoneInformation", 0, nullptr);
   return TrueGetDynamicTimeZoneInformation(p);
+}
+
+static VOID WINAPI HookGetLocalTime(LPSYSTEMTIME local_time) {
+  // Keep the real UTC timeline; only the default local wall clock uses Profile
+  // rules. A null output pointer retains the original API behavior.
+  const DWORD saved_error = GetLastError();
+  DYNAMIC_TIME_ZONE_INFORMATION zone = {};
+  if (local_time != nullptr && FillProfileDynamic(&zone)) {
+    SYSTEMTIME utc = {};
+    SYSTEMTIME converted = {};
+    GetSystemTime(&utc);
+    if (TrueSystemTimeToTzSpecificLocalTimeEx(&zone, &utc, &converted)) {
+      *local_time = converted;
+      EnvBoxAuditEventW("GetLocalTime", 1, zone.TimeZoneKeyName);
+      SetLastError(saved_error);
+      return;
+    }
+  }
+  EnvBoxAuditEvent("GetLocalTime", 0, nullptr);
+  TrueGetLocalTime(local_time);
 }
 
 static DWORD WINAPI HookGetTimeZoneInformation(
@@ -223,6 +244,7 @@ static BOOL WINAPI HookTzSpecificLocalTimeToSystemTimeEx(
 
 int EnvBoxInstallTimeHooks() {
   int ok = 0;
+  ok += EnvBoxAttach(&TrueGetLocalTime, HookGetLocalTime);
   ok += EnvBoxAttach(&TrueGetDynamicTimeZoneInformation,
                      HookGetDynamicTimeZoneInformation);
   ok += EnvBoxAttach(&TrueGetTimeZoneInformation, HookGetTimeZoneInformation);

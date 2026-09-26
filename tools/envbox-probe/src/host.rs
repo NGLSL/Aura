@@ -7,25 +7,27 @@ use crate::{
 };
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use windows::core::{Interface, HSTRING, PWSTR};
+use windows::Globalization::Calendar;
 use windows::Win32::Globalization::{
-    GetLocaleInfoEx, GetLocaleInfoW, GetSystemDefaultLCID, GetSystemDefaultLocaleName,
-    GetSystemDefaultUILanguage, GetProcessPreferredUILanguages,
-    GetSystemPreferredUILanguages, GetThreadPreferredUILanguages,
-    GetUserDefaultGeoName, GetUserDefaultLCID, GetUserDefaultLocaleName,
-    GetUserDefaultUILanguage, GetUserGeoID, GetUserPreferredUILanguages,
-    LOCALE_SNAME, MUI_LANGUAGE_NAME, SYSGEOCLASS,
+    GetACP, GetGeoInfoA, GetGeoInfoW, GetLocaleInfoA, GetLocaleInfoEx, GetLocaleInfoW, GetOEMCP,
+    GetProcessPreferredUILanguages, GetSystemDefaultLCID, GetSystemDefaultLocaleName,
+    GetSystemDefaultUILanguage, GetSystemPreferredUILanguages, GetThreadPreferredUILanguages,
+    GetUserDefaultGeoName, GetUserDefaultLCID, GetUserDefaultLocaleName, GetUserDefaultUILanguage,
+    GetUserGeoID, GetUserPreferredUILanguages, GEO_ISO2, LOCALE_SNAME, MUI_LANGUAGE_NAME,
+    SYSGEOCLASS,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GetNetworkParams, GET_ADAPTERS_ADDRESSES_FLAGS,
 };
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
 use windows::Win32::System::Time::{
-    DYNAMIC_TIME_ZONE_INFORMATION, GetDynamicTimeZoneInformation,
-    GetTimeZoneInformation, GetTimeZoneInformationForYear,
-    SystemTimeToTzSpecificLocalTime, SystemTimeToTzSpecificLocalTimeEx,
-    TIME_ZONE_INFORMATION, TzSpecificLocalTimeToSystemTime,
-    TzSpecificLocalTimeToSystemTimeEx,
+    GetDynamicTimeZoneInformation, GetTimeZoneInformation, GetTimeZoneInformationForYear,
+    SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime, SystemTimeToTzSpecificLocalTimeEx,
+    TzSpecificLocalTimeToSystemTime, TzSpecificLocalTimeToSystemTimeEx,
+    DYNAMIC_TIME_ZONE_INFORMATION, TIME_ZONE_INFORMATION,
 };
-use windows::core::PWSTR;
+use windows::Win32::System::WinRT::RoActivateInstance;
 
 const LOCALE_NAME_MAX_LENGTH: usize = 85;
 
@@ -65,6 +67,26 @@ fn collect_geo() -> Section {
         ));
         let geo_id = GetUserGeoID(SYSGEOCLASS(16)); // GEOCLASS_NATION
         fields.push(field("GetUserGeoID", geo_id.to_string()));
+        let mut iso2_w = [0u16; 8];
+        let iso2_w_len = GetGeoInfoW(geo_id, GEO_ISO2, Some(&mut iso2_w), 0);
+        fields.push(field(
+            "GetGeoInfoW_ISO2",
+            if iso2_w_len > 0 {
+                wstr_from_until_nul(&iso2_w)
+            } else {
+                "<error>".into()
+            },
+        ));
+        let mut iso2_a = [0u8; 8];
+        let iso2_a_len = GetGeoInfoA(geo_id, GEO_ISO2, Some(&mut iso2_a), 0);
+        fields.push(field(
+            "GetGeoInfoA_ISO2",
+            if iso2_a_len > 0 {
+                astr_from_until_nul(&iso2_a)
+            } else {
+                "<error>".into()
+            },
+        ));
     }
     Section {
         title: SECTION_GEO.to_string(),
@@ -75,6 +97,11 @@ fn collect_geo() -> Section {
 fn collect_locale() -> Section {
     let mut fields = Vec::new();
     unsafe {
+        // Chromium/ICU also reads these process code pages directly. Keep
+        // them visible even though the current Profile does not virtualize
+        // ANSI/OEM conversion semantics.
+        fields.push(field("GetACP", GetACP().to_string()));
+        fields.push(field("GetOEMCP", GetOEMCP().to_string()));
         let mut user = [0u16; LOCALE_NAME_MAX_LENGTH];
         let user_ok = GetUserDefaultLocaleName(&mut user);
         fields.push(field(
@@ -127,6 +154,29 @@ fn collect_locale() -> Section {
                 "<error>".into()
             },
         ));
+
+        let mut sname_a = [0u8; 85];
+        let sname_a_ok = GetLocaleInfoA(lcid, LOCALE_SNAME, Some(&mut sname_a));
+        fields.push(field(
+            "GetLocaleInfoA_SNAME",
+            if sname_a_ok > 0 {
+                astr_from_until_nul(&sname_a)
+            } else {
+                "<error>".into()
+            },
+        ));
+
+        // Query the default alias directly; the explicit LCID above can hide a missing A hook.
+        let mut default_sname_a = [0u8; 85];
+        let default_sname_a_ok = GetLocaleInfoA(0x0400, LOCALE_SNAME, Some(&mut default_sname_a));
+        fields.push(field(
+            "GetLocaleInfoA_USER_DEFAULT_SNAME",
+            if default_sname_a_ok > 0 {
+                astr_from_until_nul(&default_sname_a)
+            } else {
+                "<error>".into()
+            },
+        ));
     }
     Section {
         title: SECTION_LOCALE.to_string(),
@@ -138,31 +188,40 @@ fn collect_language() -> Section {
     let mut fields = Vec::new();
     unsafe {
         let user_ui = GetUserDefaultUILanguage();
-        fields.push(field(
-            "GetUserDefaultUILanguage",
-            format!("{user_ui:#06x}"),
-        ));
+        fields.push(field("GetUserDefaultUILanguage", format!("{user_ui:#06x}")));
         let sys_ui = GetSystemDefaultUILanguage();
         fields.push(field(
             "GetSystemDefaultUILanguage",
             format!("{sys_ui:#06x}"),
         ));
 
-        push_preferred_ui(&mut fields, "GetUserPreferredUILanguages", |count, buf, size| {
-            GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
-        });
-        push_preferred_ui(&mut fields, "GetSystemPreferredUILanguages", |count, buf, size| {
-            GetSystemPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
-        });
-        push_preferred_ui(&mut fields, "GetThreadPreferredUILanguages", |count, buf, size| {
-            GetThreadPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
-        });
-        push_preferred_ui(&mut fields, "GetProcessPreferredUILanguages", |count, buf, size| {
-            GetProcessPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size)
-        });
-        push_preferred_ui(&mut fields, "GetUserPreferredUILanguages_ID", |count, buf, size| {
-            GetUserPreferredUILanguages(0x4, count, buf, size) // MUI_LANGUAGE_ID
-        });
+        push_preferred_ui(
+            &mut fields,
+            "GetUserPreferredUILanguages",
+            |count, buf, size| GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size),
+        );
+        push_preferred_ui(
+            &mut fields,
+            "GetSystemPreferredUILanguages",
+            |count, buf, size| GetSystemPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size),
+        );
+        push_preferred_ui(
+            &mut fields,
+            "GetThreadPreferredUILanguages",
+            |count, buf, size| GetThreadPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size),
+        );
+        push_preferred_ui(
+            &mut fields,
+            "GetProcessPreferredUILanguages",
+            |count, buf, size| GetProcessPreferredUILanguages(MUI_LANGUAGE_NAME, count, buf, size),
+        );
+        push_preferred_ui(
+            &mut fields,
+            "GetUserPreferredUILanguages_ID",
+            |count, buf, size| {
+                GetUserPreferredUILanguages(0x4, count, buf, size) // MUI_LANGUAGE_ID
+            },
+        );
     }
     Section {
         title: SECTION_LANGUAGE.to_string(),
@@ -200,9 +259,75 @@ fn format_system_time(t: &windows::Win32::Foundation::SYSTEMTIME) -> String {
     )
 }
 
+fn local_times_match_within_two_seconds(
+    a: &windows::Win32::Foundation::SYSTEMTIME,
+    b: &windows::Win32::Foundation::SYSTEMTIME,
+) -> Option<bool> {
+    let mut a_filetime = windows::Win32::Foundation::FILETIME::default();
+    let mut b_filetime = windows::Win32::Foundation::FILETIME::default();
+    unsafe {
+        SystemTimeToFileTime(a, &mut a_filetime).ok()?;
+        SystemTimeToFileTime(b, &mut b_filetime).ok()?;
+    }
+    let ticks = |ft: windows::Win32::Foundation::FILETIME| {
+        (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+    };
+    Some(ticks(a_filetime).abs_diff(ticks(b_filetime)) <= 2 * 10_000_000)
+}
+
 fn collect_timezone() -> Section {
     let mut fields = Vec::new();
+    fields.push(field(
+        "WinRT_Calendar_GetTimeZone",
+        match Calendar::new().and_then(|calendar| calendar.GetTimeZone()) {
+            Ok(timezone) => timezone.to_string(),
+            Err(error) => format!("<error {:#010x}>", error.code().0 as u32),
+        },
+    ));
+    fields.push(field(
+        "WinRT_Calendar_ChangedTimeZone",
+        match Calendar::new().and_then(|calendar| {
+            calendar.ChangeTimeZone(&HSTRING::from("Europe/London"))?;
+            calendar.GetTimeZone()
+        }) {
+            Ok(timezone) => timezone.to_string(),
+            Err(error) => format!("<error {:#010x}>", error.code().0 as u32),
+        },
+    ));
+    fields.push(field(
+        "WinRT_RoActivateInstance_GetTimeZone",
+        match unsafe { RoActivateInstance(&HSTRING::from("Windows.Globalization.Calendar")) }
+            .and_then(|instance| instance.cast::<Calendar>())
+            .and_then(|calendar| calendar.GetTimeZone())
+        {
+            Ok(timezone) => timezone.to_string(),
+            Err(error) => format!("<error {:#010x}>", error.code().0 as u32),
+        },
+    ));
     unsafe {
+        // Sample UTC and local time together so the two local-time paths can be compared.
+        let now_utc = GetSystemTime();
+        let now_local = GetLocalTime();
+        fields.push(field("GetSystemTime", format_system_time(&now_utc)));
+        fields.push(field("GetLocalTime", format_system_time(&now_local)));
+        let mut converted_now = windows::Win32::Foundation::SYSTEMTIME::default();
+        if SystemTimeToTzSpecificLocalTime(None, &now_utc, &mut converted_now).is_ok() {
+            fields.push(field(
+                "SystemTimeToTzSpecificLocalTime_Now",
+                format_system_time(&converted_now),
+            ));
+            fields.push(field(
+                "GetLocalTime_MatchesProfileConversion",
+                match local_times_match_within_two_seconds(&now_local, &converted_now) {
+                    Some(matches) => matches.to_string(),
+                    None => "<error>".into(),
+                },
+            ));
+        } else {
+            fields.push(field("SystemTimeToTzSpecificLocalTime_Now", "<error>"));
+            fields.push(field("GetLocalTime_MatchesProfileConversion", "<error>"));
+        }
+
         let mut tzi = std::mem::MaybeUninit::<DYNAMIC_TIME_ZONE_INFORMATION>::zeroed();
         let id = GetDynamicTimeZoneInformation(tzi.as_mut_ptr());
         // TIME_ZONE_ID_INVALID == u32::MAX
@@ -243,14 +368,44 @@ fn collect_timezone() -> Section {
         };
         let mut local = windows::Win32::Foundation::SYSTEMTIME::default();
         if SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_ok() {
-            fields.push(field("SystemTimeToTzSpecificLocalTime", format_system_time(&local)));
+            fields.push(field(
+                "SystemTimeToTzSpecificLocalTime",
+                format_system_time(&local),
+            ));
         } else {
             fields.push(field("SystemTimeToTzSpecificLocalTime", "<error>"));
         }
 
+        // Fixed UTC date boundary: Pacific time is still the previous day.
+        let boundary_utc = windows::Win32::Foundation::SYSTEMTIME {
+            wYear: 2024,
+            wMonth: 1,
+            wDay: 1,
+            wDayOfWeek: 1,
+            wHour: 3,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        let mut boundary_local = windows::Win32::Foundation::SYSTEMTIME::default();
+        if SystemTimeToTzSpecificLocalTime(None, &boundary_utc, &mut boundary_local).is_ok() {
+            fields.push(field(
+                "SystemTimeToTzSpecificLocalTime_DateBoundary",
+                format_system_time(&boundary_local),
+            ));
+        } else {
+            fields.push(field(
+                "SystemTimeToTzSpecificLocalTime_DateBoundary",
+                "<error>",
+            ));
+        }
+
         let mut back = windows::Win32::Foundation::SYSTEMTIME::default();
         if TzSpecificLocalTimeToSystemTime(None, &local, &mut back).is_ok() {
-            fields.push(field("TzSpecificLocalTimeToSystemTime", format_system_time(&back)));
+            fields.push(field(
+                "TzSpecificLocalTimeToSystemTime",
+                format_system_time(&back),
+            ));
         } else {
             fields.push(field("TzSpecificLocalTimeToSystemTime", "<error>"));
         }
@@ -459,6 +614,23 @@ fn collect_registry() -> Section {
         "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation",
         "TimeZoneKeyName",
     );
+    push_reg_sz_a(
+        &mut fields,
+        "HKLM_TimeZone_TimeZoneKeyName_A",
+        windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation",
+        "TimeZoneKeyName",
+    );
+    let one_shot_a = fields
+        .iter()
+        .find(|field| field.name == "HKLM_TimeZone_TimeZoneKeyName_A")
+        .map(|field| field.value.as_str())
+        .unwrap_or("<missing>");
+    let query_contract = query_timezone_key_name_a_contract(one_shot_a);
+    fields.push(field(
+        "HKLM_TimeZone_TimeZoneKeyName_A_QueryContract",
+        query_contract,
+    ));
     push_reg_sz(
         &mut fields,
         "HKLM_TimeZone_StandardName",
@@ -484,7 +656,7 @@ fn collect_registry() -> Section {
 
 fn push_reg_nested(fields: &mut Vec<Field>, name: &str) {
     use windows::Win32::System::Registry::{
-        RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER, KEY_READ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
     };
     let mut mid = windows::Win32::System::Registry::HKEY::default();
     let mut leaf = windows::Win32::System::Registry::HKEY::default();
@@ -566,6 +738,130 @@ fn push_reg_sz(
     }
 }
 
+fn push_reg_sz_a(
+    fields: &mut Vec<Field>,
+    name: &str,
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+    value: &str,
+) {
+    use windows::Win32::System::Registry::{RegGetValueA, REG_VALUE_TYPE, RRF_RT_REG_SZ};
+    let sub: Vec<u8> = subkey.bytes().chain(std::iter::once(0)).collect();
+    let val: Vec<u8> = value.bytes().chain(std::iter::once(0)).collect();
+    let mut buf = [0u8; 256];
+    let mut size = buf.len() as u32;
+    let mut ty = REG_VALUE_TYPE(0);
+    let status = unsafe {
+        RegGetValueA(
+            root,
+            windows::core::PCSTR(sub.as_ptr()),
+            windows::core::PCSTR(val.as_ptr()),
+            RRF_RT_REG_SZ,
+            Some(&mut ty as *mut REG_VALUE_TYPE),
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        )
+    };
+    if status.0 == 0 {
+        fields.push(field(name, astr_from_until_nul(&buf)));
+    } else {
+        fields.push(field(name, "<error>"));
+    }
+}
+
+fn query_timezone_key_name_a_contract(one_shot: &str) -> String {
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExA, RegQueryValueExA, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+        REG_VALUE_TYPE,
+    };
+
+    struct OpenKey(HKEY);
+    impl Drop for OpenKey {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
+    }
+
+    let mut raw = HKEY::default();
+    let status = unsafe {
+        RegOpenKeyExA(
+            HKEY_LOCAL_MACHINE,
+            windows::core::s!("SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation"),
+            0,
+            KEY_READ,
+            &mut raw,
+        )
+    };
+    if status.0 != 0 {
+        return format!("<error-open {}>", status.0);
+    }
+    let key = OpenKey(raw);
+    let name = windows::core::s!("TimeZoneKeyName");
+    let mut ty = REG_VALUE_TYPE(0);
+    let mut required = 0u32;
+    let status =
+        unsafe { RegQueryValueExA(key.0, name, None, Some(&mut ty), None, Some(&mut required)) };
+    if status.0 != 0 || ty != REG_SZ || required < 2 {
+        return format!(
+            "<error-size status={} type={} bytes={}>",
+            status.0, ty.0, required
+        );
+    }
+
+    let mut short = vec![0u8; required as usize - 1];
+    let mut short_size = short.len() as u32;
+    let short_status = unsafe {
+        RegQueryValueExA(
+            key.0,
+            name,
+            None,
+            Some(&mut ty),
+            Some(short.as_mut_ptr()),
+            Some(&mut short_size),
+        )
+    };
+    if short_status != ERROR_MORE_DATA || ty != REG_SZ || short_size != required {
+        return format!(
+            "<error-short status={} type={} bytes={} expected={}>",
+            short_status.0, ty.0, short_size, required
+        );
+    }
+
+    let mut exact = vec![0u8; required as usize];
+    let mut exact_size = exact.len() as u32;
+    let exact_status = unsafe {
+        RegQueryValueExA(
+            key.0,
+            name,
+            None,
+            Some(&mut ty),
+            Some(exact.as_mut_ptr()),
+            Some(&mut exact_size),
+        )
+    };
+    if exact_status.0 != 0 || ty != REG_SZ || exact_size != required {
+        return format!(
+            "<error-exact status={} type={} bytes={} expected={}>",
+            exact_status.0, ty.0, exact_size, required
+        );
+    }
+    let exact_value = astr_from_until_nul(&exact);
+    if exact.last() != Some(&0) || exact_value != one_shot {
+        return "<error-value-mismatch>".into();
+    }
+    if let Ok(expected_profile) = std::env::var("ENVBOX_TZ_WINDOWS") {
+        if exact_value != expected_profile {
+            return format!(
+                "<error-profile-mismatch expected={expected_profile} actual={exact_value}>"
+            );
+        }
+    }
+    "ok".into()
+}
+
 fn collect_env() -> Section {
     // Full ENV snapshot (sorted). Always include comparison keys even when unset.
     let mut vars: Vec<(String, String)> = std::env::vars().collect();
@@ -591,6 +887,11 @@ fn wstr_from_until_nul(buf: &[u16]) -> String {
     OsString::from_wide(&buf[..len])
         .to_string_lossy()
         .into_owned()
+}
+
+fn astr_from_until_nul(buf: &[u8]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 fn wide_to_string(buf: &[u16]) -> String {

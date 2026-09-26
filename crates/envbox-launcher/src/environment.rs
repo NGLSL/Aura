@@ -56,10 +56,7 @@ pub fn build_environment_block(
         "ENVBOX_INHERIT_CHILDREN".into(),
         if inherit_children { "1" } else { "0" }.into(),
     );
-    env.insert(
-        "ENVBOX_AUDIT".into(),
-        if audit { "1" } else { "0" }.into(),
-    );
+    env.insert("ENVBOX_AUDIT".into(), if audit { "1" } else { "0" }.into());
     // ENVBOX_* value fallback (no C++ TOML). Used when Broker IPC is down.
     if let Some(profile) = profile {
         insert_profile_value_fallback(&mut env, profile);
@@ -169,7 +166,14 @@ mod tests {
             ("LANG".into(), "zh_CN.UTF-8".into()),
             ("PATH".into(), r"C:\Windows".into()),
         ]);
-        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true, false);
+        let merged = build_environment_block(
+            &host,
+            Some(&profile()),
+            Uuid::nil(),
+            Uuid::nil(),
+            true,
+            false,
+        );
         assert_eq!(merged.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
         assert_eq!(merged.get("PATH").map(String::as_str), Some(r"C:\Windows"));
         assert!(merged.contains_key("ENVBOX_INSTANCE_ID"));
@@ -203,7 +207,8 @@ mod tests {
         p.registry = RegistryProfile {
             whitelist_paths: vec!["HKCU\\Software\\EnvBox".into()],
         };
-        let merged = build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        let merged =
+            build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
         assert_eq!(
             merged.get("ENVBOX_LOCALE_NAME").map(String::as_str),
             Some("en-US")
@@ -226,7 +231,14 @@ mod tests {
     #[test]
     fn profile_override_is_case_insensitive() {
         let host = HashMap::from([("lang".into(), "zh_CN.UTF-8".into())]);
-        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true, false);
+        let merged = build_environment_block(
+            &host,
+            Some(&profile()),
+            Uuid::nil(),
+            Uuid::nil(),
+            true,
+            false,
+        );
         // Exactly one LANG-ish key, value from profile.
         let langs: Vec<_> = merged
             .iter()
@@ -241,7 +253,8 @@ mod tests {
         let host = HashMap::new();
         let mut p = profile();
         p.browser.webrtc = envbox_core::WebRtcPolicy::ProxyOnly;
-        let merged = build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        let merged =
+            build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
         assert_eq!(
             merged.get("ENVBOX_WEBRTC_POLICY").map(String::as_str),
             Some("proxy_only")
@@ -256,7 +269,14 @@ mod tests {
     #[test]
     fn browser_host_policy_omits_webview2_args() {
         let host = HashMap::new();
-        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true, false);
+        let merged = build_environment_block(
+            &host,
+            Some(&profile()),
+            Uuid::nil(),
+            Uuid::nil(),
+            true,
+            false,
+        );
         assert_eq!(
             merged.get("ENVBOX_WEBRTC_POLICY").map(String::as_str),
             Some("host")
@@ -270,7 +290,14 @@ mod tests {
             "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".into(),
             "--user-flag".into(),
         )]);
-        let merged = build_environment_block(&host, Some(&profile()), Uuid::nil(), Uuid::nil(), true, false);
+        let merged = build_environment_block(
+            &host,
+            Some(&profile()),
+            Uuid::nil(),
+            Uuid::nil(),
+            true,
+            false,
+        );
         assert_eq!(
             merged
                 .get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
@@ -287,7 +314,8 @@ mod tests {
         )]);
         let mut p = profile();
         p.browser.webrtc = envbox_core::WebRtcPolicy::ProxyOnly;
-        let merged = build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        let merged =
+            build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
         let v = merged
             .get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
             .map(String::as_str)

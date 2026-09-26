@@ -9,6 +9,6 @@ name = "envbox-probe"
 path = "src/main.rs"
 
 [dependencies]
-windows = { workspace = true }
+windows = { workspace = true, features = ["Globalization", "Win32_System_WinRT"] }
 
 [dev-dependencies]

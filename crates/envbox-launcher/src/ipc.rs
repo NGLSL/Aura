@@ -133,10 +133,9 @@ impl IpcMessage {
     /// Encode as one line (no trailing newline).
     pub fn encode_line(&self) -> String {
         match self {
-            IpcMessage::Hello { pid, instance_id } => format!(
-                "HELLO pid={pid} instance_id={}",
-                quote_value(instance_id)
-            ),
+            IpcMessage::Hello { pid, instance_id } => {
+                format!("HELLO pid={pid} instance_id={}", quote_value(instance_id))
+            }
             IpcMessage::GetProfile { pid, profile_id } => format!(
                 "GET_PROFILE pid={pid} profile_id={}",
                 quote_value(profile_id)
@@ -192,10 +191,7 @@ impl IpcMessage {
                 code,
                 detail,
             } => {
-                let mut s = format!(
-                    "HOOK_ERROR pid={pid} api={} code={code}",
-                    quote_value(api)
-                );
+                let mut s = format!("HOOK_ERROR pid={pid} api={} code={code}", quote_value(api));
                 if !detail.is_empty() {
                     s.push_str(&format!(" detail={}", quote_value(detail)));
                 }
@@ -430,12 +426,7 @@ pub fn profile_to_message_with_flags(
         inherit_children,
         audit,
         dns_mode: matches!(profile.dns.mode, DnsMode::VirtualView),
-        dns_servers: profile
-            .dns
-            .servers
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        dns_servers: profile.dns.servers.iter().map(|s| s.to_string()).collect(),
         registry_paths: profile.registry.whitelist_paths.clone(),
         environment,
         webrtc: profile.browser.webrtc.as_str().to_string(),
@@ -460,7 +451,10 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
     else {
         return Err(IpcError::Protocol("not a PROFILE message".into()));
     };
-    if locale_name.is_empty() || ui_language.is_empty() || region.is_empty() || tz_windows.is_empty()
+    if locale_name.is_empty()
+        || ui_language.is_empty()
+        || region.is_empty()
+        || tz_windows.is_empty()
     {
         return Err(IpcError::Protocol(
             "PROFILE missing required fields (locale_name/ui_language/region/tz_windows)".into(),
@@ -476,9 +470,8 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
         // Older peers omit the field: Host (no browser alteration).
         envbox_core::WebRtcPolicy::Host
     } else {
-        envbox_core::WebRtcPolicy::parse(webrtc).ok_or_else(|| {
-            IpcError::Protocol(format!("PROFILE invalid webrtc={webrtc:?}"))
-        })?
+        envbox_core::WebRtcPolicy::parse(webrtc)
+            .ok_or_else(|| IpcError::Protocol(format!("PROFILE invalid webrtc={webrtc:?}")))?
     };
     Ok(EnvironmentProfile {
         id: Uuid::nil(),
@@ -612,12 +605,8 @@ impl SessionTable {
         inherit_children: bool,
         audit: bool,
     ) {
-        let msg = profile_to_message_with_flags(
-            profile,
-            &self.instance_id,
-            inherit_children,
-            audit,
-        );
+        let msg =
+            profile_to_message_with_flags(profile, &self.instance_id, inherit_children, audit);
         self.profiles.insert(profile.id.to_string(), msg);
     }
 

@@ -7,6 +7,8 @@
 // follow (max 8 hops). Authoritative NXDOMAIN (rcode=3) is the only definitive
 // "name does not exist". Non-goals: WFP / LSP / DoH / port-53 redirect /
 // system proxy. No new Process/Thread handles; sockets always closesocket.
+// Authoritative NXDOMAIN and RFC 2308 SOA NODATA are definitive negatives;
+// referrals and other incomplete NOERROR responses remain Fail Open.
 
 #pragma comment(lib, "dnsapi.lib")
 
@@ -57,6 +59,9 @@ static DNS_STATUS(WINAPI* TrueDnsQuery_W)(PCWSTR, WORD, DWORD, PVOID,
 static DNS_STATUS(WINAPI* TrueDnsQuery_UTF8)(PCSTR, WORD, DWORD, PVOID,
                                              PDNS_RECORD*,
                                              PVOID*) = DnsQuery_UTF8;
+static DNS_STATUS(WINAPI* TrueDnsQueryEx)(PDNS_QUERY_REQUEST,
+                                          PDNS_QUERY_RESULT,
+                                          PDNS_QUERY_CANCEL) = DnsQueryEx;
 static void(WINAPI* TrueDnsFree)(PVOID, DNS_FREE_TYPE) = DnsFree;
 
 // Process-immutable virtual DNS views (built once at hook install).
@@ -75,6 +80,38 @@ static const DWORD kDnsQueryTimeoutMs = 1800;
 static const DWORD kDnsTotalBudgetMs = 6000;
 static const int kDnsMaxAnswers = 8;
 static const int kDnsMaxCnameHops = 8;
+
+// The wire client uses Winsock directly. dnsapi/getaddrinfo usually happen to
+// initialize Winsock for callers, but a process that enters a Profile-routed
+// query first is allowed to have no WSAStartup reference yet. Keep one
+// symmetric reference around each complete wire route so Runtime startup does
+// not permanently change the host process's Winsock reference count.
+static int StartDnsWinsock() {
+  WSADATA data = {};
+  int status = WSAStartup(MAKEWORD(2, 2), &data);
+  if (status != 0) {
+    SetLastError((DWORD)status);
+    return 0;
+  }
+  if (data.wVersion != MAKEWORD(2, 2)) {
+    WSACleanup();
+    SetLastError(WSAVERNOTSUPPORTED);
+    return 0;
+  }
+  return 1;
+}
+
+struct DnsWinsockScope {
+  int active;
+
+  DnsWinsockScope() : active(StartDnsWinsock()) {}
+
+  ~DnsWinsockScope() {
+    if (active) {
+      WSACleanup();
+    }
+  }
+};
 
 // UDP port for Profile DNS. Production uses 53. ENVBOX_DNS_UDP_PORT is a
 // test seam so fixtures can avoid fighting host DNS proxies on :53.
@@ -239,6 +276,7 @@ static void BuildDnsView() {
       }
     }
   }
+
   g_view_active = 1;
 }
 
@@ -325,6 +363,7 @@ struct DnsAddrs {
   int got;        // any DNS response received
   int nxdomain;   // rcode == 3
   int noerror;    // rcode == 0
+  int nodata;     // NOERROR + authoritative SOA, with no A/AAAA/CNAME
   int has_cname;  // answer included a CNAME (no A/AAAA yet)
   char cname[256];
 };
@@ -647,6 +686,7 @@ static int DnsQueryOne(const char* server_text, const char* qname,
   unsigned rcode = flags & 0x000F;
   unsigned qd = ReadU16(rbuf + 4);
   unsigned an = ReadU16(rbuf + 6);
+  unsigned ns = ReadU16(rbuf + 8);
   int off = 12;
   for (unsigned i = 0; i < qd; i++) {
     if (!SkipDnsName(rbuf, rlen, &off)) {
@@ -670,20 +710,19 @@ static int DnsQueryOne(const char* server_text, const char* qname,
     return 1;
   }
 
-  for (unsigned i = 0; i < an && off + 10 <= rlen; i++) {
+  for (unsigned i = 0; i < an; i++) {
     if (!SkipDnsName(rbuf, rlen, &off)) {
-      break;
+      return 0;
     }
     if (off + 10 > rlen) {
-      break;
+      return 0;
     }
     unsigned typ = ReadU16(rbuf + off);
     unsigned cls = ReadU16(rbuf + off + 2);
     unsigned rdlen = ReadU16(rbuf + off + 8);
     off += 10;
     if (cls != 1 || off + (int)rdlen > rlen) {
-      off += (int)rdlen;
-      continue;
+      return 0;
     }
     const unsigned char* rdata = rbuf + off;
     if (typ == 1 && rdlen == 4 && out->n_v4 < kDnsMaxAnswers) {
@@ -708,14 +747,42 @@ static int DnsQueryOne(const char* server_text, const char* qname,
     // Other types (NS/...) are skipped.
     off += (int)rdlen;
   }
+
+  // RFC 2308 NODATA is a successful response whose authority section carries
+  // an SOA while the answer section has no address or CNAME. An NS-only
+  // authority section is a referral, so leave it to the original resolver via
+  // the route's existing Fail Open path.
+  int has_soa = 0;
+  for (unsigned i = 0; i < ns; i++) {
+    if (!SkipDnsName(rbuf, rlen, &off)) {
+      return 0;
+    }
+    if (off + 10 > rlen) {
+      return 0;
+    }
+    unsigned typ = ReadU16(rbuf + off);
+    unsigned cls = ReadU16(rbuf + off + 2);
+    unsigned rdlen = ReadU16(rbuf + off + 8);
+    off += 10;
+    if (off + (int)rdlen > rlen) {
+      return 0;
+    }
+    if (typ == 6 && cls == 1) {
+      has_soa = 1;
+    }
+    off += (int)rdlen;
+  }
+  if (has_soa && out->n_v4 == 0 && out->n_v6 == 0 && !out->has_cname) {
+    out->nodata = 1;
+  }
   return 1;
 }
 
 // Route one name through Profile servers in order. Follows CNAME (max
 // kDnsMaxCnameHops). Returns:
-//   1 = definitive answer (addresses and/or authoritative NXDOMAIN)
+//   1 = definitive answer (addresses, authoritative NXDOMAIN, or NODATA)
 //   0 = no definitive answer (Fail Open) -- truncated, unreachable, or
-//       NOERROR without A/AAAA even after CNAME follow
+//       NOERROR without A/AAAA even after CNAME follow (including referral)
 static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
                         DnsAddrs* out) {
   DnsAddrsClear(out);
@@ -728,6 +795,15 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
   }
   if (DnsCacheLookup(qname, want_a, want_aaaa, out)) {
     return 1;
+  }
+
+  // Balance the Runtime's Winsock reference with the complete bounded route.
+  // DnsQueryOne closes every socket before returning, so no socket outlives
+  // this scope. The scope is local to this call and therefore safe when
+  // several Runtime threads resolve names concurrently.
+  DnsWinsockScope winsock;
+  if (!winsock.active) {
+    return 0;
   }
 
   char current[256];
@@ -746,6 +822,8 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
   for (int hop = 0; hop < kDnsMaxCnameHops; hop++) {
     int saw_nx = 0;
     int saw_ok = 0;
+    int saw_nodata_a = 0;
+    int saw_nodata_aaaa = 0;
     int has_cname = 0;
     char next_name[256];
     next_name[0] = '\0';
@@ -772,7 +850,11 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
           if (step.nxdomain) {
             saw_nx = 1;
           } else if (step.noerror) {
-            saw_ok = 1;
+            if (step.nodata) {
+              saw_nodata_a = 1;
+            } else {
+              saw_ok = 1;
+            }
             for (int i = 0; i < step.n_v4 && out->n_v4 < kDnsMaxAnswers; i++) {
               out->v4[out->n_v4++] = step.v4[i];
             }
@@ -803,7 +885,11 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
           if (step6.nxdomain) {
             saw_nx = 1;
           } else if (step6.noerror) {
-            saw_ok = 1;
+            if (step6.nodata) {
+              saw_nodata_aaaa = 1;
+            } else {
+              saw_ok = 1;
+            }
             for (int i = 0; i < step6.n_v6 && out->n_v6 < kDnsMaxAnswers; i++) {
               out->v6[out->n_v6++] = step6.v6[i];
             }
@@ -816,7 +902,9 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
       }
 
       // First definitive reply for this name wins (do not leak to Host DNS).
-      if (saw_nx || saw_ok) {
+      int all_nodata = (want_a ? saw_nodata_a : 1) &&
+                       (want_aaaa ? saw_nodata_aaaa : 1);
+      if (saw_nx || saw_ok || all_nodata) {
         break;
       }
     }
@@ -833,6 +921,15 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
       out->got = 1;
       out->noerror = 1;
       out->nxdomain = 0;
+      DnsCacheStore(qname, want_a, want_aaaa, out);
+      return 1;
+    }
+    if ((want_a ? saw_nodata_a : 1) &&
+        (want_aaaa ? saw_nodata_aaaa : 1)) {
+      out->got = 1;
+      out->noerror = 1;
+      out->nxdomain = 0;
+      out->nodata = 1;
       DnsCacheStore(qname, want_a, want_aaaa, out);
       return 1;
     }
@@ -1180,7 +1277,8 @@ static int ResolveRoutedA(const char* qname_utf8, const char* service,
   if (!DnsRouteName(qname_utf8, want_a, want_aaaa, addrs)) {
     return EAI_AGAIN;  // caller Fail Opens
   }
-  if (addrs->nxdomain && addrs->n_v4 == 0 && addrs->n_v6 == 0) {
+  if ((addrs->nxdomain || addrs->nodata) && addrs->n_v4 == 0 &&
+      addrs->n_v6 == 0) {
     return EAI_NONAME;
   }
   AddrPair pairs[kDnsMaxAnswers * 2];
@@ -1312,7 +1410,8 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
   }
   if (rc == EAI_NONAME) {
     char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "nxdomain node=%.64s", node);
+    const char* kind = addrs.nodata ? "nodata" : "nxdomain";
+    _snprintf_s(note, sizeof(note), _TRUNCATE, "%s node=%.64s", kind, node);
     EnvBoxAuditEvent(api, 1, note);
     SetLastError(err);
     return EAI_NONAME;
@@ -1406,7 +1505,9 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
   }
   if (rc == EAI_NONAME) {
     char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "nxdomain node=%.64s", node_u8);
+    const char* kind = addrs.nodata ? "nodata" : "nxdomain";
+    _snprintf_s(note, sizeof(note), _TRUNCATE, "%s node=%.64s", kind,
+                node_u8);
     EnvBoxAuditEvent(api, 1, note);
     SetLastError(err);
     return EAI_NONAME;
@@ -1560,7 +1661,8 @@ static INT WSAAPI HookGetAddrInfoExA(
   }
   if (rc == EAI_NONAME) {
     char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "nxdomain node=%.64s", name);
+    const char* kind = addrs.nodata ? "nodata" : "nxdomain";
+    _snprintf_s(note, sizeof(note), _TRUNCATE, "%s node=%.64s", kind, name);
     EnvBoxAuditEvent("GetAddrInfoExA", 1, note);
     SetLastError(err);
     return EAI_NONAME;
@@ -1687,7 +1789,9 @@ static INT WSAAPI HookGetAddrInfoExW(
   }
   if (rc == EAI_NONAME) {
     char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "nxdomain node=%.64s", name_u8);
+    const char* kind = addrs.nodata ? "nodata" : "nxdomain";
+    _snprintf_s(note, sizeof(note), _TRUNCATE, "%s node=%.64s", kind,
+                name_u8);
     EnvBoxAuditEvent("GetAddrInfoExW", 1, note);
     SetLastError(err);
     return EAI_NONAME;
@@ -1729,8 +1833,7 @@ static INT WSAAPI HookGetAddrInfoExW(
 }
 
 // ---------------------------------------------------------------------------
-// DnsQuery_A / W / UTF8 (A + AAAA). DnsQueryEx is async-shaped: Fail Open and
-// not hooked (audit documents the gap at install).
+// DnsQueryEx and DnsQuery_A / W / UTF8 (A + AAAA).
 // ---------------------------------------------------------------------------
 
 enum DnsQueryFlavor {
@@ -1738,6 +1841,86 @@ enum DnsQueryFlavor {
   kDnsFlavorW = 1,
   kDnsFlavorUtf8 = 2,
 };
+
+static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
+                                PDNS_RECORD* out, PVOID* reserved,
+                                DnsQueryFlavor flavor, const wchar_t* name_w,
+                                const char* api);
+
+static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
+                                        PDNS_QUERY_RESULT results,
+                                        PDNS_QUERY_CANCEL cancel) {
+  DWORD err = GetLastError();
+  if (!g_view_active || request == nullptr || results == nullptr) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0,
+                     g_view_active ? "fail-open-invalid-input" : "dns-host");
+    SetLastError(err);
+    return st;
+  }
+
+  // The callback/cancel contract includes provider-owned asynchronous state.
+  // Keep it completely with the original API until a lifetime-safe adapter is
+  // available; this is an explicit fail-open boundary.
+  if (request->pQueryCompletionCallback != nullptr) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async");
+    SetLastError(err);
+    return st;
+  }
+
+  // Only the v1 request/result layouts are handled. Later SDK versions may
+  // append fields whose semantics this hook must not silently truncate.
+  if (request->Version != DNS_QUERY_REQUEST_VERSION1) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-unsupported-version");
+    SetLastError(err);
+    return st;
+  }
+  if (results->Version != DNS_QUERY_RESULTS_VERSION1 ||
+      results->QueryStatus != ERROR_SUCCESS ||
+      results->QueryOptions != DNS_QUERY_STANDARD ||
+      results->pQueryRecords != nullptr || results->Reserved != nullptr) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-invalid-result");
+    SetLastError(err);
+    return st;
+  }
+
+  // The bounded wire client implements only standard A/AAAA lookups. Reject
+  // every input whose semantics would otherwise be lost, especially the
+  // 64-bit NO_WIRE_QUERY option and caller-selected server/interface paths.
+  if (request->QueryName == nullptr ||
+      request->QueryOptions != DNS_QUERY_STANDARD ||
+      request->pDnsServerList != nullptr || request->InterfaceIndex != 0 ||
+      cancel != nullptr ||
+      (request->QueryType != DNS_TYPE_A &&
+       request->QueryType != DNS_TYPE_AAAA)) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-unsupported-input");
+    SetLastError(err);
+    return st;
+  }
+
+  char name_u8[256];
+  if (!WideToUtf8(request->QueryName, name_u8, (int)sizeof(name_u8))) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-name-conversion");
+    SetLastError(err);
+    return st;
+  }
+
+  PDNS_RECORD records = nullptr;
+  DNS_STATUS st = RouteDnsQuery(name_u8, request->QueryType,
+                                DNS_QUERY_STANDARD, &records, nullptr,
+                                kDnsFlavorW, request->QueryName, "DnsQueryEx");
+  results->QueryStatus = st;
+  results->QueryOptions = DNS_QUERY_STANDARD;
+  results->pQueryRecords = records;
+  results->Reserved = nullptr;
+  SetLastError(err);
+  return st;
+}
 
 // Always Fail Open / pass through to the matching original API.
 static DNS_STATUS CallTrueDnsQuery(DnsQueryFlavor flavor, const char* name_u8,
@@ -1761,18 +1944,30 @@ static PDNS_RECORD AllocDnsRecord(const char* name_a, const wchar_t* name_w,
   if (rec == nullptr) {
     return nullptr;
   }
-  if (is_wide && name_w != nullptr) {
+  if (is_wide) {
+    if (name_w == nullptr) {
+      OwnedFree(rec);
+      return nullptr;
+    }
     size_t n = wcslen(name_w) + 1;
     rec->pName = (PSTR)OwnedAlloc(n * sizeof(wchar_t));
-    if (rec->pName != nullptr) {
-      memcpy(rec->pName, name_w, n * sizeof(wchar_t));
+    if (rec->pName == nullptr) {
+      OwnedFree(rec);
+      return nullptr;
     }
-  } else if (name_a != nullptr) {
+    memcpy(rec->pName, name_w, n * sizeof(wchar_t));
+  } else {
+    if (name_a == nullptr) {
+      OwnedFree(rec);
+      return nullptr;
+    }
     size_t n = strlen(name_a) + 1;
     rec->pName = (PSTR)OwnedAlloc(n);
-    if (rec->pName != nullptr) {
-      memcpy(rec->pName, name_a, n);
+    if (rec->pName == nullptr) {
+      OwnedFree(rec);
+      return nullptr;
     }
+    memcpy(rec->pName, name_a, n);
   }
   rec->wType = wtype;
   rec->wDataLength = rdlen;
@@ -1840,6 +2035,13 @@ static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
     EnvBoxAuditEvent(api, 1, note);
     SetLastError(err);
     return DNS_ERROR_RCODE_NAME_ERROR;
+  }
+  if (addrs.nodata && addrs.n_v4 == 0 && addrs.n_v6 == 0) {
+    char note[128];
+    _snprintf_s(note, sizeof(note), _TRUNCATE, "nodata node=%.64s", name_u8);
+    EnvBoxAuditEvent(api, 1, note);
+    SetLastError(err);
+    return DNS_INFO_NO_RECORDS;
   }
   if (addrs.n_v4 == 0 && addrs.n_v6 == 0) {
     // NOERROR without A/AAAA must not become NAME_ERROR.
@@ -1990,8 +2192,7 @@ int EnvBoxInstallDnsHooks() {
   ok += EnvBoxAttach(&TrueDnsQuery_A, HookDnsQuery_A);
   ok += EnvBoxAttach(&TrueDnsQuery_W, HookDnsQuery_W);
   ok += EnvBoxAttach(&TrueDnsQuery_UTF8, HookDnsQuery_UTF8);
+  ok += EnvBoxAttach(&TrueDnsQueryEx, HookDnsQueryEx);
   ok += EnvBoxAttach(&TrueDnsFree, HookDnsFree);
-  // DnsQueryEx is async/completion-shaped: not hooked (Fail Open by design).
-  EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-unhooked");
   return ok;
 }

@@ -17,6 +17,7 @@ static inline int EnvBoxAttach(T* pp, T hook) {
 
 // Per-domain install entry points (split modules).
 int EnvBoxInstallTimeHooks();
+int EnvBoxInstallWinRtTimeHooks();
 int EnvBoxInstallGeoHooks();
 int EnvBoxInstallLocaleHooks();
 int EnvBoxInstallLanguageHooks();

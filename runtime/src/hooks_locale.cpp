@@ -18,6 +18,7 @@ static LCID(WINAPI* TrueGetSystemDefaultLCID)() = GetSystemDefaultLCID;
 static int(WINAPI* TrueGetLocaleInfoEx)(LPCWSTR, LCTYPE, LPWSTR, int) =
     GetLocaleInfoEx;
 static int(WINAPI* TrueGetLocaleInfoW)(LCID, LCTYPE, LPWSTR, int) = GetLocaleInfoW;
+static int(WINAPI* TrueGetLocaleInfoA)(LCID, LCTYPE, LPSTR, int) = GetLocaleInfoA;
 
 // Write Profile locale name. Size query (null dst) returns Profile length+1.
 // Buffer too small returns 0 + ERROR_INSUFFICIENT_BUFFER (never Host name).
@@ -111,6 +112,18 @@ static int WINAPI HookGetLocaleInfoW(LCID Locale, LCTYPE LCType, LPWSTR lpLCData
   return TrueGetLocaleInfoW(v, LCType, lpLCData, cchData);
 }
 
+static int WINAPI HookGetLocaleInfoA(LCID Locale, LCTYPE LCType, LPSTR lpLCData,
+                                     int cchData) {
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  LCID v = VirtualizeLcid(Locale);
+  if (pfl != nullptr && pfl->has_locale && v != Locale) {
+    EnvBoxAuditEvent("GetLocaleInfoA", 1, "default-lcid-rewritten");
+  } else {
+    EnvBoxAuditEvent("GetLocaleInfoA", 0, nullptr);
+  }
+  return TrueGetLocaleInfoA(v, LCType, lpLCData, cchData);
+}
+
 // LOCALE_NAME_USER_DEFAULT is NULL; LOCALE_NAME_SYSTEM_DEFAULT is L"!".
 // LOCALE_NAME_INVARIANT is L"" - a real locale name, not a default alias.
 static LPCWSTR VirtualizeLocaleName(LPCWSTR name, const RuntimeProfile* pfl) {
@@ -144,5 +157,6 @@ int EnvBoxInstallLocaleHooks() {
   ok += EnvBoxAttach(&TrueGetSystemDefaultLCID, HookGetSystemDefaultLCID);
   ok += EnvBoxAttach(&TrueGetLocaleInfoEx, HookGetLocaleInfoEx);
   ok += EnvBoxAttach(&TrueGetLocaleInfoW, HookGetLocaleInfoW);
+  ok += EnvBoxAttach(&TrueGetLocaleInfoA, HookGetLocaleInfoA);
   return ok;
 }

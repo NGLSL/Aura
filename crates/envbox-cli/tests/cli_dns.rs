@@ -1,6 +1,6 @@
 //! DNS routing acceptance (tickets 24-26 + review): VirtualView routes
-//! getaddrinfo via Profile servers; Host mode leaves resolution untouched;
-//! Fail Open never hangs; truncated / CNAME-only never fake NXDOMAIN.
+//! getaddrinfo and DnsQueryEx via Profile servers; Host mode leaves resolution
+//! untouched; Fail Open never hangs; truncated / CNAME-only never fake NXDOMAIN.
 
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::Command;
@@ -140,6 +140,22 @@ fn run_probe_dnsquery(
     cmd.output().expect("run probe --resolve-dnsquery")
 }
 
+fn run_probe_dnsquery_ex(
+    root: &std::path::Path,
+    dll: &std::path::Path,
+    profile_id: &str,
+    name: &str,
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_envbox"));
+    cmd.env("ENVBOX_CONFIG_ROOT", root)
+        .env("ENVBOX_RUNTIME_DLL", dll)
+        .args(["run", "--profile", profile_id, "--audit"])
+        .arg(probe_exe().expect("envbox-probe.exe required"))
+        .args(["--resolve-dnsquery-ex", name]);
+    apply_dns_port(&mut cmd);
+    cmd.output().expect("run probe --resolve-dnsquery-ex")
+}
+
 // --- fixture DNS server (UDP 127.0.0.1:53) ---
 
 const FIXTURE_NAME: &str = "fixture.test";
@@ -147,6 +163,9 @@ const FIXTURE_A: [u8; 4] = [10, 99, 0, 1];
 const CNAME_A_NAME: &str = "cname-a.test";
 const CNAME_B_NAME: &str = "cname-b.test";
 const DANGLING_NAME: &str = "dangling.invalid";
+const NODATA_NAME: &str = "nodata.test";
+const REFERRAL_NAME: &str = "referral.test";
+const EAI_NONAME_STATUS: &str = "<error 11001>";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FixtureMode {
@@ -159,6 +178,10 @@ enum FixtureMode {
     CnameOnly,
     /// cname-a.test -> cname-b.test -> fixture.test -> A.
     CnameChain,
+    /// NOERROR + empty answer + SOA authority (RFC 2308 NODATA).
+    Nodata,
+    /// NOERROR + empty answer + NS authority (referral; no SOA).
+    Referral,
 }
 
 /// Bind fixture DNS on the test port (not 53: host DNS proxies own :53).
@@ -300,14 +323,21 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
             n if n == FIXTURE_NAME && qtype == 1 => Answer::A(FIXTURE_A),
             _ => Answer::None,
         },
-        FixtureMode::Truncated => Answer::None,
+        FixtureMode::Nodata | FixtureMode::Referral | FixtureMode::Truncated => {
+            Answer::None
+        }
     };
+
+    let soa_authority = mode == FixtureMode::Nodata && qname == NODATA_NAME;
+    let referral_authority = mode == FixtureMode::Referral && qname == REFERRAL_NAME;
 
     // NXDOMAIN for Address/other miss; NOERROR empty for CnameOnly dangling.
     let (rcode, ancount): (u8, u16) = match &answer {
         Answer::A(_) | Answer::Cname(_) => (0, 1),
         Answer::None => {
-            if mode == FixtureMode::CnameOnly || mode == FixtureMode::CnameChain {
+            if soa_authority || referral_authority {
+                (0, 0)
+            } else if mode == FixtureMode::CnameOnly || mode == FixtureMode::CnameChain {
                 (0, 0)
             } else if qname == FIXTURE_NAME || qname.ends_with(".test") {
                 (0, 0)
@@ -324,7 +354,8 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
     resp.extend_from_slice(&flags.to_be_bytes());
     resp.extend_from_slice(&qd.to_be_bytes());
     resp.extend_from_slice(&ancount.to_be_bytes());
-    resp.extend_from_slice(&0u16.to_be_bytes());
+    let nscount: u16 = if soa_authority || referral_authority { 1 } else { 0 };
+    resp.extend_from_slice(&nscount.to_be_bytes());
     resp.extend_from_slice(&0u16.to_be_bytes());
     resp.extend_from_slice(&question);
     if ancount == 1 {
@@ -347,6 +378,34 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
             }
             Answer::None => {}
         }
+    }
+    if soa_authority {
+        // Authority SOA marks an authoritative NODATA response. Keep the
+        // names uncompressed so the fixture exercises the parser's normal
+        // authority-section name skipping and does not rely on answer data.
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&6u16.to_be_bytes()); // SOA
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&60u32.to_be_bytes());
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&encode_name("ns1.nodata.test"));
+        rdata.extend_from_slice(&encode_name("hostmaster.nodata.test"));
+        rdata.extend_from_slice(&1u32.to_be_bytes()); // serial
+        rdata.extend_from_slice(&3600u32.to_be_bytes()); // refresh
+        rdata.extend_from_slice(&600u32.to_be_bytes()); // retry
+        rdata.extend_from_slice(&86400u32.to_be_bytes()); // expire
+        rdata.extend_from_slice(&60u32.to_be_bytes()); // minimum
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+    } else if referral_authority {
+        // An NS-only authority section is a referral, not RFC 2308 NODATA.
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&2u16.to_be_bytes()); // NS
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&60u32.to_be_bytes());
+        let rdata = encode_name("ns1.referral.test");
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
     }
     resp
 }
@@ -660,6 +719,189 @@ fn dnsquery_a_smoke_routes_fixture() {
     assert_eq!(
         got, "10.99.0.1",
         "DnsQuery_A must route fixture.test via Profile DNS:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// DnsQueryEx must route synchronous queries through the Profile DNS server
+/// under VirtualView instead of silently using the Host resolver.
+#[test]
+fn dnsquery_ex_smoke_routes_fixture() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    let stop = spawn_fixture_dns(sock, FixtureMode::Address);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+
+    let out = run_probe_dnsquery_ex(&root, &dll, &profile_id, FIXTURE_NAME);
+    stop.store(true, Ordering::SeqCst);
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let got = field_after(&stdout, "DnsQueryEx_A:");
+    let audit = std::fs::read_dir(root.join("audit"))
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        got, "10.99.0.1",
+        "DnsQueryEx must route fixture.test via Profile DNS:\n{stdout}\naudit:\n{audit}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A mixed IPv4/IPv6 Profile still uses the bounded Profile wire route. The
+/// DnsQueryEx hook must not require a single-family DNS_ADDR_ARRAY before it
+/// can route a synchronous A lookup.
+#[test]
+fn dnsquery_ex_mixed_profile_routes_fixture() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    let stop = spawn_fixture_dns(sock, FixtureMode::Address);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1", "::1"], true);
+
+    let out = run_probe_dnsquery_ex(&root, &dll, &profile_id, FIXTURE_NAME);
+    stop.store(true, Ordering::SeqCst);
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let got = field_after(&stdout, "DnsQueryEx_A:");
+    assert_eq!(
+        got, "10.99.0.1",
+        "mixed IPv4/IPv6 Profile must route fixture.test via Profile DNS:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RFC 2308 NODATA must remain a definitive negative answer instead of
+/// falling through to the Host resolver.
+#[test]
+fn dnsquery_ex_authoritative_nodata_returns_no_records() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    let stop = spawn_fixture_dns(sock, FixtureMode::Nodata);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+
+    let out = run_probe_dnsquery_ex(&root, &dll, &profile_id, NODATA_NAME);
+    stop.store(true, Ordering::SeqCst);
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let got = field_after(&stdout, "DnsQueryEx_A:");
+    assert_eq!(
+        got, "<error 9501>",
+        "SOA authority NODATA must return DNS_INFO_NO_RECORDS:
+{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RFC 2308 NODATA must map to EAI_NONAME for getaddrinfo instead of falling
+/// through to the Host resolver. Windows exposes EAI_NONAME as 11001.
+#[test]
+fn getaddrinfo_authoritative_nodata_returns_eai_noname() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    let stop = spawn_fixture_dns(sock, FixtureMode::Nodata);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+
+    let out = run_probe_resolve(&root, &dll, &profile_id, NODATA_NAME);
+    stop.store(true, Ordering::SeqCst);
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let got = field_after(&stdout, "getaddrinfo:");
+    assert_eq!(
+        got, EAI_NONAME_STATUS,
+        "SOA authority NODATA must return EAI_NONAME, not Host data:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An NS-only authority response is a referral. It has no definitive
+/// negative answer, so the route must retain the existing Fail Open behavior.
+#[test]
+fn dnsquery_ex_referral_fails_open() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    let stop = spawn_fixture_dns(sock, FixtureMode::Referral);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let virtual_id = make_profile(&root, &["127.0.0.1"], true);
+    let host_id = make_profile(&root, &[], false);
+
+    let virtual_out = run_probe_dnsquery_ex(&root, &dll, &virtual_id, REFERRAL_NAME);
+    let host_out = run_probe_dnsquery_ex(&root, &dll, &host_id, REFERRAL_NAME);
+    stop.store(true, Ordering::SeqCst);
+    assert!(virtual_out.status.success(), "virtual run failed: {virtual_out:?}");
+    assert!(host_out.status.success(), "host run failed: {host_out:?}");
+    let virtual_value = field_after(
+        &String::from_utf8_lossy(&virtual_out.stdout),
+        "DnsQueryEx_A:",
+    );
+    let host_value = field_after(&String::from_utf8_lossy(&host_out.stdout), "DnsQueryEx_A:");
+    assert_eq!(
+        virtual_value, host_value,
+        "NS-only referral must Fail Open to the Host resolver (virtual={virtual_value} host={host_value})"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An NS-only authority response is a referral for getaddrinfo as well. It
+/// must retain the existing Fail Open behavior and match the Host profile.
+#[test]
+fn getaddrinfo_referral_fails_open() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    let stop = spawn_fixture_dns(sock, FixtureMode::Referral);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let virtual_id = make_profile(&root, &["127.0.0.1"], true);
+    let host_id = make_profile(&root, &[], false);
+
+    let virtual_out = run_probe_resolve(&root, &dll, &virtual_id, REFERRAL_NAME);
+    let host_out = run_probe_resolve(&root, &dll, &host_id, REFERRAL_NAME);
+    stop.store(true, Ordering::SeqCst);
+    assert!(virtual_out.status.success(), "virtual run failed: {virtual_out:?}");
+    assert!(host_out.status.success(), "host run failed: {host_out:?}");
+    let virtual_value = field_after(
+        &String::from_utf8_lossy(&virtual_out.stdout),
+        "getaddrinfo:",
+    );
+    let host_value = field_after(&String::from_utf8_lossy(&host_out.stdout), "getaddrinfo:");
+    assert_eq!(
+        virtual_value, host_value,
+        "NS-only referral must Fail Open to the Host resolver (virtual={virtual_value} host={host_value})"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

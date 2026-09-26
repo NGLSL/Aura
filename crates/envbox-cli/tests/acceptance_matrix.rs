@@ -148,6 +148,38 @@ fn acceptance_host_and_us_probe_values() {
         field_after(&run_out, "GetDynamicTimeZoneInformation:"),
         "Pacific Standard Time"
     );
+    assert_eq!(
+        field_after(&run_out, "WinRT_Calendar_GetTimeZone:"),
+        "America/Los_Angeles"
+    );
+    assert_eq!(
+        field_after(&run_out, "WinRT_RoActivateInstance_GetTimeZone:"),
+        "America/Los_Angeles"
+    );
+    assert_eq!(
+        field_after(&run_out, "WinRT_Calendar_ChangedTimeZone:"),
+        "Europe/London",
+        "explicit Calendar timezone changes must remain effective"
+    );
+    assert_eq!(
+        field_after(&run_out, "GetLocalTime_MatchesProfileConversion:"),
+        "true",
+        "native local time must agree with the Profile timezone"
+    );
+    assert_eq!(
+        field_after(&run_out, "SystemTimeToTzSpecificLocalTime_DateBoundary:"),
+        "2023-12-31 19:00:00"
+    );
+    assert_eq!(
+        field_after(&run_out, "HKLM_TimeZone_TimeZoneKeyName_A:"),
+        "Pacific Standard Time",
+        "ANSI registry reads must see the Profile timezone"
+    );
+    assert_eq!(
+        field_after(&run_out, "HKLM_TimeZone_TimeZoneKeyName_A_QueryContract:"),
+        "ok",
+        "ANSI size query, short buffer, and exact buffer reads must follow the Win32 contract"
+    );
 
     // A Host can already use US/en-US, so contrast is not a portable
     // assertion. The Profile literals above and the loaded marker prove the
@@ -163,6 +195,45 @@ fn acceptance_host_and_us_probe_values() {
         );
     }
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn acceptance_ansi_default_locale_uses_profile() {
+    let probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-locale-{}", Uuid::new_v4()));
+    let added = envbox_with_root(&root)
+        .args([
+            "profile",
+            "add",
+            "--name",
+            "French Acceptance",
+            "--locale",
+            "fr-FR",
+            "--ui-language",
+            "fr-FR",
+            "--region",
+            "FR",
+            "--tz-windows",
+            "Romance Standard Time",
+            "--tz-iana",
+            "Europe/Paris",
+        ])
+        .output()
+        .expect("profile add");
+    assert!(added.status.success(), "{added:?}");
+    let profile_id = String::from_utf8_lossy(&added.stdout).trim().to_string();
+    let run = envbox_with_root(&root)
+        .args(["run", "--profile", &profile_id])
+        .arg(&probe)
+        .output()
+        .expect("run probe");
+    assert!(run.status.success(), "{run:?}");
+    let output = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(
+        field_after(&output, "GetLocaleInfoA_USER_DEFAULT_SNAME:"),
+        "fr-FR"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -301,6 +372,7 @@ fn acceptance_notepad_launch_and_stop() {
         launch: LaunchTarget::Command {
             command: "notepad".into(),
         },
+        console_host: envbox_core::ConsoleHost::Direct,
         working_directory: None,
         arguments: vec![],
         default_profile_id: profile.id,

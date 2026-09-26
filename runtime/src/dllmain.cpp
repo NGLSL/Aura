@@ -19,6 +19,7 @@ static int InstallAllHooks() {
   // Each install is independent (Fail Open per API).
   int ok = 0;
   ok += EnvBoxInstallTimeHooks();
+  ok += EnvBoxInstallWinRtTimeHooks();
   ok += EnvBoxInstallGeoHooks();
   ok += EnvBoxInstallLocaleHooks();
   ok += EnvBoxInstallLanguageHooks();

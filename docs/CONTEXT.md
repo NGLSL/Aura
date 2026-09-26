@@ -14,6 +14,7 @@
 | **Process Tree Instance** | 隔离单位：Root Process 及其子进程树；不是可执行文件名 |
 | **Root Process** | EnvBox 直接创建或激活的进程；后续子进程经注入继承 Profile |
 | **LaunchTarget** | 启动方式：Executable / Command / Packaged（AUMID，禁止直接跑 WindowsApps exe） |
+| **ConsoleHost** | Application 的命令宿主偏好：Direct / cmd.exe / PowerShell / Windows Terminal；旧配置默认为 Direct，非 Direct 宿主仅适用于 Command |
 | **ActivationBackend** | 激活后端：Win32（CreateProcess SUSPENDED）/ Packaged（ActivateApplication） |
 | **AttachStrategy** | 注入时机：PreExecution（挂起注入）/ PostActivation（激活后注入）/ PackageDebug（预留） |
 | **RuntimeAttacher / RuntimeInjector** | 共享注入缝：向 PID 装载 envbox-runtime；与激活方式解耦 |

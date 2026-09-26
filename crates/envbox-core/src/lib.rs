@@ -46,6 +46,51 @@ pub enum LaunchTarget {
     },
 }
 
+/// Console host used when an Application launches a command target.
+///
+/// This is an Application preference only.  The launcher is responsible for
+/// applying the selected host; keeping it here lets the preference survive a
+/// GUI restart and keeps older application documents compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleHost {
+    /// Launch the target directly in the current process model.
+    Direct,
+    /// Run the command through cmd.exe.
+    Cmd,
+    /// Run the command through PowerShell.
+    PowerShell,
+    /// Open the command in Windows Terminal.
+    WindowsTerminal,
+}
+
+impl Default for ConsoleHost {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
+impl ConsoleHost {
+    pub const ALL: [Self; 4] = [
+        Self::Direct,
+        Self::Cmd,
+        Self::PowerShell,
+        Self::WindowsTerminal,
+    ];
+}
+
+impl std::fmt::Display for ConsoleHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Direct => "Direct",
+            Self::Cmd => "cmd.exe",
+            Self::PowerShell => "PowerShell",
+            Self::WindowsTerminal => "Windows Terminal",
+        };
+        f.write_str(label)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Application {
     pub id: Uuid,
@@ -55,6 +100,10 @@ pub struct Application {
     pub arguments: Vec<String>,
     pub default_profile_id: Uuid,
     pub inherit_children: bool,
+    /// Console host preference for command targets. Older documents default
+    /// to direct launch for backwards compatibility.
+    #[serde(default)]
+    pub console_host: ConsoleHost,
     /// Audit Mode default for this Application (ticket 20). CLI `--audit` forces on.
     #[serde(default)]
     pub audit: bool,
@@ -84,6 +133,13 @@ impl Application {
                 ));
             }
             _ => {}
+        }
+        if !matches!(self.console_host, ConsoleHost::Direct)
+            && !matches!(self.launch, LaunchTarget::Command { .. })
+        {
+            return Err(DomainError::InvalidApplication(
+                "non-direct console hosts are available only for command targets".into(),
+            ));
         }
         Ok(())
     }
@@ -472,6 +528,7 @@ mod tests {
             arguments: vec![],
             default_profile_id: Uuid::nil(),
             inherit_children: true,
+            console_host: ConsoleHost::Direct,
             audit: false,
         };
         assert!(matches!(
@@ -489,6 +546,50 @@ mod tests {
         assert!(text.contains("type = \"command\""));
         let back: Wrap = toml::from_str(&text).unwrap();
         assert_eq!(back.0, target);
+    }
+
+    #[test]
+    fn application_console_host_defaults_for_legacy_documents() {
+        let value = serde_json::json!({
+            "id": Uuid::nil(),
+            "name": "Claude Code",
+            "launch": {"type": "command", "command": "claude"},
+            "working_directory": null,
+            "arguments": [],
+            "default_profile_id": Uuid::nil(),
+            "inherit_children": true,
+            "audit": false
+        });
+        let app: Application = serde_json::from_value(value).unwrap();
+        assert_eq!(app.console_host, ConsoleHost::Direct);
+    }
+
+    #[test]
+    fn non_direct_console_hosts_require_command_target() {
+        for console_host in [
+            ConsoleHost::Cmd,
+            ConsoleHost::PowerShell,
+            ConsoleHost::WindowsTerminal,
+        ] {
+            let app = Application {
+                id: Uuid::nil(),
+                name: "GUI".into(),
+                launch: LaunchTarget::Executable {
+                    path: r"C:\\Windows\\System32\\notepad.exe".into(),
+                },
+                working_directory: None,
+                arguments: vec![],
+                default_profile_id: Uuid::nil(),
+                inherit_children: true,
+                console_host,
+                audit: false,
+            };
+            assert!(matches!(
+                app.validate(),
+                Err(DomainError::InvalidApplication(message))
+                    if message.contains("only for command targets")
+            ));
+        }
     }
 
     #[test]

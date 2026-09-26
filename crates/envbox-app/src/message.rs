@@ -208,6 +208,7 @@ pub enum Message {
     AppWorkDir(String),
     AppProfile(Uuid),
     AppInherit(bool),
+    AppConsoleHost(envbox_core::ConsoleHost),
     AppAudit(bool),
     AppSelect(Uuid),
     AppEdit,

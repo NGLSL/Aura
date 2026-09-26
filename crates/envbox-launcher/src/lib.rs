@@ -17,7 +17,7 @@ pub mod process_tracker;
 pub mod session;
 
 pub use activation::{
-    backend_for, ActivateError, ActivationBackend, ActivationRequest, ActivatedTarget,
+    backend_for, ActivateError, ActivatedTarget, ActivationBackend, ActivationRequest,
     PackagedActivationBackend, Win32ActivationBackend,
 };
 pub use attach::{select_strategy, AttachError, AttachedRuntime, RuntimeAttacher, RuntimeInjector};
@@ -44,4 +44,8 @@ pub use package_discovery::{
     normalize_launch_target, parse_aumid, resolve_package_identity, PackageAppInfo,
 };
 pub use process_tracker::{ProcessTracker, TrackMode};
-pub use session::{belongs, register_child, start_session, SessionError, SessionHandle, SessionStartRequest};
+pub use session::{
+    belongs, register_child, start_session, start_session_in_named_job,
+    start_session_in_new_console, terminal_cancel_marker_path, terminal_root_marker_path,
+    SessionError, SessionHandle, SessionStartRequest,
+};

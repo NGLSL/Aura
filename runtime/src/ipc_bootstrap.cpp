@@ -174,7 +174,13 @@ HANDLE ConnectPipe(DWORD timeout_ms) {
   ULONGLONG deadline = GetTickCount64() + timeout_ms;
   for (;;) {
     // Wait briefly for an instance; ignore failure and still try CreateFileW.
-    WaitNamedPipeW(path, 100);
+    // Keep the wait inside the caller's deadline so a missing broker cannot
+    // add an extra fixed 100 ms after the retry window has expired.
+    DWORD remaining = RemainingMs(deadline);
+    if (remaining == 0) {
+      break;
+    }
+    WaitNamedPipeW(path, remaining < 100 ? remaining : 100);
     HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
@@ -196,8 +202,17 @@ HANDLE ConnectPipe(DWORD timeout_ms) {
       OutputDebugStringA(msg);
       return INVALID_HANDLE_VALUE;
     }
-    Sleep(50);
+    // The launcher publishes the first pipe instance before activation, so
+    // this is normally never reached for a new root. Keep a short backoff for
+    // PostActivation/late descendants without paying a 50 ms floor per retry.
+    DWORD backoff = RemainingMs(deadline);
+    if (backoff == 0) {
+      break;
+    }
+    Sleep(backoff < 5 ? backoff : 5);
   }
+  OutputDebugStringA("EnvBox IPC: connect deadline reached\n");
+  return INVALID_HANDLE_VALUE;
 }
 
 void ClosePipe(HANDLE h) {

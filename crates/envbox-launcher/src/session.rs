@@ -3,15 +3,13 @@
 //! Order: resolve → capability probe → backend selection → activation →
 //! attach → bootstrap → track. Win32 golden path stays PreExecution.
 
-use crate::activation::{
-    backend_for, ActivateError, ActivationRequest, ActivatedTarget,
-};
+use crate::activation::{backend_for, ActivateError, ActivatedTarget, ActivationRequest};
 use crate::attach::{select_strategy, AttachError, AttachedRuntime, RuntimeInjector};
 use crate::capability::win32_capabilities;
 use crate::environment::build_environment_block;
+use crate::ipc::SessionTable;
 use crate::job::{InstanceJob, JobError};
 use crate::launcher::{LaunchError, LaunchedProcess};
-use crate::ipc::SessionTable;
 use envbox_core::{
     isolation_for_strategy, AttachStrategy, EnvironmentProfile, EnvironmentSession,
     IsolationGuarantee, LaunchTarget, RuntimeInstance, SessionState,
@@ -71,17 +69,23 @@ impl SessionHandle {
         }
         #[cfg(windows)]
         {
-            use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+            use windows::Win32::System::Threading::{
+                GetExitCodeProcess, WaitForSingleObject, INFINITE,
+            };
             let Some(process) = &self.process else {
                 return Ok(0);
             };
             unsafe {
                 if WaitForSingleObject(process.0, INFINITE).0 == 0xFFFF_FFFF {
-                    return Err(SessionError::Unsupported("WaitForSingleObject failed".into()));
+                    return Err(SessionError::Unsupported(
+                        "WaitForSingleObject failed".into(),
+                    ));
                 }
                 let mut code = 0u32;
                 if GetExitCodeProcess(process.0, &mut code).is_err() {
-                    return Err(SessionError::Unsupported("GetExitCodeProcess failed".into()));
+                    return Err(SessionError::Unsupported(
+                        "GetExitCodeProcess failed".into(),
+                    ));
                 }
                 Ok(code as i32)
             }
@@ -106,11 +110,63 @@ pub struct SessionStartRequest {
     pub audit: bool,
 }
 
+/// Small local handoff marker used only between the GUI and the hidden
+/// Windows Terminal bridge. It carries the exact root PID because Job Object
+/// process-list order is unspecified. The GUI removes stale markers when a
+/// handoff times out; the generated UUID keeps concurrent launches isolated.
+pub fn terminal_root_marker_path(instance_id: Uuid) -> PathBuf {
+    std::env::temp_dir().join(format!("envbox-terminal-{instance_id}.root"))
+}
+
+/// Non-overwritable cancellation marker for a Windows Terminal handoff.
+/// Keeping this separate from the root-PID state prevents terminal-run from
+/// replacing a Stop request while publishing its `running` marker.
+pub fn terminal_cancel_marker_path(instance_id: Uuid) -> PathBuf {
+    std::env::temp_dir().join(format!("envbox-terminal-{instance_id}.cancel"))
+}
+
 /// Start an Environment Session.
 ///
 /// Host (no profile): plain create, no Runtime injection.
 /// Profile: activate → attach → resume (Win32) or activate → attach (Packaged).
 pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionError> {
+    start_session_with_options(req, None, None, false)
+}
+
+/// Start a GUI-selected shell with its own interactive console. This is only
+/// used for Cmd/PowerShell Application preferences; `envbox run` keeps the
+/// caller's console, and Windows Terminal supplies a ConPTY itself.
+pub fn start_session_in_new_console(
+    req: SessionStartRequest,
+) -> Result<SessionHandle, SessionError> {
+    start_session_with_options(req, None, None, true)
+}
+
+/// Start a session in a Job Object that was created by another process.
+///
+/// This is the handoff seam for Windows Terminal: the GUI creates a unique
+/// named Job, launches `wt.exe`, and the hidden `terminal-run` command opens
+/// the name before starting the real CLI. The supplied instance ID is kept so
+/// the Runtime and the GUI refer to the same instance.
+pub fn start_session_in_named_job(
+    req: SessionStartRequest,
+    instance_id: Uuid,
+    job_name: impl AsRef<str>,
+) -> Result<SessionHandle, SessionError> {
+    start_session_with_options(
+        req,
+        Some(instance_id),
+        Some(job_name.as_ref().to_string()),
+        false,
+    )
+}
+
+fn start_session_with_options(
+    req: SessionStartRequest,
+    requested_instance_id: Option<Uuid>,
+    requested_job_name: Option<String>,
+    create_new_console: bool,
+) -> Result<SessionHandle, SessionError> {
     // Safety net: every caller (GUI/CLI/tests) gets Packaged for AUMID /
     // WindowsApps targets. Never CreateProcess a WindowsApps exe (package
     // identity would be dropped — ChatGPT: "该进程没有程序包标识符").
@@ -118,7 +174,7 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
         launch: crate::package_discovery::normalize_launch_target(&req.launch),
         ..req
     };
-    let instance_id = Uuid::new_v4();
+    let instance_id = requested_instance_id.unwrap_or_else(Uuid::new_v4);
     let profile_id = req.profile.as_ref().map(|p| p.id).unwrap_or_default();
     let host_mode = req.profile.is_none();
 
@@ -134,9 +190,7 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
             )));
         }
         for (key, value) in &profile.environment {
-            if key.len() + 1 + value.len()
-                >= crate::ipc::RUNTIME_ENVIRONMENT_ENTRY_MAX_BYTES
-            {
+            if key.len() + 1 + value.len() >= crate::ipc::RUNTIME_ENVIRONMENT_ENTRY_MAX_BYTES {
                 return Err(SessionError::InvalidProfile(format!(
                     "environment entry {key:?} is too large for Runtime IPC"
                 )));
@@ -254,6 +308,14 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
     );
     session.id = instance_id;
 
+    // Open a pre-created named Job before activation so a missing/expired
+    // Windows Terminal handoff fails closed without starting an untracked
+    // target. Ordinary sessions create their private Job after activation.
+    let mut job = match requested_job_name.as_deref() {
+        Some(name) => InstanceJob::open_named(name)?,
+        None => InstanceJob::create()?,
+    };
+
     // Activation
     let runtime_dll = if host_mode {
         None
@@ -273,6 +335,7 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
         runtime_dll: runtime_dll.clone(),
         require_runtime: !host_mode,
         webrtc_policy: req.profile.as_ref().map(|p| p.browser.webrtc),
+        create_new_console,
     };
 
     let backend = backend_for(&req.launch);
@@ -316,17 +379,24 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
     tracker.register_root(activated.pid);
     tracker.mark(SessionState::Activated);
 
-    // Job (lifecycle only; best-effort for packaged).
-    let mut job = InstanceJob::create()?;
-    let _job_ok = job.assign_pid(activated.pid).is_ok();
+    // Job (lifecycle only; best-effort for packaged). A named handoff Job is
+    // required: silently proceeding without assignment would defeat GUI Stop.
+    if let Err(err) = job.assign_pid(activated.pid) {
+        if requested_job_name.is_some() {
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::System::Threading::TerminateProcess;
+                let _ = TerminateProcess(activated.process.0, 1);
+            }
+            return Err(err.into());
+        }
+    }
 
     // Attach
     let attached = if host_mode {
         None
     } else {
-        let dll = runtime_dll
-            .clone()
-            .ok_or(SessionError::InjectionFailed)?;
+        let dll = runtime_dll.clone().ok_or(SessionError::InjectionFailed)?;
         let injector = RuntimeInjector::new(dll);
         let already = activated.suspended && !is_packaged; // Detours at create
         match injector.attach(activated.pid, strategy, already) {
@@ -368,10 +438,7 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
         .package_identity
         .as_ref()
         .map(|p| p.package_family_name.clone());
-    let aumid = session
-        .package_identity
-        .as_ref()
-        .map(|p| p.aumid.clone());
+    let aumid = session.package_identity.as_ref().map(|p| p.aumid.clone());
     let instance = RuntimeInstance {
         id: instance_id,
         application_id: req.application_id,
@@ -440,9 +507,7 @@ pub fn belongs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use envbox_core::{
-        DnsMode, DnsProfile, LocaleProfile, RegistryProfile, TimezoneProfile,
-    };
+    use envbox_core::{DnsMode, DnsProfile, LocaleProfile, RegistryProfile, TimezoneProfile};
 
     fn profile() -> EnvironmentProfile {
         EnvironmentProfile {
@@ -587,7 +652,10 @@ mod tests {
         let launch = crate::package_discovery::launch_target_from_user_path(
             r"shell:AppsFolder\OpenAi.Codex_2p2nqsd0c76g0!App",
         );
-        assert!(matches!(launch, LaunchTarget::Packaged { .. }), "{launch:?}");
+        assert!(
+            matches!(launch, LaunchTarget::Packaged { .. }),
+            "{launch:?}"
+        );
         let req = SessionStartRequest {
             application_id: Uuid::nil(),
             launch,

@@ -6,7 +6,7 @@
 use envbox_core::{LaunchTarget, PackageIdentity, TargetCapabilities};
 use thiserror::Error;
 
-use crate::capability::{capabilities_after_probe, probe_pid, win32_capabilities, ProcessProbe};
+use crate::capability::{capabilities_after_probe, probe_pid, win32_capabilities};
 
 #[derive(Debug, Error)]
 pub enum ActivateError {
@@ -41,7 +41,6 @@ pub struct ActivatedTarget {
     pub capabilities: TargetCapabilities,
     pub injection_supported: bool,
     pub injection_reason: Option<String>,
-    pub probe: ProcessProbe,
     #[cfg(windows)]
     pub process: crate::launcher::win::SafeHandle,
     #[cfg(windows)]
@@ -61,6 +60,9 @@ pub struct ActivationRequest {
     pub require_runtime: bool,
     /// Browser / Network Guard: root-process Chromium switch (Win32 only).
     pub webrtc_policy: Option<envbox_core::WebRtcPolicy>,
+    /// GUI-selected Cmd/PowerShell roots need their own interactive console.
+    /// Direct CLI runs keep the caller's existing console.
+    pub create_new_console: bool,
 }
 
 /// ActivationBackend: produce a live process. Attach is a separate seam.
@@ -74,6 +76,34 @@ pub trait ActivationBackend {
 
 /// Win32 / Command backend: CreateProcess(CREATE_SUSPENDED) [+ Detours inject].
 pub struct Win32ActivationBackend;
+
+/// Apply the same working-directory policy used by the direct launch path.
+///
+/// This helper runs after the target kind is known, which is necessary to
+/// distinguish a CLI `Command` from a GUI `Executable` before CreateProcess.
+fn effective_activation_request(
+    target: &LaunchTarget,
+    req: &ActivationRequest,
+) -> Result<ActivationRequest, ActivateError> {
+    let working_directory =
+        crate::launcher::effective_working_directory(target, req.working_directory.as_deref())
+            .map_err(|error| match error {
+                crate::launcher::LaunchError::WorkingDirectoryMissing(path) => {
+                    ActivateError::WorkingDirectoryMissing(path)
+                }
+                other => ActivateError::Resolve(other.to_string()),
+            })?;
+
+    if let Some(dir) = &working_directory {
+        if !dir.is_dir() {
+            return Err(ActivateError::WorkingDirectoryMissing(dir.clone()));
+        }
+    }
+
+    let mut effective = req.clone();
+    effective.working_directory = working_directory;
+    Ok(effective)
+}
 
 impl ActivationBackend for Win32ActivationBackend {
     fn activate(
@@ -129,16 +159,11 @@ impl ActivationBackend for Win32ActivationBackend {
             }
         };
 
-        if let Some(dir) = &req.working_directory {
-            if !dir.is_dir() {
-                return Err(ActivateError::WorkingDirectoryMissing(dir.clone()));
-            }
-        }
+        let effective_req = effective_activation_request(target, req)?;
 
-        let spawn = crate::launcher::spawn_for_activation(&resolved, &user_args, req)?;
-        let probe = probe_pid(spawn.pid);
-        let (injection_supported, injection_reason) = if req.require_runtime {
-            if req.runtime_dll.is_some() {
+        let spawn = crate::launcher::spawn_for_activation(&resolved, &user_args, &effective_req)?;
+        let (injection_supported, injection_reason) = if effective_req.require_runtime {
+            if effective_req.runtime_dll.is_some() {
                 (true, None)
             } else {
                 (
@@ -147,7 +172,7 @@ impl ActivationBackend for Win32ActivationBackend {
                 )
             }
         } else {
-            (req.runtime_dll.is_some(), None)
+            (effective_req.runtime_dll.is_some(), None)
         };
 
         Ok(ActivatedTarget {
@@ -157,7 +182,6 @@ impl ActivationBackend for Win32ActivationBackend {
             capabilities: win32_capabilities(),
             injection_supported,
             injection_reason,
-            probe,
             #[cfg(windows)]
             process: spawn.process,
             #[cfg(windows)]
@@ -180,7 +204,11 @@ impl ActivationBackend for PackagedActivationBackend {
                 aumid,
                 package_full_name,
                 package_family_name,
-            } => (aumid.clone(), package_full_name.clone(), package_family_name.clone()),
+            } => (
+                aumid.clone(),
+                package_full_name.clone(),
+                package_family_name.clone(),
+            ),
             _ => {
                 return Err(ActivateError::UnsupportedTarget(
                     "PackagedActivationBackend requires LaunchTarget::Packaged".into(),
@@ -217,7 +245,6 @@ impl ActivationBackend for PackagedActivationBackend {
             capabilities: capabilities_after_probe(&probe, injection.supported),
             injection_supported: injection.supported,
             injection_reason: injection.reason,
-            probe,
             #[cfg(windows)]
             process: crate::launcher::open_process_handle(pid)?,
             #[cfg(windows)]
@@ -244,7 +271,9 @@ fn activate_aumid(aumid: &str) -> Result<u32, ActivateError> {
 #[cfg(windows)]
 fn win_activate_aumid(aumid: &str) -> Result<u32, ActivateError> {
     use windows::core::HSTRING;
-    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+    };
     use windows::Win32::UI::Shell::{
         ApplicationActivationManager, IApplicationActivationManager, AO_NONE,
     };
@@ -253,12 +282,9 @@ fn win_activate_aumid(aumid: &str) -> Result<u32, ActivateError> {
         // Best-effort COM init; already-initialized is fine.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-        let manager: IApplicationActivationManager = CoCreateInstance(
-            &ApplicationActivationManager,
-            None,
-            CLSCTX_ALL,
-        )
-        .map_err(|e| ActivateError::AumidActivate(format!("CoCreateInstance: {e}")))?;
+        let manager: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)
+                .map_err(|e| ActivateError::AumidActivate(format!("CoCreateInstance: {e}")))?;
 
         let aumid_h = HSTRING::from(aumid);
         let args = HSTRING::new();
@@ -276,5 +302,56 @@ pub fn backend_for(target: &LaunchTarget) -> Box<dyn ActivationBackend> {
         LaunchTarget::Executable { .. } | LaunchTarget::Command { .. } => {
             Box::new(Win32ActivationBackend)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn request(working_directory: Option<PathBuf>) -> ActivationRequest {
+        ActivationRequest {
+            arguments: Vec::new(),
+            working_directory,
+            environment: HashMap::new(),
+            runtime_dll: None,
+            require_runtime: false,
+            webrtc_policy: None,
+            create_new_console: false,
+        }
+    }
+
+    #[test]
+    fn command_activation_defaults_to_user_profile_directory() {
+        let target = LaunchTarget::Command {
+            command: "my-cli".into(),
+        };
+        let req = request(None);
+        let effective = effective_activation_request(&target, &req).unwrap();
+        let expected = crate::launcher::effective_working_directory(&target, None).unwrap();
+        assert_eq!(effective.working_directory, expected);
+        assert!(effective.working_directory.is_some());
+    }
+
+    #[test]
+    fn executable_activation_keeps_inherited_working_directory() {
+        let target = LaunchTarget::Executable {
+            path: PathBuf::from(r"C:\Program Files\my-gui.exe"),
+        };
+        let effective = effective_activation_request(&target, &request(None)).unwrap();
+        assert_eq!(effective.working_directory, None);
+    }
+
+    #[test]
+    fn activation_explicit_working_directory_wins_for_commands() {
+        let target = LaunchTarget::Command {
+            command: "my-cli".into(),
+        };
+        let explicit = std::env::current_dir().unwrap();
+        let effective =
+            effective_activation_request(&target, &request(Some(explicit.clone()))).unwrap();
+        assert_eq!(effective.working_directory, Some(explicit));
     }
 }

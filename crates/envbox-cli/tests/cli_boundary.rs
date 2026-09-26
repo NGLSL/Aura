@@ -637,6 +637,7 @@ fn sample_app(args: Vec<String>) -> envbox_core::Application {
         launch: LaunchTarget::Command {
             command: "cmd".into(),
         },
+        console_host: envbox_core::ConsoleHost::Direct,
         working_directory: None,
         arguments: args,
         default_profile_id: Uuid::nil(),

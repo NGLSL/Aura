@@ -7,6 +7,7 @@ use crate::ipc::{IpcMessage, SessionTable};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Shared host session registry used by the pipe server.
 pub type SharedTable = Arc<Mutex<SessionTable>>;
@@ -31,9 +32,37 @@ impl HostBroker {
         let stop2 = stop.clone();
         let table2 = table.clone();
         let name2 = pipe_name.clone();
+        // Do not return until the accept loop has created its first pipe
+        // instance. Runtime DLL initialization happens immediately after the
+        // launcher returns from this function; without this handoff the
+        // client can spend its first retry interval waiting for a server
+        // thread that has not been scheduled yet.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("envbox-ipc-host".into())
-            .spawn(move || serve_loop(table2, stop2, name2))?;
+            .spawn(move || serve_loop(table2, stop2, name2, Some(ready_tx)))?;
+
+        match ready_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                stop.store(true, Ordering::SeqCst);
+                nudge_pipe(&pipe_name);
+                let _ = join.join();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "IPC broker did not become ready",
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                stop.store(true, Ordering::SeqCst);
+                nudge_pipe(&pipe_name);
+                let _ = join.join();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "IPC broker stopped before becoming ready",
+                ));
+            }
+        }
         Ok(Self {
             table,
             stop,
@@ -85,12 +114,12 @@ fn nudge_pipe(name: &str) {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Storage::FileSystem::{
             CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             OPEN_EXISTING,
         };
-        use windows::core::PCWSTR;
 
         let wide: Vec<u16> = std::ffi::OsStr::new(name)
             .encode_wide()
@@ -113,15 +142,20 @@ fn nudge_pipe(name: &str) {
 }
 
 #[cfg(windows)]
-fn serve_loop(table: SharedTable, stop: Arc<AtomicBool>, pipe_name: String) {
+fn serve_loop(
+    table: SharedTable,
+    stop: Arc<AtomicBool>,
+    pipe_name: String,
+    mut ready: Option<std::sync::mpsc::SyncSender<()>>,
+) {
     use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HANDLE};
     use windows::Win32::Storage::FileSystem::{FlushFileBuffers, PIPE_ACCESS_DUPLEX};
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-        PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
     };
-    use windows::core::PCWSTR;
 
     struct OwnedHandle(HANDLE);
     impl Drop for OwnedHandle {
@@ -152,10 +186,19 @@ fn serve_loop(table: SharedTable, stop: Arc<AtomicBool>, pipe_name: String) {
             )
         };
         if raw.is_invalid() {
+            // Preserve the existing retry behavior for a transient bind
+            // failure. start_on will stop the loop if the first instance does
+            // not become available within its bounded readiness window.
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
         let pipe = OwnedHandle(raw);
+        if let Some(tx) = ready.take() {
+            let _ = tx.send(());
+        }
 
         match unsafe { ConnectNamedPipe(pipe.0, None) } {
             Ok(()) => {}
@@ -216,17 +259,22 @@ fn serve_connection(
 }
 
 #[cfg(not(windows))]
-fn serve_loop(_table: SharedTable, stop: Arc<AtomicBool>, _pipe_name: String) {
+fn serve_loop(
+    _table: SharedTable,
+    stop: Arc<AtomicBool>,
+    _pipe_name: String,
+    ready: Option<std::sync::mpsc::SyncSender<()>>,
+) {
+    if let Some(tx) = ready {
+        let _ = tx.send(());
+    }
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
 #[cfg(not(windows))]
-fn serve_connection(
-    _pipe: (),
-    _table: &SharedTable,
-) -> std::io::Result<()> {
+fn serve_connection(_pipe: (), _table: &SharedTable) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -252,8 +300,43 @@ mod tests {
     #[test]
     fn fake_broker_still_works() {
         let mut b = FakeBroker::new();
-        assert!(b
-            .send(IpcMessage::RuntimeReady { pid: 1 })
-            .is_none());
+        assert!(b.send(IpcMessage::RuntimeReady { pid: 1 }).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn start_returns_after_pipe_instance_exists() {
+        use std::os::windows::ffi::OsStrExt;
+        use uuid::Uuid;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        };
+
+        let name = session_pipe_name(&Uuid::new_v4().to_string());
+        let table: SharedTable = Arc::new(Mutex::new(SessionTable::new()));
+        let mut broker = HostBroker::start_on(table, name.clone()).expect("broker ready");
+        let wide: Vec<u16> = std::ffi::OsStr::new(&name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let client = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        }
+        .expect("start_on must publish a connectable pipe");
+        unsafe {
+            let _ = CloseHandle(client);
+        }
+        broker.stop();
     }
 }

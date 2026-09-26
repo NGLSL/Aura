@@ -96,7 +96,6 @@ impl ConfigStore {
         // Corrupt profiles must fail closed on read (L15).
         for profile in &doc.profiles {
             validate_profile(profile)?;
-            validate_timezone_windows_id(&profile.timezone.windows_id)?;
         }
         Ok(doc)
     }
@@ -158,9 +157,37 @@ fn validate_timezone_windows_id(windows_id: &str) -> Result<(), DomainError> {
 fn windows_id_exists(windows_id: &str) -> bool {
     #[cfg(windows)]
     {
-        enumerate_dynamic_timezone_ids()
-            .iter()
-            .any(|id| id.eq_ignore_ascii_case(windows_id))
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+        };
+
+        // A Windows time-zone ID is one key below Time Zones. Opening that
+        // exact key avoids enumerating every system zone for each Profile read.
+        if windows_id.contains(['\\', '/']) {
+            return false;
+        }
+        let path =
+            format!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\{windows_id}");
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut key = HKEY::default();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(wide.as_ptr()),
+                0,
+                KEY_READ,
+                &mut key,
+            )
+        };
+        if opened.is_ok() {
+            unsafe {
+                let _ = RegCloseKey(key);
+            }
+            true
+        } else {
+            false
+        }
     }
     #[cfg(not(windows))]
     {
@@ -307,7 +334,8 @@ pub fn validate_application(app: &Application) -> Result<(), StorageError> {
 mod tests {
     use super::*;
     use envbox_core::{
-        DnsMode, DnsProfile, LaunchTarget, LocaleProfile, RegistryProfile, TimezoneProfile,
+        ConsoleHost, DnsMode, DnsProfile, LaunchTarget, LocaleProfile, RegistryProfile,
+        TimezoneProfile,
     };
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -373,6 +401,7 @@ mod tests {
             arguments: vec![],
             default_profile_id: Uuid::nil(),
             inherit_children: true,
+            console_host: ConsoleHost::Direct,
             audit: false,
         }
     }
@@ -388,7 +417,10 @@ mod tests {
             })
             .unwrap();
         let text = std::fs::read_to_string(store.profiles_path()).unwrap();
-        assert!(text.contains("[[profiles]]"), "expected array-of-tables:\n{text}");
+        assert!(
+            text.contains("[[profiles]]"),
+            "expected array-of-tables:\n{text}"
+        );
         let loaded = store.load_profiles().unwrap();
         assert_eq!(loaded.profiles.len(), 1);
         assert_eq!(loaded.profiles[0].name, "US Development");
@@ -442,6 +474,20 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn direct_timezone_lookup_accepts_enumerated_windows_ids() {
+        let ids = enumerate_dynamic_timezone_ids();
+        assert!(!ids.is_empty());
+        for id in ids {
+            assert!(
+                windows_id_exists(&id),
+                "enumerated ID missing its registry key: {id}"
+            );
+        }
+        assert!(!windows_id_exists(r"..\Bogus"));
+    }
+
     #[test]
     fn invalid_dns_servers_rejected_by_type_and_mode() {
         let mut profile = sample_profile();
@@ -482,11 +528,33 @@ mod tests {
             })
             .unwrap();
         let text = std::fs::read_to_string(store.applications_path()).unwrap();
-        assert!(text.contains("[[applications]]"), "expected array-of-tables:\n{text}");
+        assert!(
+            text.contains("[[applications]]"),
+            "expected array-of-tables:\n{text}"
+        );
         assert!(text.contains("type = \"command\""), "launch tag:\n{text}");
         let loaded = store.load_applications().unwrap();
         assert_eq!(loaded.applications[0].name, "Claude Code");
+        assert_eq!(loaded.applications[0].console_host, ConsoleHost::Direct);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_application_defaults_to_direct_console_host() {
+        let legacy = r#"
+[[applications]]
+id = "00000000-0000-0000-0000-000000000000"
+name = "Claude Code"
+launch = { type = "command", command = "claude" }
+arguments = []
+working_directory = ""
+default_profile_id = "00000000-0000-0000-0000-000000000000"
+inherit_children = true
+audit = false
+"#;
+        let doc: ApplicationDocument =
+            toml::from_str(legacy).expect("legacy application should load");
+        assert_eq!(doc.applications[0].console_host, ConsoleHost::Direct);
     }
 
     #[test]

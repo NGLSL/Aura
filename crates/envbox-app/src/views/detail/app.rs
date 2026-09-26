@@ -1,6 +1,7 @@
 use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{Alignment, Element, Fill, Length, Padding};
 
+use envbox_core::ConsoleHost;
 use crate::app::EnvBoxApp;
 use crate::font;
 use crate::icons::{icon, Icon};
@@ -242,6 +243,34 @@ fn app_editor(app: &EnvBoxApp) -> Element<'_, Message> {
         .find(|n| n.id == app.app_draft.profile_id)
         .cloned();
 
+    let console_hint: Element<'_, Message> = if app.app_draft.console_host != ConsoleHost::Direct
+        && app.app_draft.kind != LaunchKind::Command
+    {
+        container(
+            text(format!(
+                "{} 仅适用于 Command 目标；请先将启动类型改为 Command。",
+                app.app_draft.console_host
+            ))
+            .size(11)
+            .color(DANGER_TEXT)
+            .font(font::ui_font()),
+        )
+        .padding(Padding::from([4, 8]))
+        .style(inner_card_style)
+        .into()
+    } else if app.app_draft.console_host == ConsoleHost::WindowsTerminal {
+        container(
+            text("Windows Terminal 将在保存后用于命令目标的启动。")
+                .size(11)
+                .color(MUTED)
+                .font(font::ui_font()),
+        )
+        .padding(Padding::from([4, 8]))
+        .into()
+    } else {
+        container(text("")).into()
+    };
+
     let basic = column![
         field_label("基本信息"),
         form_row(
@@ -272,6 +301,19 @@ fn app_editor(app: &EnvBoxApp) -> Element<'_, Message> {
                 .style(input_style)
                 .font(font::ui_font()),
         ),
+        form_row(
+            "终端宿主",
+            pick_list(
+                ConsoleHost::ALL,
+                Some(app.app_draft.console_host),
+                Message::AppConsoleHost,
+            )
+            .style(pick_style)
+            .menu_style(pick_menu)
+            .padding(Padding::from([5, 8]))
+            .font(font::ui_font()),
+        ),
+        console_hint,
         form_row(
             "默认环境",
             pick_list(profile_labels, selected_profile, |n: NamedId| {

@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let store = ConfigStore::new(ConfigStore::default_root());
+    let store =
+        ConfigStore::new(terminal_store_root(&args).unwrap_or_else(ConfigStore::default_root));
 
     match args.first().map(String::as_str) {
         Some("profile") => match args.get(1).map(String::as_str) {
@@ -32,8 +33,29 @@ fn main() -> ExitCode {
             _ => usage(),
         },
         Some("run") => cmd_run(&store, &args[1..]),
+        Some("hidden") if args.get(1).map(String::as_str) == Some("terminal-run") => {
+            cmd_terminal_run(&store, &args[2..])
+        }
+        Some("terminal-run") => cmd_terminal_run(&store, &args[1..]),
         _ => usage(),
     }
+}
+
+/// Windows Terminal's server may have been started before the GUI and does
+/// not reliably inherit the GUI's custom `ENVBOX_CONFIG_ROOT`. Pass the
+/// already selected store root as a controlled handoff value so terminal-run
+/// reads exactly the same persisted Application/Profile documents.
+fn terminal_store_root(args: &[String]) -> Option<PathBuf> {
+    let is_terminal_run = matches!(
+        args.first().map(String::as_str),
+        Some("terminal-run" | "hidden")
+    );
+    if !is_terminal_run {
+        return None;
+    }
+    args.windows(2)
+        .find(|pair| pair[0] == "--config-root")
+        .map(|pair| PathBuf::from(&pair[1]))
 }
 
 fn usage() -> ExitCode {
@@ -43,11 +65,14 @@ fn usage() -> ExitCode {
     eprintln!("  envbox profile list");
     eprintln!("  envbox profile add --name N --locale L --ui-language U --region R \\");
     eprintln!("     --tz-windows W --tz-iana I [--dns-mode host|virtual_view] \\");
-    eprintln!("     [--dns IP]... [--env K=V]... [--webrtc host|public_interface_only|proxy_only|strict]");
+    eprintln!(
+        "     [--dns IP]... [--env K=V]... [--webrtc host|public_interface_only|proxy_only|strict]"
+    );
     eprintln!("  envbox app list");
     eprintln!("  envbox app add --name N (--command C | --executable P) --profile ID \\");
     eprintln!("     [--working-directory D] [--arg A]... [--inherit-children] [--audit]");
     eprintln!("  envbox run --profile <id> [--working-directory D] [--no-inherit-children] [--audit] [--] <command> [args...]");
+    eprintln!("  envbox hidden terminal-run --config-root ROOT --app-id ID --profile-id ID|host --instance-id ID --job-name NAME");
     eprintln!("  envbox audit show <instance_id> [--summary]");
     eprintln!("  envbox audit export [--out PATH]");
     ExitCode::FAILURE
@@ -366,9 +391,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         Ok(mut handle) => {
             eprintln!(
                 "envbox: started pid={} instance={} profile={} (Runtime + core hooks active)",
-                handle.instance.root_pid,
-                handle.instance.id,
-                handle.instance.profile_id
+                handle.instance.root_pid, handle.instance.id, handle.instance.profile_id
             );
             match handle.wait_root() {
                 Ok(code) => {
@@ -389,6 +412,217 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Windows Terminal handoff entry point. The actual command and arguments are
+/// deliberately loaded from the persisted Application record, so `wt.exe`
+/// never receives user command text and cannot accidentally start an
+/// unvirtualized copy of a CLI.
+fn cmd_terminal_run(store: &ConfigStore, args: &[String]) -> ExitCode {
+    let mut app_raw = None;
+    let mut profile_raw = None;
+    let mut instance_raw = None;
+    let mut job_name = None;
+    let mut config_fingerprint = None;
+    let mut i = 0;
+    while i < args.len() {
+        let value = |index: &mut usize| -> Option<String> {
+            *index += 1;
+            args.get(*index).cloned()
+        };
+        match args[i].as_str() {
+            "--config-root" => {
+                if value(&mut i).is_none() {
+                    eprintln!("error: terminal-run --config-root requires a path");
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--config-fingerprint" => {
+                let Some(raw) = value(&mut i) else {
+                    eprintln!("error: terminal-run --config-fingerprint requires a value");
+                    return ExitCode::FAILURE;
+                };
+                config_fingerprint = match raw.parse::<u64>() {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        eprintln!("error: invalid terminal-run config fingerprint");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            }
+            "--app-id" => app_raw = value(&mut i),
+            "--profile-id" => profile_raw = value(&mut i),
+            "--instance-id" => instance_raw = value(&mut i),
+            "--job-name" => job_name = value(&mut i),
+            other => {
+                eprintln!("error: terminal-run unknown argument {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(app_raw) = app_raw.filter(|value| !value.is_empty()) else {
+        eprintln!("error: terminal-run requires --app-id");
+        return ExitCode::FAILURE;
+    };
+    let Some(profile_raw) = profile_raw.filter(|value| !value.is_empty()) else {
+        eprintln!("error: terminal-run requires --profile-id");
+        return ExitCode::FAILURE;
+    };
+    let Some(instance_raw) = instance_raw.filter(|value| !value.is_empty()) else {
+        eprintln!("error: terminal-run requires --instance-id");
+        return ExitCode::FAILURE;
+    };
+    let Some(job_name) = job_name.filter(|value| !value.is_empty()) else {
+        eprintln!("error: terminal-run requires --job-name");
+        return ExitCode::FAILURE;
+    };
+
+    let Some(application_id) = parse_instance_id(&app_raw) else {
+        eprintln!("error: invalid --app-id {app_raw:?}");
+        return ExitCode::FAILURE;
+    };
+    let Some(instance_id) = parse_instance_id(&instance_raw) else {
+        eprintln!("error: invalid --instance-id {instance_raw:?}");
+        return ExitCode::FAILURE;
+    };
+    if !job_name.starts_with(r"Local\Aura-") || job_name.contains('\0') {
+        eprintln!("error: invalid terminal-run Job name");
+        return ExitCode::FAILURE;
+    }
+    if let Some(expected) = config_fingerprint {
+        let actual = terminal_config_fingerprint(store.root());
+        if actual != expected {
+            eprintln!("error: application/profile store changed before Windows Terminal handoff");
+            return ExitCode::FAILURE;
+        }
+    }
+    let marker = envbox_launcher::terminal_root_marker_path(instance_id);
+    let cancel_marker = envbox_launcher::terminal_cancel_marker_path(instance_id);
+    if terminal_handoff_cancelled(&cancel_marker) {
+        eprintln!("error: Windows Terminal handoff was stopped before activation");
+        return ExitCode::FAILURE;
+    }
+
+    let app = match store.load_applications() {
+        Ok(doc) => doc
+            .applications
+            .into_iter()
+            .find(|app| app.id == application_id),
+        Err(err) => {
+            eprintln!("error: applications store unreadable: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(app) = app else {
+        eprintln!("error: application {application_id} not found");
+        return ExitCode::FAILURE;
+    };
+    if let Err(err) = validate_application(&app) {
+        eprintln!("error: saved application is invalid: {err}");
+        return ExitCode::FAILURE;
+    }
+    if app.console_host != envbox_core::ConsoleHost::WindowsTerminal {
+        eprintln!("error: application is no longer configured for Windows Terminal");
+        return ExitCode::FAILURE;
+    }
+
+    let profile = if profile_raw.eq_ignore_ascii_case("host") {
+        None
+    } else {
+        let Some(profile_id) = parse_instance_id(&profile_raw) else {
+            eprintln!("error: invalid --profile-id {profile_raw:?}");
+            return ExitCode::FAILURE;
+        };
+        match store.load_profiles() {
+            Ok(doc) => match doc
+                .profiles
+                .into_iter()
+                .find(|profile| profile.id == profile_id)
+            {
+                Some(profile) => Some(profile),
+                None => {
+                    eprintln!("error: profile {profile_id} not found");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Err(err) => {
+                eprintln!("error: profiles store unreadable: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let request = envbox_launcher::SessionStartRequest {
+        application_id,
+        launch: app.launch,
+        arguments: app.arguments,
+        working_directory: app.working_directory,
+        profile,
+        inherit_children: app.inherit_children,
+        audit: app.audit,
+    };
+    match envbox_launcher::start_session_in_named_job(request, instance_id, &job_name) {
+        Ok(mut handle) => {
+            let root_pid = handle.instance.root_pid;
+            if terminal_handoff_cancelled(&cancel_marker) {
+                let _ = handle.job.as_mut().map(|job| job.terminate());
+                eprintln!("error: Windows Terminal handoff was stopped during activation");
+                return ExitCode::FAILURE;
+            }
+            if let Err(err) = std::fs::write(&marker, format!("{root_pid}\nrunning\n")) {
+                let _ = handle.job.as_mut().map(|job| job.terminate());
+                eprintln!("error: terminal-run cannot publish root PID: {err}");
+                return ExitCode::FAILURE;
+            }
+            if terminal_handoff_cancelled(&cancel_marker) {
+                let _ = handle.job.as_mut().map(|job| job.terminate());
+                let _ = std::fs::write(&marker, format!("{root_pid}\nexited\n"));
+                eprintln!("error: Windows Terminal handoff was stopped before wait");
+                return ExitCode::FAILURE;
+            }
+            let result = match handle.wait_root() {
+                Ok(code) if code == 0 => ExitCode::SUCCESS,
+                Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+                Err(err) => {
+                    eprintln!("error: terminal-run wait failed: {err}");
+                    ExitCode::FAILURE
+                }
+            };
+            // Keep the marker long enough for the GUI refresh loop to observe
+            // a fast CLI exit; the GUI owns cleanup of the per-instance file.
+            let _ = std::fs::write(&marker, format!("{root_pid}\nexited\n"));
+            result
+        }
+        Err(err) => {
+            eprintln!("error: terminal-run failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn terminal_handoff_cancelled(marker: &std::path::Path) -> bool {
+    std::fs::read_to_string(marker)
+        .map(|text| text.trim() == "cancelled")
+        .unwrap_or(false)
+}
+
+fn terminal_config_fingerprint(root: &std::path::Path) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for name in ["applications.toml", "profiles.toml"] {
+        for byte in name.as_bytes().iter().copied().chain(std::iter::once(0xff)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        if let Ok(bytes) = std::fs::read(root.join(name)) {
+            for byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash
 }
 
 fn cmd_profile_list(store: &ConfigStore) -> ExitCode {
@@ -653,6 +887,7 @@ fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         id: Uuid::new_v4(),
         name,
         launch,
+        console_host: envbox_core::ConsoleHost::Direct,
         working_directory,
         arguments,
         default_profile_id,
@@ -699,5 +934,47 @@ impl DnsModeLabel for DnsProfile {
             DnsMode::Host => "host",
             DnsMode::VirtualView => "virtual_view",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_store_root_uses_explicit_handoff_root() {
+        let args = vec![
+            "hidden".into(),
+            "terminal-run".into(),
+            "--config-root".into(),
+            r"D:\Aura\config".into(),
+            "--app-id".into(),
+            Uuid::new_v4().to_string(),
+        ];
+        assert_eq!(
+            terminal_store_root(&args),
+            Some(PathBuf::from(r"D:\Aura\config"))
+        );
+    }
+
+    #[test]
+    fn terminal_config_fingerprint_changes_when_store_changes() {
+        let root = std::env::temp_dir().join(format!("envbox-cli-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let before = terminal_config_fingerprint(&root);
+        std::fs::write(root.join("applications.toml"), b"[applications]\n").unwrap();
+        let after = terminal_config_fingerprint(&root);
+        assert_ne!(before, after);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_handoff_cancelled_requires_exact_marker() {
+        let marker = std::env::temp_dir().join(format!("envbox-cli-marker-{}", Uuid::new_v4()));
+        std::fs::write(&marker, "cancelled\n").unwrap();
+        assert!(terminal_handoff_cancelled(&marker));
+        std::fs::write(&marker, "1234\nrunning\n").unwrap();
+        assert!(!terminal_handoff_cancelled(&marker));
+        let _ = std::fs::remove_file(marker);
     }
 }

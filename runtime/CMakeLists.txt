@@ -33,6 +33,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/runtime_profile.cpp
   src/ipc_bootstrap.cpp
   src/hooks_time.cpp
+  src/hooks_winrt_time.cpp
   src/hooks_geo.cpp
   src/hooks_locale.cpp
   src/hooks_language.cpp
@@ -44,7 +45,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
 target_compile_features(${ENVBOX_RT_TARGET} PRIVATE cxx_std_17)
 target_compile_definitions(${ENVBOX_RT_TARGET} PRIVATE ENVBOX_RUNTIME=1 ENVBOX_ARCH=${ENVBOX_RT_ARCH})
 set_target_properties(${ENVBOX_RT_TARGET} PROPERTIES OUTPUT_NAME "${ENVBOX_RT_NAME}")
-target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE iphlpapi ws2_32)
+target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE iphlpapi ws2_32 runtimeobject)
 
 if(ENVBOX_WITH_DETOURS)
   if(NOT DETOURS_ROOT)

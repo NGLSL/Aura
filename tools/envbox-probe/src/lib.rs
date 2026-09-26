@@ -94,4 +94,45 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn timezone_snapshot_contains_local_time_consistency_field() {
+        let snapshot = collect_host_snapshot();
+        let timezone = snapshot
+            .sections
+            .iter()
+            .find(|section| section.title == SECTION_TIMEZONE)
+            .expect("TIMEZONE section");
+        assert!(
+            timezone
+                .fields
+                .iter()
+                .any(|field| field.name == "GetLocalTime_MatchesProfileConversion"),
+            "missing local-time consistency field"
+        );
+        assert!(
+            timezone
+                .fields
+                .iter()
+                .any(|field| field.name == "WinRT_RoActivateInstance_GetTimeZone"),
+            "missing direct WinRT activation field"
+        );
+    }
+
+    #[test]
+    fn registry_snapshot_contains_ansi_query_contract_field() {
+        let snapshot = collect_host_snapshot();
+        let registry = snapshot
+            .sections
+            .iter()
+            .find(|section| section.title == SECTION_REGISTRY)
+            .expect("REGISTRY section");
+        assert!(
+            registry
+                .fields
+                .iter()
+                .any(|field| field.name == "HKLM_TimeZone_TimeZoneKeyName_A_QueryContract"),
+            "missing ANSI registry query contract field"
+        );
+    }
 }

@@ -26,8 +26,16 @@ fn host_snapshot_prints_all_ticket01_sections() {
     for key in [
         "GetUserDefaultGeoName:",
         "GetUserDefaultLocaleName:",
+        "GetLocaleInfoA_SNAME:",
         "GetUserDefaultUILanguage:",
         "GetDynamicTimeZoneInformation:",
+        "WinRT_Calendar_GetTimeZone:",
+        "WinRT_Calendar_ChangedTimeZone:",
+        "GetSystemTime:",
+        "GetLocalTime:",
+        "SystemTimeToTzSpecificLocalTime_Now:",
+        "SystemTimeToTzSpecificLocalTime_DateBoundary:",
+        "HKLM_TimeZone_TimeZoneKeyName_A:",
         "GetNetworkParams:",
         "LANG:",
     ] {
@@ -67,6 +75,34 @@ fn resolve_flag_prints_getaddrinfo_section() {
     // localhost must resolve to a loopback address on Host.
     let value = stdout
         .split("getaddrinfo:")
+        .nth(1)
+        .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    assert!(
+        value.contains("127.0.0.1") || value.contains("::1"),
+        "localhost should be loopback, got {value}"
+    );
+}
+
+/// DnsQueryEx is a separate Windows resolver entry point and must remain
+/// visible in the Probe acceptance surface.
+#[test]
+fn resolve_dnsquery_ex_flag_prints_section() {
+    let output = probe_exe()
+        .args(["--resolve-dnsquery-ex", "localhost"])
+        .output()
+        .expect("run probe --resolve-dnsquery-ex");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("=== RESOLVE DNSQUERY EX ==="),
+        "missing RESOLVE DNSQUERY EX:\n{stdout}"
+    );
+    assert!(stdout.contains("DnsQueryEx_A:"), "missing key:\n{stdout}");
+    let value = stdout
+        .split("DnsQueryEx_A:")
         .nth(1)
         .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
         .unwrap_or("")

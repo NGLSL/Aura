@@ -10,6 +10,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <vector>
 
 #include "hooks.h"
 #include "runtime_profile.h"
@@ -22,10 +24,16 @@
 
 static LSTATUS(WINAPI* TrueRegOpenKeyExW)(HKEY, LPCWSTR, DWORD, REGSAM,
                                          PHKEY) = RegOpenKeyExW;
+static LSTATUS(WINAPI* TrueRegOpenKeyExA)(HKEY, LPCSTR, DWORD, REGSAM,
+                                         PHKEY) = RegOpenKeyExA;
 static LSTATUS(WINAPI* TrueRegQueryValueExW)(HKEY, LPCWSTR, LPDWORD, LPDWORD,
                                              LPBYTE, LPDWORD) = RegQueryValueExW;
+static LSTATUS(WINAPI* TrueRegQueryValueExA)(HKEY, LPCSTR, LPDWORD, LPDWORD,
+                                             LPBYTE, LPDWORD) = RegQueryValueExA;
 static LSTATUS(WINAPI* TrueRegGetValueW)(HKEY, LPCWSTR, LPCWSTR, DWORD,
                                          LPDWORD, PVOID, LPDWORD) = RegGetValueW;
+static LSTATUS(WINAPI* TrueRegGetValueA)(HKEY, LPCSTR, LPCSTR, DWORD,
+                                         LPDWORD, PVOID, LPDWORD) = RegGetValueA;
 static LSTATUS(WINAPI* TrueRegCloseKey)(HKEY) = RegCloseKey;
 
 static const wchar_t* kIntlPath = L"HKEY_CURRENT_USER\\Control Panel\\International";
@@ -262,6 +270,64 @@ static LSTATUS VirtualToStatus(VirtualResult v) {
   return ERROR_SUCCESS;  // unused for miss
 }
 
+// Registry A APIs use the process ANSI code page for names and REG_SZ data.
+// Conversion failure leaves the original API in charge (Fail Open).
+static int AnsiToWide(LPCSTR src, std::wstring* out) {
+  if (src == nullptr) {
+    out->clear();
+    return 1;
+  }
+  int count = MultiByteToWideChar(CP_ACP, 0, src, -1, nullptr, 0);
+  if (count == 0) return 0;
+  std::vector<wchar_t> converted(count);
+  if (MultiByteToWideChar(CP_ACP, 0, src, -1, converted.data(), count) == 0)
+    return 0;
+  out->assign(converted.data());
+  return 1;
+}
+
+static VirtualResult VirtualValueA(const wchar_t* path, LPCSTR name,
+                                   LPDWORD type_out, LPBYTE data,
+                                   LPDWORD size_out) {
+  std::wstring wide_name;
+  if (!AnsiToWide(name, &wide_name)) return kVirtualMiss;
+  DWORD type = 0;
+  DWORD wide_size = 0;
+  VirtualResult v = VirtualValue(path, name ? wide_name.c_str() : nullptr,
+                                 &type, nullptr, &wide_size);
+  if (v == kVirtualMiss) return v;
+  std::vector<BYTE> wide_data(wide_size);
+  DWORD actual = wide_size;
+  v = VirtualValue(path, name ? wide_name.c_str() : nullptr, &type,
+                   wide_data.data(), &actual);
+  if (v != kVirtualOk) return kVirtualMiss;
+
+  if (type == REG_SZ) {
+    const wchar_t* wide = reinterpret_cast<const wchar_t*>(wide_data.data());
+    int ansi_size = WideCharToMultiByte(CP_ACP, 0, wide, -1, nullptr, 0,
+                                        nullptr, nullptr);
+    if (ansi_size == 0) return kVirtualMiss;
+    std::vector<char> ansi_data(ansi_size);
+    if (WideCharToMultiByte(CP_ACP, 0, wide, -1, ansi_data.data(), ansi_size,
+                            nullptr, nullptr) == 0)
+      return kVirtualMiss;
+    return WriteBytes(data, size_out, ansi_data.data(), ansi_data.size(), type,
+                      type_out);
+  }
+  return WriteBytes(data, size_out, wide_data.data(), actual, type, type_out);
+}
+
+static int TypeAllowed(DWORD flags, DWORD type) {
+  DWORD want = flags & 0x0000ffff;
+  if (want == 0 || want == RRF_RT_ANY) return 1;
+  return ((want & RRF_RT_REG_SZ) && type == REG_SZ) ||
+         ((want & RRF_RT_REG_DWORD) && type == REG_DWORD) ||
+         ((want & RRF_RT_REG_MULTI_SZ) && type == REG_MULTI_SZ) ||
+         ((want & RRF_RT_REG_QWORD) && type == REG_QWORD) ||
+         ((want & RRF_RT_REG_BINARY) && type == REG_BINARY) ||
+         ((want & RRF_RT_REG_EXPAND_SZ) && type == REG_EXPAND_SZ);
+}
+
 static LSTATUS WINAPI HookRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey,
                                         DWORD ulOptions, REGSAM samDesired,
                                         PHKEY phkResult) {
@@ -271,6 +337,22 @@ static LSTATUS WINAPI HookRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey,
     wchar_t path[260];
     // Track every open so nested relative opens resolve (Hard #1).
     if (JoinPath(hKey, lpSubKey, path, 260)) {
+      TrackKey(*phkResult, path);
+    }
+  }
+  return st;
+}
+
+static LSTATUS WINAPI HookRegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey,
+                                        DWORD ulOptions, REGSAM samDesired,
+                                        PHKEY phkResult) {
+  LSTATUS st =
+      TrueRegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+  if (st == ERROR_SUCCESS && phkResult != nullptr && *phkResult != nullptr) {
+    std::wstring subkey;
+    wchar_t path[260];
+    if (AnsiToWide(lpSubKey, &subkey) &&
+        JoinPath(hKey, lpSubKey ? subkey.c_str() : nullptr, path, 260)) {
       TrackKey(*phkResult, path);
     }
   }
@@ -292,6 +374,27 @@ static LSTATUS WINAPI HookRegQueryValueExW(HKEY hKey, LPCWSTR lpValueName,
                       lpValueName ? lpValueName : L"(default)");
   }
   return TrueRegQueryValueExW(hKey, lpValueName, lpReserved, lpType, lpData,
+                              lpcbData);
+}
+
+static LSTATUS WINAPI HookRegQueryValueExA(HKEY hKey, LPCSTR lpValueName,
+                                           LPDWORD lpReserved, LPDWORD lpType,
+                                           LPBYTE lpData, LPDWORD lpcbData) {
+  wchar_t path[260];
+  if (LookupPath(hKey, path, 260) && IsWhitelisted(path)) {
+    VirtualResult v = VirtualValueA(path, lpValueName, lpType, lpData, lpcbData);
+    std::wstring name;
+    if (v != kVirtualMiss) {
+      if (AnsiToWide(lpValueName, &name))
+        EnvBoxAuditEventW("RegQueryValueExA", 1,
+                          lpValueName ? name.c_str() : L"(default)");
+      return VirtualToStatus(v);
+    }
+    if (AnsiToWide(lpValueName, &name))
+      EnvBoxAuditEventW("RegQueryValueExA", 0,
+                        lpValueName ? name.c_str() : L"(default)");
+  }
+  return TrueRegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData,
                               lpcbData);
 }
 
@@ -339,6 +442,40 @@ static LSTATUS WINAPI HookRegGetValueW(HKEY hkey, LPCWSTR lpSubKey,
                           pcbData);
 }
 
+static LSTATUS WINAPI HookRegGetValueA(HKEY hkey, LPCSTR lpSubKey,
+                                       LPCSTR lpValue, DWORD dwFlags,
+                                       LPDWORD pdwType, PVOID pvData,
+                                       LPDWORD pcbData) {
+  std::wstring subkey;
+  wchar_t path[260];
+  if (AnsiToWide(lpSubKey, &subkey) &&
+      JoinPath(hkey, lpSubKey ? subkey.c_str() : nullptr, path, 260) &&
+      IsWhitelisted(path)) {
+    DWORD type = 0;
+    DWORD original_capacity = pcbData ? *pcbData : 0;
+    VirtualResult v = VirtualValueA(path, lpValue, &type, (LPBYTE)pvData,
+                                    pcbData);
+    std::wstring name;
+    if (v != kVirtualMiss) {
+      if (pdwType) *pdwType = type;
+      LSTATUS st = TypeAllowed(dwFlags, type) ? VirtualToStatus(v)
+                                              : ERROR_UNSUPPORTED_TYPE;
+      if (st != ERROR_SUCCESS && (dwFlags & RRF_ZEROONFAILURE) && pvData &&
+          pcbData)
+        memset(pvData, 0, original_capacity);
+      if (AnsiToWide(lpValue, &name))
+        EnvBoxAuditEventW("RegGetValueA", 1,
+                          lpValue ? name.c_str() : L"(default)");
+      return st;
+    }
+    if (AnsiToWide(lpValue, &name))
+      EnvBoxAuditEventW("RegGetValueA", 0,
+                        lpValue ? name.c_str() : L"(default)");
+  }
+  return TrueRegGetValueA(hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData,
+                          pcbData);
+}
+
 static LSTATUS WINAPI HookRegCloseKey(HKEY hKey) {
   UntrackKey(hKey);
   return TrueRegCloseKey(hKey);
@@ -348,8 +485,11 @@ int EnvBoxInstallRegistryHooks() {
   EnsureLock();
   int ok = 0;
   ok += EnvBoxAttach(&TrueRegOpenKeyExW, HookRegOpenKeyExW);
+  ok += EnvBoxAttach(&TrueRegOpenKeyExA, HookRegOpenKeyExA);
   ok += EnvBoxAttach(&TrueRegQueryValueExW, HookRegQueryValueExW);
+  ok += EnvBoxAttach(&TrueRegQueryValueExA, HookRegQueryValueExA);
   ok += EnvBoxAttach(&TrueRegGetValueW, HookRegGetValueW);
+  ok += EnvBoxAttach(&TrueRegGetValueA, HookRegGetValueA);
   ok += EnvBoxAttach(&TrueRegCloseKey, HookRegCloseKey);
   return ok;
 }

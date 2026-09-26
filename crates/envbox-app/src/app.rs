@@ -3,7 +3,7 @@
 
 use envbox_core::{
     Application, AuditEvent, BrowserPrivacyProfile, DnsProfile, EnvironmentProfile,
-    InstanceStatus, LaunchTarget, LocaleProfile, RegistryProfile, TimezoneProfile,
+    ConsoleHost, InstanceStatus, LaunchTarget, LocaleProfile, RegistryProfile, TimezoneProfile,
 };
 use envbox_launcher::{format_args, parse_args, InstanceManager, RunTarget};
 use envbox_storage::{
@@ -34,6 +34,7 @@ pub struct AppDraft {
     pub work_dir: String,
     pub profile_id: Uuid,
     pub inherit: bool,
+    pub console_host: ConsoleHost,
     pub audit: bool,
     /// Shell icon source (`path` or `path,index`) from picker / discovery.
     #[allow(dead_code)]
@@ -51,6 +52,7 @@ impl AppDraft {
             work_dir: String::new(),
             profile_id,
             inherit: true,
+            console_host: ConsoleHost::Direct,
             audit: false,
             icon_src: String::new(),
         }
@@ -245,6 +247,7 @@ impl EnvBoxApp {
                     .unwrap_or_default(),
                 profile_id: app.default_profile_id,
                 inherit: app.inherit_children,
+                console_host: app.console_host,
                 audit: app.audit,
                 icon_src: match &app.launch {
                     LaunchTarget::Command { command } => command.clone(),
@@ -684,6 +687,7 @@ impl EnvBoxApp {
             Message::AppWorkDir(v) => self.app_draft.work_dir = v,
             Message::AppProfile(id) => self.app_draft.profile_id = id,
             Message::AppInherit(v) => self.app_draft.inherit = v,
+            Message::AppConsoleHost(v) => self.app_draft.console_host = v,
             Message::AppAudit(v) => self.app_draft.audit = v,
             Message::AppSelect(id) => {
                 if self.app_draft.id != Some(id) {
@@ -1009,6 +1013,7 @@ impl EnvBoxApp {
             arguments,
             default_profile_id: self.app_draft.profile_id,
             inherit_children: self.app_draft.inherit,
+            console_host: self.app_draft.console_host,
             audit: self.app_draft.audit,
         };
         if let Err(err) = validate_application(&app) {
