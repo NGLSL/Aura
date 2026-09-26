@@ -62,10 +62,15 @@ static DNS_STATUS(WINAPI* TrueDnsQuery_UTF8)(PCSTR, WORD, DWORD, PVOID,
 static DNS_STATUS(WINAPI* TrueDnsQueryEx)(PDNS_QUERY_REQUEST,
                                           PDNS_QUERY_RESULT,
                                           PDNS_QUERY_CANCEL) = DnsQueryEx;
+static DNS_STATUS(WINAPI* TrueDnsCancelQuery)(PDNS_QUERY_CANCEL) =
+    DnsCancelQuery;
 static void(WINAPI* TrueDnsFree)(PVOID, DNS_FREE_TYPE) = DnsFree;
 
 // Process-immutable virtual DNS views (built once at hook install).
 static int g_view_active = 0;
+// A custom cancel token is safe only when its matching cancel hook attached.
+static int g_dns_cancel_hook_attached = 0;
+static int g_dns_free_hook_attached = 0;
 static int g_net_count = 0;
 static int g_addr_v4_count = 0;
 static int g_addr_v6_count = 0;
@@ -130,7 +135,10 @@ static unsigned DnsUdpPort() {
 // Owned-allocation registry so freeaddrinfo / DnsRecordListFree can release
 // our nodes even when the CRT heap differs from ws2_32/dnsapi.
 #ifndef ENVBOX_OWNED_MAX
-#define ENVBOX_OWNED_MAX 128
+// A QueryEx worker can own up to kDnsMaxAnswers records and one name
+// allocation per record.  Keep enough headroom for all 64 bounded workers
+// plus synchronous results that are being released concurrently.
+#define ENVBOX_OWNED_MAX 2048
 #endif
 static void* g_owned[ENVBOX_OWNED_MAX];
 static SRWLOCK g_owned_lock = SRWLOCK_INIT;
@@ -604,7 +612,8 @@ static int DecodeDnsName(const unsigned char* buf, int len, int* off,
 // One UDP query to a single server. timeout_ms is per-attempt (bounded).
 // Returns 1 when a DNS response was parsed into *out (any rcode), else 0.
 static int DnsQueryOne(const char* server_text, const char* qname,
-                       unsigned qtype, DWORD timeout_ms, DnsAddrs* out) {
+                       unsigned qtype, DWORD timeout_ms, HANDLE cancel_event,
+                       DnsAddrs* out) {
   unsigned char qbuf[512];
   int namelen = EncodeDnsName(qname, qbuf + 12, (int)sizeof(qbuf) - 12);
   if (namelen <= 0) {
@@ -667,7 +676,51 @@ static int DnsQueryOne(const char* server_text, const char* qname,
   }
 
   unsigned char rbuf[1500];
-  int rlen = recvfrom(s, (char*)rbuf, (int)sizeof(rbuf), 0, nullptr, nullptr);
+  DWORD wait_ms = timeout_ms;
+  ULONGLONG deadline = GetTickCount64() + timeout_ms;
+  int rlen = 0;
+  if (cancel_event == nullptr) {
+    // Keep the synchronous path's existing one-shot wait.  Only async
+    // requests need short select slices to observe DnsCancelQuery promptly.
+    rlen = recvfrom(s, (char*)rbuf, (int)sizeof(rbuf), 0, nullptr, nullptr);
+  } else {
+    for (;;) {
+      if (WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
+        closesocket(s);
+        return -1;
+      }
+      ULONGLONG now = GetTickCount64();
+      if (now >= deadline) {
+        closesocket(s);
+        return 0;
+      }
+      ULONGLONG left = deadline - now;
+      wait_ms = (DWORD)(left < 50ULL ? left : 50ULL);
+      if (wait_ms == 0) {
+        continue;
+      }
+      fd_set read_set;
+      FD_ZERO(&read_set);
+      FD_SET(s, &read_set);
+      timeval tv;
+      tv.tv_sec = (long)(wait_ms / 1000);
+      tv.tv_usec = (long)((wait_ms % 1000) * 1000);
+      int ready = select(0, &read_set, nullptr, nullptr, &tv);
+      if (ready == SOCKET_ERROR) {
+        closesocket(s);
+        return 0;
+      }
+      if (ready == 0) {
+        continue;
+      }
+      if (WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
+        closesocket(s);
+        return -1;
+      }
+      rlen = recvfrom(s, (char*)rbuf, (int)sizeof(rbuf), 0, nullptr, nullptr);
+      break;
+    }
+  }
   closesocket(s);
   if (rlen < 12) {
     return 0;
@@ -784,8 +837,12 @@ static int DnsQueryOne(const char* server_text, const char* qname,
 //   0 = no definitive answer (Fail Open) -- truncated, unreachable, or
 //       NOERROR without A/AAAA even after CNAME follow (including referral)
 static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
-                        DnsAddrs* out) {
+                        DnsAddrs* out, HANDLE cancel_event) {
   DnsAddrsClear(out);
+  if (cancel_event != nullptr &&
+      WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
+    return -1;
+  }
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl == nullptr || pfl->dns_mode != 1 || pfl->dns_server_count <= 0) {
     return 0;
@@ -846,7 +903,12 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
         }
         DnsAddrs step;
         DnsAddrsClear(&step);
-        if (DnsQueryOne(server, current, 1, t, &step)) {
+        int query_status =
+            DnsQueryOne(server, current, 1, t, cancel_event, &step);
+        if (query_status < 0) {
+          return -1;
+        }
+        if (query_status > 0) {
           if (step.nxdomain) {
             saw_nx = 1;
           } else if (step.noerror) {
@@ -881,7 +943,12 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
         }
         DnsAddrs step6;
         DnsAddrsClear(&step6);
-        if (DnsQueryOne(server, current, 28, t, &step6)) {
+        int query_status =
+            DnsQueryOne(server, current, 28, t, cancel_event, &step6);
+        if (query_status < 0) {
+          return -1;
+        }
+        if (query_status > 0) {
           if (step6.nxdomain) {
             saw_nx = 1;
           } else if (step6.noerror) {
@@ -1274,7 +1341,7 @@ static int ResolveRoutedA(const char* qname_utf8, const char* service,
   }
   *port = p;
 
-  if (!DnsRouteName(qname_utf8, want_a, want_aaaa, addrs)) {
+  if (DnsRouteName(qname_utf8, want_a, want_aaaa, addrs, nullptr) <= 0) {
     return EAI_AGAIN;  // caller Fail Opens
   }
   if ((addrs->nxdomain || addrs->nodata) && addrs->n_v4 == 0 &&
@@ -1845,7 +1912,303 @@ enum DnsQueryFlavor {
 static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
                                 PDNS_RECORD* out, PVOID* reserved,
                                 DnsQueryFlavor flavor, const wchar_t* name_w,
-                                const char* api);
+                                const char* api, HANDLE cancel_event = nullptr);
+
+// DnsQueryEx's native asynchronous provider can ignore pDnsServerList on
+// machines with DNS Client policy/NRPT.  For VirtualView, own the complete
+// async operation and reuse the bounded Profile wire route instead.  The
+// caller's result/cancel storage remains valid until the callback, as required
+// by DnsQueryEx; this state only borrows those pointers and owns its event.
+struct EnvBoxDnsAsyncContext {
+  PDNS_QUERY_COMPLETION_ROUTINE callback;
+  PVOID user_context;
+  PDNS_QUERY_RESULT results;
+  PDNS_QUERY_CANCEL cancel_handle;
+  HANDLE cancel_event;
+  WORD query_type;
+  ULONGLONG cancel_generation;
+  unsigned char original_cancel[sizeof(DNS_QUERY_CANCEL)];
+  int cancel_token_written;
+  wchar_t query_name[256];
+  char name_u8[256];
+  volatile LONG cancel_requested;
+  int registered;
+  EnvBoxDnsAsyncContext* next;
+};
+
+static const LONG kDnsAsyncMaxPending = 64;
+static const ULONGLONG kDnsAsyncCancelMagic = 0x454E56424F584451ULL;
+static_assert(sizeof(DNS_QUERY_CANCEL) >= 16,
+              "DNS_QUERY_CANCEL must provide opaque token storage");
+static volatile LONG64 g_dns_async_generation = 0;
+static LONG g_dns_async_work_count = 0;
+static LONG g_dns_async_pending_count = 0;
+static EnvBoxDnsAsyncContext* g_dns_async_pending = nullptr;
+static SRWLOCK g_dns_async_lock = SRWLOCK_INIT;
+
+static int DnsAsyncCancelled(const EnvBoxDnsAsyncContext* context) {
+  return context != nullptr &&
+         InterlockedCompareExchange(
+             const_cast<volatile LONG*>(&context->cancel_requested), 0, 0) !=
+             0;
+}
+
+// The pending map is only for finding EnvBox-owned cancel handles.  It never
+// runs a caller callback while held.  The worker removes its state after the
+// callback returns, so a concurrent cancel can safely signal the event without
+// taking ownership or freeing the context.
+static EnvBoxDnsAsyncContext* FindDnsAsyncLocked(ULONGLONG generation);
+
+static ULONGLONG NextDnsAsyncGeneration() {
+  LONG64 generation = InterlockedIncrement64(&g_dns_async_generation);
+  if (generation <= 0) {
+    InterlockedExchange64(&g_dns_async_generation, 1);
+    generation = 1;
+  }
+  return (ULONGLONG)generation;
+}
+
+static int ReadDnsAsyncToken(PDNS_QUERY_CANCEL cancel_handle,
+                             ULONGLONG* generation) {
+  if (cancel_handle == nullptr || generation == nullptr) {
+    return 0;
+  }
+  ULONGLONG magic = 0;
+  ULONGLONG value = 0;
+  memcpy(&magic, cancel_handle, sizeof(magic));
+  memcpy(&value, reinterpret_cast<const unsigned char*>(cancel_handle) +
+                         sizeof(magic),
+         sizeof(value));
+  if (magic != kDnsAsyncCancelMagic) {
+    return 0;
+  }
+  *generation = value;
+  return 1;
+}
+
+static void WriteDnsAsyncToken(PDNS_QUERY_CANCEL cancel_handle,
+                               ULONGLONG generation) {
+  unsigned char token[sizeof(DNS_QUERY_CANCEL)] = {};
+  memcpy(token, &kDnsAsyncCancelMagic, sizeof(kDnsAsyncCancelMagic));
+  memcpy(token + sizeof(kDnsAsyncCancelMagic), &generation,
+         sizeof(generation));
+  memcpy(cancel_handle, token, sizeof(token));
+}
+
+static void RestoreDnsAsyncCancelToken(EnvBoxDnsAsyncContext* context) {
+  if (context == nullptr || context->cancel_handle == nullptr ||
+      !context->cancel_token_written) {
+    return;
+  }
+  memcpy(context->cancel_handle, context->original_cancel,
+         sizeof(context->original_cancel));
+  context->cancel_token_written = 0;
+}
+
+static int RegisterDnsAsync(EnvBoxDnsAsyncContext* context) {
+  if (context == nullptr) {
+    return 0;
+  }
+  int ok = 0;
+  AcquireSRWLockExclusive(&g_dns_async_lock);
+  if (g_dns_async_work_count < kDnsAsyncMaxPending) {
+    g_dns_async_work_count++;
+    context->registered = 1;
+    if (context->cancel_handle != nullptr) {
+      context->next = g_dns_async_pending;
+      g_dns_async_pending = context;
+      g_dns_async_pending_count++;
+    }
+    ok = 1;
+  }
+  ReleaseSRWLockExclusive(&g_dns_async_lock);
+  return ok;
+}
+
+static EnvBoxDnsAsyncContext* FindDnsAsyncLocked(
+    ULONGLONG generation) {
+  for (EnvBoxDnsAsyncContext* p = g_dns_async_pending; p != nullptr;
+       p = p->next) {
+    if (p->cancel_generation == generation) {
+      return p;
+    }
+  }
+  return nullptr;
+}
+
+static int UnregisterDnsAsync(EnvBoxDnsAsyncContext* context) {
+  if (context == nullptr || !context->registered) {
+    return 0;
+  }
+  int was_registered = 0;
+  AcquireSRWLockExclusive(&g_dns_async_lock);
+  if (context->registered) {
+    if (context->cancel_handle != nullptr) {
+      EnvBoxDnsAsyncContext** link = &g_dns_async_pending;
+      while (*link != nullptr) {
+        if (*link == context) {
+          *link = context->next;
+          if (g_dns_async_pending_count > 0) {
+            g_dns_async_pending_count--;
+          }
+          break;
+        }
+        link = &(*link)->next;
+      }
+    }
+    context->registered = 0;
+    was_registered = 1;
+  }
+  ReleaseSRWLockExclusive(&g_dns_async_lock);
+  return was_registered;
+}
+
+static void ReleaseDnsAsyncWork() {
+  AcquireSRWLockExclusive(&g_dns_async_lock);
+  if (g_dns_async_work_count > 0) {
+    g_dns_async_work_count--;
+  }
+  ReleaseSRWLockExclusive(&g_dns_async_lock);
+}
+
+static void FreeDnsAsync(EnvBoxDnsAsyncContext* context) {
+  if (context == nullptr) {
+    return;
+  }
+  int was_registered = UnregisterDnsAsync(context);
+  if (context->cancel_event != nullptr) {
+    CloseHandle(context->cancel_event);
+    context->cancel_event = nullptr;
+  }
+  // Keep the bounded-work slot occupied until the callback has returned and
+  // the worker's event resource has been released. This prevents a callback
+  // re-entry from briefly exceeding the cap while the old worker is unwinding.
+  if (was_registered) {
+    ReleaseDnsAsyncWork();
+  }
+  HeapFree(GetProcessHeap(), 0, context);
+}
+
+static void FreeDnsAsyncRecords(PDNS_RECORD records) {
+  if (records == nullptr) {
+    return;
+  }
+  if (OwnedHas(records)) {
+    FreeDnsRecordChain(records);
+  } else {
+    TrueDnsFree(records, DnsFreeRecordList);
+  }
+}
+
+static void CompleteDnsAsync(EnvBoxDnsAsyncContext* context, DNS_STATUS status,
+                             PDNS_RECORD records) {
+  if (context == nullptr) {
+    return;
+  }
+  if (DnsAsyncCancelled(context)) {
+    if (records != nullptr) {
+      FreeDnsAsyncRecords(records);
+      records = nullptr;
+    }
+    status = ERROR_CANCELLED;
+  }
+  if (context->results != nullptr) {
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&context->results->QueryStatus),
+        static_cast<LONG>(status));
+    context->results->QueryOptions = DNS_QUERY_STANDARD;
+    context->results->pQueryRecords = records;
+    context->results->Reserved = nullptr;
+  }
+  // Keep the context registered while caller code runs. A callback may reuse
+  // the same DNS_QUERY_CANCEL storage for another request; that request gets
+  // a new generation token and remains independently discoverable. The worker
+  // owns the old context until the callback returns, then releases the map
+  // entry and decrements the bounded work count.
+  if (context->callback != nullptr) {
+    context->callback(context->user_context, context->results);
+  }
+  FreeDnsAsync(context);
+}
+
+static DWORD WINAPI DnsAsyncWorker(PVOID parameter) {
+  EnvBoxDnsAsyncContext* context =
+      static_cast<EnvBoxDnsAsyncContext*>(parameter);
+  if (context == nullptr) {
+    return 0;
+  }
+
+  PDNS_RECORD records = nullptr;
+  DNS_STATUS status = RouteDnsQuery(
+      context->name_u8, context->query_type, DNS_QUERY_STANDARD, &records,
+      nullptr, kDnsFlavorW, context->query_name, "DnsQueryEx",
+      context->cancel_event);
+  CompleteDnsAsync(context, status, records);
+  return 0;
+}
+
+static DNS_STATUS WINAPI HookDnsCancelQuery(PDNS_QUERY_CANCEL cancel_handle) {
+  DWORD err = GetLastError();
+  if (cancel_handle != nullptr) {
+    ULONGLONG generation = 0;
+    if (ReadDnsAsyncToken(cancel_handle, &generation)) {
+      // An EnvBox token is always handled locally, even after its worker has
+      // completed. In particular, never pass a copied/stale token to the
+      // native API where it could be interpreted as an unrelated provider
+      // handle.
+      AcquireSRWLockExclusive(&g_dns_async_lock);
+      EnvBoxDnsAsyncContext* context =
+          generation == 0 ? nullptr : FindDnsAsyncLocked(generation);
+      if (context != nullptr) {
+        InterlockedExchange(&context->cancel_requested, 1);
+        BOOL signaled = context->cancel_event == nullptr ||
+                        SetEvent(context->cancel_event);
+        ReleaseSRWLockExclusive(&g_dns_async_lock);
+        SetLastError(err);
+        EnvBoxAuditEvent("DnsCancelQuery", signaled ? 1 : 0,
+                         signaled ? "dns-virtual-async-cancel"
+                                  : "fail-open-async-cancel-signal");
+        return signaled ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+      }
+      ReleaseSRWLockExclusive(&g_dns_async_lock);
+      SetLastError(err);
+      EnvBoxAuditEvent("DnsCancelQuery", 0, "dns-virtual-async-stale");
+      return ERROR_INVALID_PARAMETER;
+    }
+  }
+
+  DNS_STATUS status = TrueDnsCancelQuery(cancel_handle);
+  EnvBoxAuditEvent("DnsCancelQuery", 0, "dns-host-or-unowned");
+  SetLastError(err);
+  return status;
+}
+
+static int DnsNameEqualsW(const wchar_t* query, const wchar_t* local) {
+  if (query == nullptr || local == nullptr) return 0;
+  size_t query_len = wcslen(query);
+  size_t local_len = wcslen(local);
+  if (query_len > 0 && query[query_len - 1] == L'.') query_len--;
+  if (local_len > 0 && local[local_len - 1] == L'.') local_len--;
+  return query_len == local_len &&
+         _wcsnicmp(query, local, query_len) == 0;
+}
+
+// Windows completes local-machine A/AAAA DnsQueryEx calls synchronously and
+// does not invoke a supplied callback. Preserve that API shape for local names.
+static int IsLocalMachineDnsNameW(const wchar_t* name) {
+  if (DnsNameEqualsW(name, L"localhost")) return 1;
+  wchar_t local[256] = {};
+  DWORD cap = ARRAYSIZE(local);
+  if (GetComputerNameW(local, &cap) && DnsNameEqualsW(name, local)) return 1;
+  cap = ARRAYSIZE(local);
+  if (GetComputerNameExW(ComputerNameDnsHostname, local, &cap) &&
+      DnsNameEqualsW(name, local)) {
+    return 1;
+  }
+  cap = ARRAYSIZE(local);
+  return GetComputerNameExW(ComputerNameDnsFullyQualified, local, &cap) &&
+         DnsNameEqualsW(name, local);
+}
 
 static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
                                         PDNS_QUERY_RESULT results,
@@ -1858,13 +2221,9 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
     SetLastError(err);
     return st;
   }
-
-  // The callback/cancel contract includes provider-owned asynchronous state.
-  // Keep it completely with the original API until a lifetime-safe adapter is
-  // available; this is an explicit fail-open boundary.
-  if (request->pQueryCompletionCallback != nullptr) {
+  if (!g_dns_free_hook_attached) {
     DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async");
+    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-dns-free-hook");
     SetLastError(err);
     return st;
   }
@@ -1893,11 +2252,18 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
   if (request->QueryName == nullptr ||
       request->QueryOptions != DNS_QUERY_STANDARD ||
       request->pDnsServerList != nullptr || request->InterfaceIndex != 0 ||
-      cancel != nullptr ||
+      (request->pQueryCompletionCallback == nullptr && cancel != nullptr) ||
       (request->QueryType != DNS_TYPE_A &&
        request->QueryType != DNS_TYPE_AAAA)) {
     DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
     EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-unsupported-input");
+    SetLastError(err);
+    return st;
+  }
+
+  if (IsLocalMachineDnsNameW(request->QueryName)) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0, "local-machine-passthrough");
     SetLastError(err);
     return st;
   }
@@ -1908,6 +2274,103 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
     EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-name-conversion");
     SetLastError(err);
     return st;
+  }
+
+  if (request->pQueryCompletionCallback != nullptr) {
+    if (cancel != nullptr && !g_dns_cancel_hook_attached) {
+      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-cancel-hook");
+      SetLastError(err);
+      return st;
+    }
+    const RuntimeProfile* profile = EnvBoxProfile();
+    if (profile == nullptr || profile->dns_mode != 1 ||
+        profile->dns_server_count <= 0 || IsNumericNodeA(name_u8) ||
+        !IsAsciiNameA(name_u8)) {
+      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+      EnvBoxAuditEvent("DnsQueryEx", 0,
+                       profile == nullptr || profile->dns_mode != 1
+                           ? "fail-open-async-no-profile-dns"
+                           : "fail-open-async-unsupported-name");
+      SetLastError(err);
+      return st;
+    }
+
+    size_t name_len = wcslen(request->QueryName);
+    if (name_len >= 256) {
+      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-name-too-long");
+      SetLastError(err);
+      return st;
+    }
+
+    EnvBoxDnsAsyncContext* context =
+        static_cast<EnvBoxDnsAsyncContext*>(HeapAlloc(
+            GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(EnvBoxDnsAsyncContext)));
+    if (context == nullptr) {
+      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-allocation");
+      SetLastError(err);
+      return st;
+    }
+    context->callback = request->pQueryCompletionCallback;
+    context->user_context = request->pQueryContext;
+    context->results = results;
+    context->cancel_handle = cancel;
+    context->query_type = request->QueryType;
+    if (cancel != nullptr) {
+      memcpy(context->original_cancel, cancel,
+             sizeof(context->original_cancel));
+      context->cancel_generation = NextDnsAsyncGeneration();
+    }
+    memcpy(context->query_name, request->QueryName,
+           (name_len + 1) * sizeof(wchar_t));
+    memcpy(context->name_u8, name_u8, sizeof(context->name_u8));
+
+    const char* async_fallback = nullptr;
+    if (cancel != nullptr) {
+      context->cancel_event =
+          CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (context->cancel_event == nullptr) {
+        async_fallback = "fail-open-async-cancel-event";
+      }
+    }
+    if (async_fallback == nullptr && !RegisterDnsAsync(context)) {
+      async_fallback = "fail-open-async-pending-limit";
+    }
+    if (async_fallback != nullptr) {
+      RestoreDnsAsyncCancelToken(context);
+      FreeDnsAsync(context);
+      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+      EnvBoxAuditEvent("DnsQueryEx", 0, async_fallback);
+      SetLastError(err);
+      return st;
+    }
+
+    // DnsQueryEx exposes this field while the callback is pending. Publish it
+    // before queueing so a fast worker cannot race a later pending write.
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&results->QueryStatus),
+        DNS_REQUEST_PENDING);
+    if (cancel != nullptr) {
+      WriteDnsAsyncToken(cancel, context->cancel_generation);
+      context->cancel_token_written = 1;
+    }
+    if (!QueueUserWorkItem(DnsAsyncWorker, context, WT_EXECUTEDEFAULT)) {
+      InterlockedExchange(
+          reinterpret_cast<volatile LONG*>(&results->QueryStatus),
+          ERROR_SUCCESS);
+      RestoreDnsAsyncCancelToken(context);
+      FreeDnsAsync(context);
+      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-queue");
+      SetLastError(err);
+      return st;
+    }
+
+    EnvBoxAuditEvent("DnsQueryEx", 1, "dns-virtual-async-worker");
+    SetLastError(err);
+    return DNS_REQUEST_PENDING;
   }
 
   PDNS_RECORD records = nullptr;
@@ -1988,7 +2451,7 @@ static PDNS_RECORD AllocDnsRecord(const char* name_a, const wchar_t* name_w,
 static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
                                 PDNS_RECORD* out, PVOID* reserved,
                                 DnsQueryFlavor flavor, const wchar_t* name_w,
-                                const char* api) {
+                                const char* api, HANDLE cancel_event) {
   DWORD err = GetLastError();
   if (out != nullptr) {
     *out = nullptr;
@@ -1997,6 +2460,13 @@ static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
     DNS_STATUS st =
         CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
     EnvBoxAuditEvent(api, 0, "dns-host");
+    SetLastError(err);
+    return st;
+  }
+  if (!g_dns_free_hook_attached) {
+    DNS_STATUS st =
+        CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
+    EnvBoxAuditEvent(api, 0, "fail-open-dns-free-hook");
     SetLastError(err);
     return st;
   }
@@ -2020,7 +2490,13 @@ static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
   DnsAddrs addrs;
   int want_a = (wtype == DNS_TYPE_A);
   int want_aaaa = (wtype == DNS_TYPE_AAAA);
-  if (!DnsRouteName(name_u8, want_a, want_aaaa, &addrs)) {
+  int route_status =
+      DnsRouteName(name_u8, want_a, want_aaaa, &addrs, cancel_event);
+  if (route_status < 0) {
+    SetLastError(ERROR_CANCELLED);
+    return ERROR_CANCELLED;
+  }
+  if (route_status == 0) {
     DNS_STATUS st =
         CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
     char note[128];
@@ -2181,18 +2657,37 @@ int EnvBoxInstallDnsHooks() {
     return ok;
   }
 
-  ok += EnvBoxAttach(&Truegetaddrinfo, Hookgetaddrinfo);
-  ok += EnvBoxAttach(&TrueGetAddrInfoW, HookGetAddrInfoW);
-  ok += EnvBoxAttach(&Truefreeaddrinfo, Hookfreeaddrinfo);
-  ok += EnvBoxAttach(&TrueFreeAddrInfoW, HookFreeAddrInfoW);
-  ok += EnvBoxAttach(&TrueGetAddrInfoExA, HookGetAddrInfoExA);
-  ok += EnvBoxAttach(&TrueGetAddrInfoExW, HookGetAddrInfoExW);
-  ok += EnvBoxAttach(&TrueFreeAddrInfoExA, HookFreeAddrInfoExA);
-  ok += EnvBoxAttach(&TrueFreeAddrInfoExW, HookFreeAddrInfoExW);
-  ok += EnvBoxAttach(&TrueDnsQuery_A, HookDnsQuery_A);
-  ok += EnvBoxAttach(&TrueDnsQuery_W, HookDnsQuery_W);
-  ok += EnvBoxAttach(&TrueDnsQuery_UTF8, HookDnsQuery_UTF8);
-  ok += EnvBoxAttach(&TrueDnsQueryEx, HookDnsQueryEx);
-  ok += EnvBoxAttach(&TrueDnsFree, HookDnsFree);
+  // Never return an OwnedAlloc chain unless the corresponding public free API
+  // is hooked too. Partial Detours attach failure must fail open as a pair.
+  int free_a = EnvBoxAttach(&Truefreeaddrinfo, Hookfreeaddrinfo);
+  int free_w = EnvBoxAttach(&TrueFreeAddrInfoW, HookFreeAddrInfoW);
+  int free_ex_a = EnvBoxAttach(&TrueFreeAddrInfoExA, HookFreeAddrInfoExA);
+  int free_ex_w = EnvBoxAttach(&TrueFreeAddrInfoExW, HookFreeAddrInfoExW);
+  ok += free_a + free_w + free_ex_a + free_ex_w;
+  if (free_a) {
+    ok += EnvBoxAttach(&Truegetaddrinfo, Hookgetaddrinfo);
+  }
+  if (free_w) {
+    ok += EnvBoxAttach(&TrueGetAddrInfoW, HookGetAddrInfoW);
+  }
+  if (free_ex_a) {
+    ok += EnvBoxAttach(&TrueGetAddrInfoExA, HookGetAddrInfoExA);
+  }
+  if (free_ex_w) {
+    ok += EnvBoxAttach(&TrueGetAddrInfoExW, HookGetAddrInfoExW);
+  }
+  g_dns_free_hook_attached = EnvBoxAttach(&TrueDnsFree, HookDnsFree);
+  ok += g_dns_free_hook_attached;
+  if (g_dns_free_hook_attached) {
+    ok += EnvBoxAttach(&TrueDnsQuery_A, HookDnsQuery_A);
+    ok += EnvBoxAttach(&TrueDnsQuery_W, HookDnsQuery_W);
+    ok += EnvBoxAttach(&TrueDnsQuery_UTF8, HookDnsQuery_UTF8);
+  }
+  g_dns_cancel_hook_attached =
+      EnvBoxAttach(&TrueDnsCancelQuery, HookDnsCancelQuery);
+  ok += g_dns_cancel_hook_attached;
+  if (g_dns_free_hook_attached) {
+    ok += EnvBoxAttach(&TrueDnsQueryEx, HookDnsQueryEx);
+  }
   return ok;
 }

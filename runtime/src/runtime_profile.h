@@ -55,6 +55,12 @@ struct RuntimeProfile {
 // Process-wide immutable profile after successful init. Never mutated later.
 const RuntimeProfile* EnvBoxProfile();
 
+// The IPC profile includes the complete EnvironmentProfile override list.
+// The ENVBOX_* fallback has only structured values and must preserve the
+// already-merged inherited environment instead of rebuilding it from a
+// partial Profile.
+int EnvBoxProfileEnvironmentComplete();
+
 // Returns 1 on success. Fails when ENVBOX_PROFILE_ID is missing or the
 // profile cannot be resolved. Does not install hooks.
 int EnvBoxLoadProfile();

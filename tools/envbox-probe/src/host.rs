@@ -5,10 +5,11 @@ use crate::{
     Field, HostSnapshot, Section, SECTION_DNS, SECTION_ENV, SECTION_GEO, SECTION_LANGUAGE,
     SECTION_LOCALE, SECTION_REGISTRY, SECTION_TIMEZONE,
 };
-use std::ffi::OsString;
+use std::ffi::{c_char, CStr, CString, OsString};
 use std::os::windows::ffi::OsStringExt;
 use windows::core::{Interface, HSTRING, PWSTR};
 use windows::Globalization::Calendar;
+use windows::Win32::Foundation::FreeLibrary;
 use windows::Win32::Globalization::{
     GetACP, GetGeoInfoA, GetGeoInfoW, GetLocaleInfoA, GetLocaleInfoEx, GetLocaleInfoW, GetOEMCP,
     GetProcessPreferredUILanguages, GetSystemDefaultLCID, GetSystemDefaultLangID,
@@ -23,6 +24,7 @@ use windows::Win32::Globalization::{
 use windows::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GetNetworkParams, GET_ADAPTERS_ADDRESSES_FLAGS,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
 use windows::Win32::System::Time::{
     GetDynamicTimeZoneInformation, GetTimeZoneInformation, GetTimeZoneInformationForYear,
@@ -105,6 +107,9 @@ fn collect_locale() -> Section {
         // CP_OEMCP conversions through the same pages.
         fields.push(field("GetACP", GetACP().to_string()));
         fields.push(field("GetOEMCP", GetOEMCP().to_string()));
+        let (crt_ansi, crt_wide) = ucrt_empty_locale();
+        fields.push(field("UCRT_setlocale_empty", crt_ansi));
+        fields.push(field("UCRT_wsetlocale_empty", crt_wide));
         fields.push(field("GetThreadLocale", GetThreadLocale().to_string()));
         fields.push(field("GetUserDefaultLangID", GetUserDefaultLangID().to_string()));
         fields.push(field(
@@ -222,6 +227,73 @@ fn collect_locale() -> Section {
     Section {
         title: SECTION_LOCALE.to_string(),
         fields,
+    }
+}
+
+// UCRT resolves an empty setlocale request separately from Win32 NLS. Probe
+// the real CRT entry points, then restore the initial locale so later probe
+// sections observe the same process state.
+fn ucrt_empty_locale() -> (String, String) {
+    type SetLocale = unsafe extern "C" fn(i32, *const c_char) -> *const c_char;
+    type WSetLocale = unsafe extern "C" fn(i32, *const u16) -> *const u16;
+    const LC_ALL: i32 = 0;
+    unsafe {
+        let Ok(module) = LoadLibraryW(windows::core::w!("ucrtbase.dll")) else {
+            return ("<unavailable>".into(), "<unavailable>".into());
+        };
+        let (Some(ansi_fn), Some(wide_fn)) = (
+            GetProcAddress(module, windows::core::s!("setlocale")),
+            GetProcAddress(module, windows::core::s!("_wsetlocale")),
+        ) else {
+            let _ = FreeLibrary(module);
+            return ("<unavailable>".into(), "<unavailable>".into());
+        };
+        let setlocale: SetLocale = std::mem::transmute(ansi_fn);
+        let _wsetlocale: WSetLocale = std::mem::transmute(wide_fn);
+        let original_ptr = setlocale(LC_ALL, std::ptr::null());
+        let original = if original_ptr.is_null() {
+            None
+        } else {
+            CString::new(CStr::from_ptr(original_ptr).to_bytes()).ok()
+        };
+        let original_wide = _wsetlocale(LC_ALL, std::ptr::null());
+        let original_wide = if original_wide.is_null() {
+            None
+        } else {
+            let mut len = 0;
+            while len < 4096 && *original_wide.add(len) != 0 {
+                len += 1;
+            }
+            (len < 4096).then(|| std::slice::from_raw_parts(original_wide, len).to_vec())
+        };
+        let ansi_ptr = setlocale(LC_ALL, c"".as_ptr());
+        let ansi = if ansi_ptr.is_null() {
+            "<error>".to_string()
+        } else {
+            CStr::from_ptr(ansi_ptr).to_string_lossy().into_owned()
+        };
+        let wide_ptr = _wsetlocale(LC_ALL, [0u16].as_ptr());
+        let wide = if wide_ptr.is_null() {
+            "<error>".to_string()
+        } else {
+            let mut len = 0;
+            while len < 4096 && *wide_ptr.add(len) != 0 {
+                len += 1;
+            }
+            if len < 4096 {
+                String::from_utf16_lossy(std::slice::from_raw_parts(wide_ptr, len))
+            } else {
+                "<error>".to_string()
+            }
+        };
+        if let Some(mut original_wide) = original_wide {
+            original_wide.push(0);
+            _wsetlocale(LC_ALL, original_wide.as_ptr());
+        } else if let Some(original) = &original {
+            setlocale(LC_ALL, original.as_ptr());
+        }
+        let _ = FreeLibrary(module);
+        (ansi, wide)
     }
 }
 

@@ -22,6 +22,7 @@ static int InstallAllHooks() {
   ok += EnvBoxInstallWinRtTimeHooks();
   ok += EnvBoxInstallGeoHooks();
   ok += EnvBoxInstallLocaleHooks();
+  ok += EnvBoxInstallCrtLocaleHooks();
   ok += EnvBoxInstallLanguageHooks();
   ok += EnvBoxInstallDnsHooks();
   ok += EnvBoxInstallRegistryHooks();

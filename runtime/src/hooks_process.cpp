@@ -276,23 +276,16 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
     vars.emplace_back(key, val);
   };
 
-  // A Profile LANG must not be defeated by LC_ALL, category-specific LC_*,
-  // or LANGUAGE inherited from the caller's explicit child environment.
-  // Profile-supplied values are applied after this removal.
-  bool profile_sets_lang = false;
-  for (int i = 0; i < pfl->environment_count && i < ENVBOX_ENV_MAX; i++) {
-    const wchar_t* entry = pfl->environment[i];
-    const wchar_t* eq = wcschr(entry, L'=');
-    if (eq != nullptr && (size_t)(eq - entry) == 4 &&
-        _wcsnicmp(entry, L"LANG", 4) == 0) {
-      profile_sets_lang = true;
-      break;
-    }
-  }
-  if (profile_sets_lang) {
+  // With the complete IPC Profile, its locale takes precedence over inherited
+  // and caller-supplied child POSIX locale values. Profile-supplied values
+  // are applied after removal.
+  // ENVBOX_* fallback lacks those overrides, so preserve the already-merged
+  // inherited block instead of discarding an explicit Profile LANG.
+  if (EnvBoxProfileEnvironmentComplete()) {
     vars.erase(std::remove_if(vars.begin(), vars.end(), [](const auto& kv) {
                  const wchar_t* key = kv.first.c_str();
-                 return _wcsicmp(key, L"LANGUAGE") == 0 ||
+                 return _wcsicmp(key, L"LANG") == 0 ||
+                        _wcsicmp(key, L"LANGUAGE") == 0 ||
                         _wcsnicmp(key, L"LC_", 3) == 0;
                }),
                vars.end());

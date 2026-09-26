@@ -156,6 +156,34 @@ fn run_probe_dnsquery_ex(
     cmd.output().expect("run probe --resolve-dnsquery-ex")
 }
 
+fn run_probe_dnsquery_ex_async(
+    root: &std::path::Path,
+    dll: &std::path::Path,
+    profile_id: &str,
+    name: &str,
+    cancel: bool,
+    copy_cancel: bool,
+    reenter: bool,
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_envbox"));
+    cmd.env("ENVBOX_CONFIG_ROOT", root)
+        .env("ENVBOX_RUNTIME_DLL", dll)
+        .args(["run", "--profile", profile_id])
+        .arg(probe_exe().expect("envbox-probe.exe required"))
+        .args(["--resolve-dnsquery-ex-async", name, "--inspect-pending-status"]);
+    if cancel {
+        cmd.arg("--cancel");
+    }
+    if copy_cancel {
+        cmd.arg("--copy-cancel");
+    }
+    if reenter {
+        cmd.arg("--reenter");
+    }
+    apply_dns_port(&mut cmd);
+    cmd.output().expect("run probe --resolve-dnsquery-ex-async")
+}
+
 fn run_probe_dns_system_settings(
     root: &std::path::Path,
     dll: &std::path::Path,
@@ -171,9 +199,11 @@ fn run_probe_dns_system_settings(
     cmd.output().expect("run probe --dns-system-settings")
 }
 
-// --- fixture DNS server (UDP 127.0.0.1:53) ---
+// --- fixture DNS server (UDP 127.0.0.1:<test port>) ---
 
 const FIXTURE_NAME: &str = "fixture.test";
+const ASYNC_FIXTURE_NAME: &str = "async-fixture.test";
+const ASYNC_CANCEL_NAME: &str = "async-cancel.test";
 const FIXTURE_A: [u8; 4] = [10, 99, 0, 1];
 const CNAME_A_NAME: &str = "cname-a.test";
 const CNAME_B_NAME: &str = "cname-b.test";
@@ -186,6 +216,9 @@ const EAI_NONAME_STATUS: &str = "<error 11001>";
 enum FixtureMode {
     /// fixture.test -> A 10.99.0.1; others NXDOMAIN.
     Address,
+    /// Address response after a delay, allowing an async cancellation request
+    /// to reach the custom Runtime worker before it completes.
+    DelayedAddress,
     /// Every response has TC=1 (unusable / truncated).
     Truncated,
     /// cname-only.test -> CNAME dangling.invalid (NOERROR, no A). Chain never
@@ -201,7 +234,13 @@ enum FixtureMode {
 
 /// Bind fixture DNS on the test port (not 53: host DNS proxies own :53).
 fn try_bind_fixture_dns() -> Option<UdpSocket> {
-    let port = fixture_dns_port();
+    try_bind_fixture_dns_port(fixture_dns_port())
+}
+
+/// Keep the explicit port helper for tests that need to exercise a different
+/// fixture binding. The custom async Runtime path uses the same high-port
+/// seam as the synchronous wire client.
+fn try_bind_fixture_dns_port(port: u16) -> Option<UdpSocket> {
     match UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))) {
         Ok(sock) => {
             let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
@@ -317,8 +356,12 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
     }
 
     let answer = match mode {
-        FixtureMode::Address => {
-            if qname == FIXTURE_NAME && qtype == 1 {
+        FixtureMode::Address | FixtureMode::DelayedAddress => {
+            if (qname == FIXTURE_NAME
+                || qname == ASYNC_FIXTURE_NAME
+                || qname == ASYNC_CANCEL_NAME)
+                && qtype == 1
+            {
                 Answer::A(FIXTURE_A)
             } else {
                 Answer::None
@@ -433,6 +476,9 @@ fn spawn_fixture_dns(sock: UdpSocket, mode: FixtureMode) -> Arc<AtomicBool> {
         while !stop2.load(Ordering::SeqCst) {
             match sock.recv_from(&mut buf) {
                 Ok((n, peer)) => {
+                    if mode == FixtureMode::DelayedAddress {
+                        std::thread::sleep(Duration::from_millis(750));
+                    }
                     let resp = build_fixture_response(&buf[..n], mode);
                     if !resp.is_empty() {
                         let _ = sock.send_to(&resp, peer);
@@ -768,6 +814,179 @@ fn dnsquery_ex_smoke_routes_fixture() {
     assert_eq!(
         got, "10.99.0.1",
         "DnsQueryEx must route fixture.test via Profile DNS:\n{stdout}\naudit:\n{audit}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Asynchronous DnsQueryEx must route through the Profile wire client and
+/// preserve the caller callback contract. The unique name avoids a prior
+/// synchronous test's positive cache entry hiding the fixture request.
+#[test]
+fn dnsquery_ex_async_smoke_routes_fixture() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    // Hold each answer long enough to observe the real pending result field
+    // before either callback can publish its completion status.
+    let stop = spawn_fixture_dns(sock, FixtureMode::DelayedAddress);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+
+    let out = run_probe_dnsquery_ex_async(
+        &root,
+        &dll,
+        &profile_id,
+        ASYNC_FIXTURE_NAME,
+        false,
+        false,
+        true,
+    );
+    stop.store(true, Ordering::SeqCst);
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let got = field_after(&stdout, "DnsQueryEx_A_Async:");
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_ReturnStatus:"),
+        "9506",
+        "custom async DnsQueryEx must return DNS_REQUEST_PENDING:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_WaitStatus:"),
+        "0",
+        "custom async DnsQueryEx must complete within the bounded wait:\n{stdout}"
+    );
+    assert_eq!(
+        got, "10.99.0.1",
+        "async DnsQueryEx must route the fixture via Profile DNS:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_Callbacks:"),
+        "1",
+        "async DnsQueryEx must invoke the caller callback exactly once:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_ReentryReturnStatus:"),
+        "9506",
+        "callback re-entry must create a second pending request:\n{stdout}"
+    );
+    let reentry_initial = field_after(&stdout, "DnsQueryEx_A_Async_ReentryInitialQueryStatus:");
+    assert!(
+        reentry_initial == "9506" || reentry_initial == "0",
+        "re-entry must expose the result field observed after DnsQueryEx (pending or an already-completed callback):\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_ReentryWaitStatus:"),
+        "0",
+        "re-entry callback must complete within the bounded wait:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_ReentryCallbacks:"),
+        "1",
+        "re-entry must invoke its callback exactly once:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_ReentryCallbackStatus:"),
+        "0",
+        "re-entry callback must report success:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_Reentry:"),
+        "10.99.0.1",
+        "re-entry must use the custom Profile route:\n{stdout}"
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dnsquery_ex_local_name_keeps_native_synchronous_completion() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+    let out = run_probe_dnsquery_ex_async(
+        &root,
+        &dll,
+        &profile_id,
+        "localhost",
+        false,
+        false,
+        false,
+    );
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(field_after(&stdout, "DnsQueryEx_A_Async_ReturnStatus:"), "0", "{stdout}");
+    assert_eq!(field_after(&stdout, "DnsQueryEx_A_Async_Callbacks:"), "0", "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Cancellation must still produce exactly one completion callback. The
+/// delayed fixture ensures the cancellation request races a pending query,
+/// exercising the worker's single callback-owned release point.
+#[test]
+fn dnsquery_ex_async_cancel_completes_callback() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _probe = probe_exe().expect("envbox-probe.exe required");
+    let _guard = lock_fixture();
+    let Some(sock) = try_bind_fixture_dns() else {
+        return;
+    };
+    let stop = spawn_fixture_dns(sock, FixtureMode::DelayedAddress);
+
+    let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+
+    let out = run_probe_dnsquery_ex_async(
+        &root,
+        &dll,
+        &profile_id,
+        ASYNC_CANCEL_NAME,
+        true,
+        true,
+        false,
+    );
+    stop.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_ReturnStatus:"),
+        "9506",
+        "custom async DnsQueryEx must return DNS_REQUEST_PENDING:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_WaitStatus:"),
+        "0",
+        "cancelled custom async DnsQueryEx must complete within the bounded wait:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_Callbacks:"),
+        "1",
+        "cancelled async DnsQueryEx must invoke one completion callback:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_CancelStatus:"),
+        "0",
+        "DnsCancelQuery must accept the Runtime-owned cancel handle:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_CancelCopied:"),
+        "1",
+        "DnsCancelQuery must accept a copied Runtime-owned cancel handle:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_InitialQueryStatus:"),
+        "9506",
+        "pending query must publish DNS_REQUEST_PENDING before return:\n{stdout}"
+    );
+    assert_ne!(
+        field_after(&stdout, "DnsQueryEx_A_Async_CallbackStatus:"),
+        "0",
+        "cancelled query must report a non-success completion status:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

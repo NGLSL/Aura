@@ -18,20 +18,14 @@ pub fn build_environment_block(
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = host.clone();
     if let Some(profile) = profile {
-        // POSIX locale variables outrank LANG. When a Profile explicitly
-        // chooses LANG, inherited category overrides would silently defeat
-        // that choice. Explicit Profile LC_* / LANGUAGE values are reinserted
-        // below and retain their intended precedence.
-        if profile
-            .environment
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("LANG"))
-        {
-            env.retain(|key, _| {
-                !key.eq_ignore_ascii_case("LANGUAGE")
-                    && !key.to_ascii_uppercase().starts_with("LC_")
-            });
-        }
+        // A Profile locale must not inherit conflicting POSIX locale values
+        // from the host. Explicit Profile LANG / LC_* / LANGUAGE values are
+        // reinserted below, retaining their intended precedence.
+        env.retain(|key, _| {
+            !key.eq_ignore_ascii_case("LANG")
+                && !key.eq_ignore_ascii_case("LANGUAGE")
+                && !key.to_ascii_uppercase().starts_with("LC_")
+        });
         for (key, value) in &profile.environment {
             // Drop any host key that matches case-insensitively before insert.
             let lower = key.to_ascii_lowercase();
@@ -288,6 +282,26 @@ mod tests {
 
         let plain = build_environment_block(&host, None, Uuid::nil(), Uuid::nil(), true, false);
         assert_eq!(plain.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
+    }
+
+    #[test]
+    fn profile_locale_without_lang_does_not_inherit_host_locale_values() {
+        let host = HashMap::from([
+            ("LANG".into(), "zh_CN.UTF-8".into()),
+            ("LC_ALL".into(), "C.UTF-8".into()),
+            ("LANGUAGE".into(), "zh_CN".into()),
+            ("PATH".into(), r"C:\Windows".into()),
+        ]);
+        let mut p = profile();
+        p.environment.clear();
+        p.environment.insert("LC_TIME".into(), "en_US.UTF-8".into());
+        let merged =
+            build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        for key in ["LANG", "LC_ALL", "LANGUAGE"] {
+            assert!(!merged.contains_key(key), "inherited host {key}");
+        }
+        assert_eq!(merged.get("LC_TIME").map(String::as_str), Some("en_US.UTF-8"));
+        assert!(merged.contains_key("PATH"));
     }
 
     #[test]

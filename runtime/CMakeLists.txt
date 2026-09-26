@@ -36,6 +36,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/hooks_winrt_time.cpp
   src/hooks_geo.cpp
   src/hooks_locale.cpp
+  src/hooks_crt_locale.cpp
   src/hooks_language.cpp
   src/hooks_dns.cpp
   src/hooks_registry.cpp

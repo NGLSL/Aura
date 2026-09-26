@@ -20,10 +20,15 @@
 
 static RuntimeProfile g_profile = {};
 static int g_loaded = 0;
+static int g_environment_complete = 0;
 static char g_dll_path_a[MAX_PATH] = {};
 
 const RuntimeProfile* EnvBoxProfile() {
   return g_loaded ? &g_profile : nullptr;
+}
+
+int EnvBoxProfileEnvironmentComplete() {
+  return g_loaded && g_environment_complete;
 }
 
 const char* EnvBoxRuntimeDllPathA() {
@@ -247,9 +252,32 @@ static void ApplyIpcProfile(const RuntimeProfile* src) {
 // is required for packaged roots because AUMID activation cannot receive a
 // custom Environment Block. Internal ENVBOX_* identity always wins, matching
 // the Rust Win32 environment builder.
-static void ApplyCurrentProcessEnvironment(const RuntimeProfile* profile) {
+static void ApplyCurrentProcessEnvironment(const RuntimeProfile* profile,
+                                           int environment_complete) {
   if (profile == nullptr) {
     return;
+  }
+  // A packaged root has no custom CreateProcess environment block. With a
+  // complete IPC Profile, remove inherited host POSIX locale values before
+  // applying explicit Profile entries. ENVBOX_* fallback lacks the Profile
+  // override list, so keep its already-merged inherited environment intact.
+  LPWCH block = environment_complete ? GetEnvironmentStringsW() : nullptr;
+  if (block != nullptr) {
+    for (const wchar_t* entry = block; *entry != L'\0';
+         entry += wcslen(entry) + 1) {
+      const wchar_t* eq = wcschr(entry, L'=');
+      if (eq == nullptr || eq == entry) {
+        continue;
+      }
+      const size_t key_len = (size_t)(eq - entry);
+      if ((key_len == 4 && _wcsnicmp(entry, L"LANG", 4) == 0) ||
+          (key_len == 8 && _wcsnicmp(entry, L"LANGUAGE", 8) == 0) ||
+          (key_len >= 3 && _wcsnicmp(entry, L"LC_", 3) == 0)) {
+        std::wstring key(entry, key_len);
+        SetEnvironmentVariableW(key.c_str(), nullptr);
+      }
+    }
+    FreeEnvironmentStringsW(block);
   }
   for (int i = 0; i < profile->environment_count && i < ENVBOX_ENV_MAX; i++) {
     const wchar_t* entry = profile->environment[i];
@@ -472,6 +500,7 @@ int EnvBoxLoadProfile() {
     if (EnvBoxIpcFetchProfile(&ipc)) {
       ApplyIpcProfile(&ipc);
       loaded = 1;
+      g_environment_complete = 1;
     }
   }
 
@@ -491,7 +520,7 @@ int EnvBoxLoadProfile() {
     return 0;
   }
 
-  ApplyCurrentProcessEnvironment(&g_profile);
+  ApplyCurrentProcessEnvironment(&g_profile, g_environment_complete);
   g_loaded = 1;
   // Best-effort readiness notice; never affects startup success.
   EnvBoxIpcNotifyRuntimeReady();

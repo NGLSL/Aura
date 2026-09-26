@@ -20,6 +20,11 @@ int EnvBoxInstallTimeHooks();
 int EnvBoxInstallWinRtTimeHooks();
 int EnvBoxInstallGeoHooks();
 int EnvBoxInstallLocaleHooks();
+// UCRT's setlocale/_wsetlocale resolve their locale defaults internally and
+// do not necessarily pass through the Win32 NLS entry points above.  These
+// hooks only virtualize the empty-locale request; explicit locale names and
+// query calls remain untouched.
+int EnvBoxInstallCrtLocaleHooks();
 int EnvBoxInstallLanguageHooks();
 int EnvBoxInstallProcessHooks();
 int EnvBoxInstallDnsHooks();

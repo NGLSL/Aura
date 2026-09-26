@@ -147,6 +147,8 @@ mod tests {
         for expected in [
             "GetACP",
             "GetOEMCP",
+            "UCRT_setlocale_empty",
+            "UCRT_wsetlocale_empty",
             "GetThreadLocale",
             "GetUserDefaultLangID",
             "GetSystemDefaultLangID",
