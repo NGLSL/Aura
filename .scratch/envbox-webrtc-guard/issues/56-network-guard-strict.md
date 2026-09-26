@@ -18,3 +18,10 @@ Parent: .scratch/envbox-webrtc-guard/spec.md
 - [x] HTTP/3 回退 TCP 为可接受行为并写入文档
 
 ## Comments
+
+### 2026-09-26 hardening（评审三项）
+
+- [x] connected UDP：`connect`/`WSAConnect`/`send`/`WSASend`/`WSASendMsg` + per-socket `SOCK_DGRAM` state（不再只拦 `sendto`/`WSASendTo`）；`WSASocketA/W`/`socket` 建表，表满拒绝 socket，`sendto(NULL)` 回落 per-socket peer
+- [x] UDP/53 收紧为 allowlist（禁止任意 IP:53）：VirtualView 仅 `dns_servers`（空列表 / 仅 loopback 可完全关闭外部 UDP/53）；Host 模式跟 host resolver（要用关闭语义请改 VirtualView）
+- [x] Strict attach 不全 → Startup Fail（`EnvBoxInstallNetworkHooks` 返回 0，DllMain 拒绝启动）
+- [x] browser-probe：IPv6 XOR-MAPPED-ADDRESS 按 RFC 5389 magic||txid 完整解码；Chromium/Edge `--browser` 真页 `RTCPeerConnection` + Intl 验收（mDNS 归 host、ProxyOnly+ 断言非 relay、Intl 全字段 + `navigator.languages`）；`--browser` 按 policy 自动注入 `--force-webrtc-ip-handling-policy`

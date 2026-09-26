@@ -44,7 +44,7 @@ envbox profile add --name US --locale en-US --ui-language en-US --region US `
 envbox run --profile <id> .\target\debug\envbox-probe.exe
 ```
 
-Config lives under `%LOCALAPPDATA%\EnvBox\` (or `ENVBOX_CONFIG_ROOT`).
+Config lives under `%LOCALAPPDATA%\com.aura.envbox\` (or `ENVBOX_CONFIG_ROOT`).
 
 ## Performance
 

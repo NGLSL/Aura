@@ -99,6 +99,23 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
   return found;
 }
 
+LCID EnvBoxProfileLcid() {
+  // Hot path: IME / Chrome call GetUserDefaultLCID and registry Locale value
+  // in tight loops while typing. Locale is process-immutable - cache the
+  // LocaleNameToLCID result once.
+  static LCID s_lcid = 0;
+  static int s_cached = 0;
+  const RuntimeProfile* pfl = EnvBoxProfile();
+  if (pfl == nullptr || !pfl->has_locale) {
+    return 0;
+  }
+  if (!s_cached) {
+    s_lcid = LocaleNameToLCID(pfl->locale_name, 0);
+    s_cached = 1;
+  }
+  return s_lcid;
+}
+
 // ---------------------------------------------------------------------------
 // WebRTC Privacy policy tokens (ticket 54). Mirrors envbox-core::WebRtcPolicy
 // parse / as_str / chromium_ip_handling_policy exactly; C++ never invents new
@@ -308,10 +325,9 @@ static int LoadFromEnvValues() {
       }
     }
   }
-  if (g_profile.dns_mode == 1 && g_profile.dns_server_count == 0) {
-    OutputDebugStringA("EnvBox: virtual_view without servers, DNS View disabled\n");
-    g_profile.dns_mode = 0;
-  }
+  // VirtualView + empty dns_servers is legal: DNS View / resolve stay off
+  // (hooks_dns requires servers), while Network Guard treats the empty list as
+  // "close external UDP/53". Do not coerce to Host.
 
   wchar_t reg_raw[2048] = {};
   if (ReadEnvW(L"ENVBOX_REGISTRY_PATHS", reg_raw,

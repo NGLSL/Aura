@@ -54,6 +54,10 @@ int EnvBoxLoadProfile();
 int EnvBoxLookupTimeZone(const wchar_t* windows_id,
                          DYNAMIC_TIME_ZONE_INFORMATION* out);
 
+// Cached LocaleNameToLCID(Profile locale). 0 when no Profile locale. Hot path
+// for GetUserDefaultLCID / GetLocaleInfoW / registry intl values (IME typing).
+LCID EnvBoxProfileLcid();
+
 // Absolute path of this Runtime DLL (for child injection).
 const char* EnvBoxRuntimeDllPathA();
 

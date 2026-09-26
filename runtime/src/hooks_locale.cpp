@@ -58,11 +58,7 @@ static int WINAPI HookGetSystemDefaultLocaleName(LPWSTR lpLocaleName,
 }
 
 static LCID ProfileLocaleLcid() {
-  const RuntimeProfile* pfl = EnvBoxProfile();
-  if (pfl == nullptr || !pfl->has_locale) {
-    return 0;
-  }
-  return LocaleNameToLCID(pfl->locale_name, 0);
+  return EnvBoxProfileLcid();
 }
 
 static LCID WINAPI HookGetUserDefaultLCID() {

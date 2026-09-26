@@ -309,6 +309,8 @@ impl InstanceStatus {
 
 /// Audit Mode event schema v1 (ticket 20). One JSON object per line.
 /// Never carries file contents, tokens, or full environment blocks.
+/// `n` collapses a short-window burst of identical calls (IME typing under
+/// Audit Mode). Absent or 1 means a single call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub v: u32,
@@ -323,6 +325,17 @@ pub struct AuditEvent {
     /// Process image name (e.g. `chrome.exe`). Present on new events; optional on old logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Collapsed call count for this line (default 1).
+    #[serde(default = "audit_event_default_n", skip_serializing_if = "audit_event_n_is_one")]
+    pub n: u32,
+}
+
+fn audit_event_default_n() -> u32 {
+    1
+}
+
+fn audit_event_n_is_one(n: &u32) -> bool {
+    *n <= 1
 }
 
 impl AuditEvent {
@@ -490,6 +503,7 @@ mod tests {
             virtualized: true,
             summary: Some("Pacific Standard Time".into()),
             image: Some("probe.exe".into()),
+            n: 1,
         };
         let line = ev.to_json_line().unwrap();
         assert!(!line.contains('\n'));
@@ -509,6 +523,7 @@ mod tests {
             virtualized: false,
             summary: None,
             image: None,
+            n: 1,
         };
         let line = ev.to_json_line().unwrap();
         assert!(!line.contains("summary"));
@@ -520,6 +535,12 @@ mod tests {
         let legacy = r#"{"v":1,"ts_utc":"2026-09-24T12:00:00.000Z","pid":1,"ppid":0,"tid":1,"api":"GetTimeZoneInformation","virtualized":true}"#;
         let ev = AuditEvent::parse_json_line(legacy).unwrap();
         assert!(ev.image.is_none());
+        assert_eq!(ev.n, 1);
+        // Collapsed burst keeps n and still parses on legacy readers (n default).
+        let burst = r#"{"v":1,"ts_utc":"2026-09-24T12:00:00.000Z","pid":1,"ppid":0,"tid":1,"api":"GetUserDefaultLCID","virtualized":true,"n":42}"#;
+        let b = AuditEvent::parse_json_line(burst).unwrap();
+        assert_eq!(b.n, 42);
+        assert!(!b.to_json_line().unwrap().contains("\"n\":1"));
     }
 
     #[test]

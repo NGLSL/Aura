@@ -57,6 +57,27 @@ Time-It "tz-api" {
   [Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
 }
 
+Time-It "locale-api" {
+  $sig = '[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern int GetLocaleInfoEx(string name, uint type, System.Text.StringBuilder sb, int cch); [DllImport("kernel32.dll")] public static extern uint GetUserDefaultLCID(); [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern int GetUserDefaultLocaleName(System.Text.StringBuilder sb, int cch);'
+  try {
+    Add-Type -Namespace EnvBoxBench -Name Loc -MemberDefinition $sig | Out-Null
+  } catch {}
+  $sb = New-Object System.Text.StringBuilder 85
+  for ($i = 0; $i -lt $ApiN; $i++) {
+    [void][EnvBoxBench.Loc]::GetLocaleInfoEx($null, 0x58, $sb, 85)
+    [void][EnvBoxBench.Loc]::GetUserDefaultLCID()
+    [void][EnvBoxBench.Loc]::GetUserDefaultLocaleName($sb, 85)
+  }
+}
+
+Time-It "reg-api" {
+  $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\International')
+  for ($i = 0; $i -lt $ApiN; $i++) {
+    if ($key) { [void]$key.GetValue('LocaleName') }
+  }
+  if ($key) { $key.Close() }
+}
+
 Time-It "spawn" {
   for ($i = 0; $i -lt $ProcN; $i++) {
     Start-Process -FilePath "cmd.exe" -ArgumentList "/c","exit 0" -WindowStyle Hidden -Wait

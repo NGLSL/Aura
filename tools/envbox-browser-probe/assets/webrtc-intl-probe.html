@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>EnvBox WebRTC / Intl acceptance probe</title>
+  <style>
+    body { font: 14px/1.45 system-ui, sans-serif; margin: 24px; background: #0f1218; color: #e8eef7; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    pre { background: #171c24; padding: 12px; border-radius: 8px; overflow: auto; }
+    .ok { color: #6dca8c; } .bad { color: #f07178; }
+  </style>
+</head>
+<body>
+  <h1>EnvBox WebRTC / Intl acceptance probe</h1>
+  <p id="status">gathering…</p>
+  <pre id="envbox-probe-result">{"error":"not finished"}</pre>
+  <script>
+    // Pure acceptance page: no network writes except ICE via RTCPeerConnection.
+    // Results are written to #envbox-probe-result as JSON for --dump-dom scrape.
+    (async () => {
+      const out = {
+        navigator_language: navigator.language || "",
+        navigator_languages: Array.from(navigator.languages || []),
+        intl_date_time_locale: "",
+        intl_number_locale: "",
+        intl_timezone: "",
+        intl_date_time_sample: "",
+        intl_number_sample: "",
+        ice_candidates: [],
+        ice_gathering_state: "",
+        error: null
+      };
+      try {
+        const dt = Intl.DateTimeFormat().resolvedOptions();
+        out.intl_date_time_locale = dt.locale || "";
+        out.intl_timezone = dt.timeZone || "";
+        out.intl_number_locale = Intl.NumberFormat().resolvedOptions().locale || "";
+        // Real format samples — what the page would actually print.
+        const sample = new Date(Date.UTC(2024, 0, 15, 22, 30, 0));
+        out.intl_date_time_sample = new Intl.DateTimeFormat().format(sample);
+        out.intl_number_sample = new Intl.NumberFormat().format(1234567.89);
+      } catch (e) {
+        out.error = "intl: " + e;
+      }
+
+      // Optional STUN via ?stun=host:port so Strict runs without a public srflx.
+      const stun = new URLSearchParams(location.search).get("stun");
+      const config = {
+        iceServers: stun ? [{ urls: "stun:" + stun }] : [],
+        iceTransportPolicy: "all"
+      };
+
+      let pc;
+      try {
+        pc = new RTCPeerConnection(config);
+      } catch (e) {
+        out.error = "rtc: " + e;
+        finish();
+        return;
+      }
+
+      const seen = new Set();
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        const c = ev.candidate;
+        const addr = (c.address || c.ip || "");
+        const kind = c.type || "";
+        const protocol = (c.protocol || "").toLowerCase();
+        const key = kind + "|" + protocol + "|" + addr + "|" + (c.port || "");
+        if (seen.has(key)) return;
+        seen.add(key);
+        let klass = null;
+        if (addr) {
+          klass = classify(addr);
+        } else if ((c.candidate || "").indexOf(".local") >= 0) {
+          klass = "link_local";
+        }
+        out.ice_candidates.push({
+          candidate: c.candidate || "",
+          kind: kind || ((c.candidate || "").indexOf(" typ host") >= 0 ? "host" : ""),
+          protocol,
+          address: addr,
+          class: klass
+        });
+      };
+
+      function classify(addr) {
+        if (!addr) return null;
+        if (addr.startsWith("127.") || addr === "::1") return "loopback";
+        if (addr.startsWith("fe80") || addr.startsWith("169.254.")) return "link_local";
+        if (addr.startsWith("10.") || addr.startsWith("192.168.") ||
+            addr.startsWith("fc") || addr.startsWith("fd")) return "private";
+        const m = addr.match(/^172\.(\d+)\./);
+        if (m) {
+          const n = +m[1];
+          if (n >= 16 && n <= 31) return "private";
+        }
+        if (/^::ffff:/i.test(addr)) return classify(addr.slice(7));
+        return "public";
+      }
+
+      const timeout = setTimeout(() => {
+        out.ice_gathering_state = pc.iceGatheringState || "";
+        out.error = out.error || "ice-timeout";
+        finish();
+      }, 8000);
+
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === "complete") {
+          clearTimeout(timeout);
+          out.ice_gathering_state = "complete";
+          finish();
+        }
+      };
+
+      try {
+        // Data channel forces a candidate gather without media permissions.
+        pc.createDataChannel("envbox-probe");
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+      } catch (e) {
+        clearTimeout(timeout);
+        out.error = out.error || ("offer: " + e);
+        out.ice_gathering_state = pc.iceGatheringState || "";
+        finish();
+      }
+
+      function finish() {
+        try { pc.close(); } catch (_) {}
+        const json = JSON.stringify(out);
+        document.getElementById("envbox-probe-result").textContent = json;
+        document.getElementById("status").textContent = out.error ? ("done: " + out.error) : "done";
+        document.getElementById("status").className = out.error ? "bad" : "ok";
+        document.title = "ENVBOX-PROBE-DONE";
+      }
+    })();
+  </script>
+</body>
+</html>

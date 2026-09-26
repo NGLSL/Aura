@@ -218,7 +218,7 @@ static VirtualResult VirtualValue(const wchar_t* path, const wchar_t* value_name
       return WriteSz(pfl->locale_name, lpType, lpData, lpcbData);
     }
     if (_wcsicmp(value_name, L"Locale") == 0 && pfl->has_locale) {
-      LCID lcid = LocaleNameToLCID(pfl->locale_name, 0);
+      LCID lcid = EnvBoxProfileLcid();
       wchar_t hex[16];
       _snwprintf_s(hex, _TRUNCATE, L"%08x", (unsigned)lcid);
       return WriteSz(hex, lpType, lpData, lpcbData);

@@ -15,12 +15,99 @@ static DWORD g_pid = 0;
 static DWORD g_ppid = 0;  // 0 = unknown until first event (avoid Toolhelp under DllMain)
 static char g_image[64] = {0};  // process basename, UTF-8
 static SRWLOCK g_lock = SRWLOCK_INIT;
-// Flush is expensive (FlushFileBuffers). Batch writes; flush on threshold/interval
-// and at shutdown so a crash can lose at most a few events.
+// Flush is expensive (FlushFileBuffers). Buffer JSONL lines and WriteFile in
+// batches; flush on threshold/interval and at shutdown so a crash can lose at
+// most a few events. Typing/IME under Audit Mode fires locale/registry hooks
+// in tight loops - one WriteFile per event was a visible stutter source.
+static char g_linebuf[16 * 1024];
+static size_t g_linebuf_len = 0;
 static unsigned g_unflushed = 0;
 static ULONGLONG g_last_flush = 0;
 static const unsigned kAuditFlushEvery = 64;
 static const DWORD kAuditFlushIntervalMs = 1000;
+
+// Short-window collapse: identical (api, virtualized, summary) bursts from
+// IME/typing become one JSONL line with "n". Key change or flush ends the
+// pending line. Cap keeps a single burst from holding forever.
+static const unsigned kAuditCollapseMax = 4096;
+struct AuditPending {
+  int active;
+  int virtualized;
+  unsigned n;
+  unsigned long tid;
+  char api[80];
+  char summary[192];
+  char ts[40];
+};
+static AuditPending g_pending;
+
+// Defined below; used when emitting collapsed lines.
+static void JsonEscape(const char* src, char* dst, size_t cap);
+
+static void AuditAppendLineLocked(const char* line, int len) {
+  if (len <= 0) return;
+  if (g_linebuf_len + (size_t)len > sizeof(g_linebuf)) {
+    if (g_audit != INVALID_HANDLE_VALUE && g_linebuf_len > 0) {
+      DWORD written = 0;
+      WriteFile(g_audit, g_linebuf, (DWORD)g_linebuf_len, &written, nullptr);
+    }
+    g_linebuf_len = 0;
+  }
+  if (g_linebuf_len + (size_t)len <= sizeof(g_linebuf)) {
+    memcpy(g_linebuf + g_linebuf_len, line, (size_t)len);
+    g_linebuf_len += (size_t)len;
+    g_unflushed++;
+  }
+}
+
+static void AuditEmitPendingLocked(void) {
+  if (!g_pending.active) return;
+  char api_esc[128];
+  char sum_esc[192];
+  char image_esc[80];
+  JsonEscape(g_pending.api, api_esc, sizeof(api_esc));
+  JsonEscape(g_pending.summary, sum_esc, sizeof(sum_esc));
+  JsonEscape(g_image, image_esc, sizeof(image_esc));
+  char line[700];
+  int len;
+  if (g_pending.summary[0] != '\0') {
+    len = _snprintf_s(
+        line, sizeof(line), _TRUNCATE,
+        "{\"v\":1,\"ts_utc\":\"%s\",\"pid\":%lu,\"ppid\":%lu,\"tid\":%lu,"
+        "\"api\":\"%s\",\"virtualized\":%s,\"summary\":\"%s\",\"image\":\"%s\",\"n\":%u}\n",
+        g_pending.ts, (unsigned long)g_pid, (unsigned long)g_ppid,
+        g_pending.tid, api_esc, g_pending.virtualized ? "true" : "false",
+        sum_esc, image_esc, g_pending.n);
+  } else {
+    len = _snprintf_s(
+        line, sizeof(line), _TRUNCATE,
+        "{\"v\":1,\"ts_utc\":\"%s\",\"pid\":%lu,\"ppid\":%lu,\"tid\":%lu,"
+        "\"api\":\"%s\",\"virtualized\":%s,\"image\":\"%s\",\"n\":%u}\n",
+        g_pending.ts, (unsigned long)g_pid, (unsigned long)g_ppid,
+        g_pending.tid, api_esc, g_pending.virtualized ? "true" : "false",
+        image_esc, g_pending.n);
+  }
+  AuditAppendLineLocked(line, len);
+  g_pending.active = 0;
+  g_pending.n = 0;
+}
+
+static void AuditFlushLocked(void) {
+  AuditEmitPendingLocked();
+  if (g_audit == INVALID_HANDLE_VALUE) {
+    g_linebuf_len = 0;
+    g_unflushed = 0;
+    return;
+  }
+  if (g_linebuf_len > 0) {
+    DWORD written = 0;
+    WriteFile(g_audit, g_linebuf, (DWORD)g_linebuf_len, &written, nullptr);
+    g_linebuf_len = 0;
+  }
+  FlushFileBuffers(g_audit);
+  g_unflushed = 0;
+  g_last_flush = GetTickCount64();
+}
 
 // Process image basename (e.g. chrome.exe) for per-software audit grouping.
 static void EnvBoxCurrentImageA(char* out, size_t cap) {
@@ -119,7 +206,15 @@ void EnvBoxAuditInit(const RuntimeProfile* pfl) {
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", appdata, MAX_PATH) == 0) {
       return;  // Fail Open: no sink
     }
-    _snwprintf_s(root, MAX_PATH, _TRUNCATE, L"%s\\EnvBox", appdata);
+    // Keep in sync with envbox-storage DATA_DIR_NAME (com.aura.envbox).
+    _snwprintf_s(root, MAX_PATH, _TRUNCATE, L"%s\\com.aura.envbox", appdata);
+    // One-time rename from the pre-0.3 `%LOCALAPPDATA%\EnvBox` layout.
+    wchar_t legacy[MAX_PATH] = {};
+    _snwprintf_s(legacy, MAX_PATH, _TRUNCATE, L"%s\\EnvBox", appdata);
+    if (GetFileAttributesW(root) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(legacy) != INVALID_FILE_ATTRIBUTES) {
+      MoveFileW(legacy, root);  // best-effort
+    }
   } else if (n >= MAX_PATH) {
     // Explicit CONFIG_ROOT that does not fit: do not fall back to another root.
     return;  // Fail Open
@@ -127,6 +222,7 @@ void EnvBoxAuditInit(const RuntimeProfile* pfl) {
 
   wchar_t dir[MAX_PATH + 16];
   _snwprintf_s(dir, MAX_PATH + 16, _TRUNCATE, L"%s\\audit", root);
+  CreateDirectoryW(root, nullptr);
   CreateDirectoryW(dir, nullptr);
 
   wchar_t path[MAX_PATH + 80];
@@ -161,44 +257,39 @@ void EnvBoxAuditEvent(const char* api, int virtualized, const char* summary) {
   if (g_ppid == 0) {
     g_ppid = EnvBoxParentPid();
   }
-  char ts[40];
-  FormatUtc(ts, sizeof(ts));
-  char api_esc[128];
-  JsonEscape(api, api_esc, sizeof(api_esc));
-  char image_esc[80];
-  JsonEscape(g_image, image_esc, sizeof(image_esc));
-  char line[640];
-  int len;
-  if (summary != nullptr && summary[0] != '\0') {
-    char esc[192];
-    JsonEscape(summary, esc, sizeof(esc));
-    len = _snprintf_s(
-        line, sizeof(line), _TRUNCATE,
-        "{\"v\":1,\"ts_utc\":\"%s\",\"pid\":%lu,\"ppid\":%lu,\"tid\":%lu,"
-        "\"api\":\"%s\",\"virtualized\":%s,\"summary\":\"%s\",\"image\":\"%s\"}\n",
-        ts, (unsigned long)g_pid, (unsigned long)g_ppid,
-        (unsigned long)GetCurrentThreadId(), api_esc,
-        virtualized ? "true" : "false", esc, image_esc);
-  } else {
-    len = _snprintf_s(
-        line, sizeof(line), _TRUNCATE,
-        "{\"v\":1,\"ts_utc\":\"%s\",\"pid\":%lu,\"ppid\":%lu,\"tid\":%lu,"
-        "\"api\":\"%s\",\"virtualized\":%s,\"image\":\"%s\"}\n",
-        ts, (unsigned long)g_pid, (unsigned long)g_ppid,
-        (unsigned long)GetCurrentThreadId(), api_esc,
-        virtualized ? "true" : "false", image_esc);
-  }
-  if (len > 0) {
-    DWORD written = 0;
-    WriteFile(g_audit, line, (DWORD)len, &written, nullptr);
-    g_unflushed++;
-    ULONGLONG now = GetTickCount64();
-    if (g_unflushed >= kAuditFlushEvery ||
-        now - g_last_flush >= kAuditFlushIntervalMs) {
-      FlushFileBuffers(g_audit);
-      g_unflushed = 0;
-      g_last_flush = now;
+
+  const char* sum = (summary != nullptr && summary[0] != '\0') ? summary : "";
+  // Collapse identical consecutive calls (typing / IME / registry loops).
+  if (g_pending.active && g_pending.virtualized == virtualized &&
+      g_pending.n < kAuditCollapseMax && strcmp(g_pending.api, api) == 0 &&
+      strcmp(g_pending.summary, sum) == 0) {
+    g_pending.n++;
+    // Periodic end-of-window write so a long burst still splits into lines.
+    if ((g_pending.n & 0x3f) == 0) {
+      ULONGLONG now = GetTickCount64();
+      if (now - g_last_flush >= kAuditFlushIntervalMs) {
+        AuditFlushLocked();
+      }
     }
+    ReleaseSRWLockExclusive(&g_lock);
+    SetLastError(last_err);
+    return;
+  }
+  AuditEmitPendingLocked();
+
+  // Start a new pending line (format JSON only when the key changes).
+  g_pending.active = 1;
+  g_pending.virtualized = virtualized;
+  g_pending.n = 1;
+  g_pending.tid = (unsigned long)GetCurrentThreadId();
+  strncpy_s(g_pending.api, api, _TRUNCATE);
+  strncpy_s(g_pending.summary, sum, _TRUNCATE);
+  FormatUtc(g_pending.ts, sizeof(g_pending.ts));
+
+  ULONGLONG now = GetTickCount64();
+  if (g_unflushed >= kAuditFlushEvery ||
+      now - g_last_flush >= kAuditFlushIntervalMs) {
+    AuditFlushLocked();
   }
   ReleaseSRWLockExclusive(&g_lock);
   SetLastError(last_err);
@@ -233,10 +324,11 @@ void EnvBoxAuditEventW(const char* api, int virtualized, const wchar_t* summary)
 void EnvBoxAuditShutdown(void) {
   AcquireSRWLockExclusive(&g_lock);
   if (g_audit != INVALID_HANDLE_VALUE) {
-    FlushFileBuffers(g_audit);
+    AuditFlushLocked();
     CloseHandle(g_audit);
     g_audit = INVALID_HANDLE_VALUE;
     g_unflushed = 0;
+    g_linebuf_len = 0;
   }
   g_audit_on = 0;
   ReleaseSRWLockExclusive(&g_lock);

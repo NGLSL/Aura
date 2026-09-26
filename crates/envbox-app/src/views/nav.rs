@@ -69,14 +69,14 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let footer = column![
         row![
             status_dot(SUCCESS),
-            text("Aura 1.0.0")
+            text(crate::version::product_label())
                 .size(12)
                 .color(INK_2)
                 .font(font::ui_font()),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
-        text("EnvBox Core · 2025.03")
+        text(crate::version::engine_label())
             .size(11)
             .color(FAINT)
             .font(font::ui_font()),

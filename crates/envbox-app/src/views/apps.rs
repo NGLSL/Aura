@@ -228,44 +228,29 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
 
     let left_info = column![top_left, meta_cmd].spacing(6);
 
-    let left_clickable = button(
-        row![tile, left_info]
-            .spacing(14)
-            .align_y(Alignment::Center),
-    )
-    .padding(0)
-    .width(Fill)
-    .style(move |_t, _s| button::Style {
-        background: None,
-        border: Border::default(),
-        text_color: INK,
-        ..Default::default()
-    })
-    .on_press(Message::AppSelect(id));
+    // Shrink-wrap the action stack. A Fill spacer here makes the right column
+    // claim half the row and swallow clicks on the empty middle (dead zone).
+    let right_column = column![status_indicator, action_btn]
+        .spacing(6)
+        .align_x(Alignment::End)
+        .width(Length::Shrink);
 
-    let right_column = column![
-        row![
-            iced::widget::Space::with_width(Length::Fill),
-            status_indicator,
-        ]
-        .align_y(Alignment::Center),
-        row![
-            iced::widget::Space::with_width(Length::Fill),
-            action_btn,
-        ]
-        .align_y(Alignment::Center),
-    ]
-    .spacing(6)
-    .align_x(Alignment::End);
-
-    container(
-        row![left_clickable, right_column]
+    // Whole card selects; action_btn still consumes its own hit box.
+    // mouse_area covers padding and the right stack so no dead zone remains.
+    iced::widget::mouse_area(
+        container(
+            row![
+                row![tile, left_info].spacing(14).align_y(Alignment::Center),
+                right_column
+            ]
             .spacing(12)
             .align_y(Alignment::Center),
+        )
+        .padding(Padding::from([12, 16]))
+        .width(Fill)
+        .style(move |_| card_style(selected)),
     )
-    .padding(Padding::from([12, 16]))
-    .width(Fill)
-    .style(move |_| card_style(selected))
+    .on_press(Message::AppSelect(id))
     .into()
 }
 

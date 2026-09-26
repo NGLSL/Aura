@@ -14,6 +14,7 @@ mod icons;
 mod message;
 mod options;
 mod theme;
+mod version;
 mod views;
 mod widgets;
 

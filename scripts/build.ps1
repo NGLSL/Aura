@@ -87,8 +87,8 @@ if (-not $SkipRuntime) {
     }
 }
 
-# Publish GUI (+ CLI for convenience) into artifacts/
-foreach ($name in @("envbox-app.exe", "envbox.exe")) {
+# Publish GUI + CLI + probes into artifacts/ (GUI "启动环境探针" looks next to itself)
+foreach ($name in @("envbox-app.exe", "envbox.exe", "envbox-probe.exe", "envbox-browser-probe.exe")) {
     $src = Join-Path $root "target\$profile\$name"
     if (Test-Path -LiteralPath $src) {
         Copy-Item -LiteralPath $src -Destination (Join-Path $artifacts $name) -Force

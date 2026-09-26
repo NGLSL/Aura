@@ -160,6 +160,11 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
             } else {
                 format!("{}() → {}", ev.api, summary)
             };
+            let call_str = if ev.n > 1 {
+                format!("{call_str} ×{}", ev.n)
+            } else {
+                call_str
+            };
             let soft = app.audit_software_label(ev);
 
             let card = container(

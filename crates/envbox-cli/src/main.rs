@@ -137,9 +137,10 @@ fn cmd_audit_show(store: &ConfigStore, args: &[String]) -> ExitCode {
         let mut by_api: HashMap<String, (usize, usize)> = HashMap::new();
         for ev in &events {
             let slot = by_api.entry(ev.api.clone()).or_insert((0, 0));
-            slot.0 += 1;
+            let n = ev.n.max(1) as usize;
+            slot.0 += n;
             if ev.virtualized {
-                slot.1 += 1;
+                slot.1 += n;
             }
         }
         let mut keys: Vec<_> = by_api.into_iter().collect();

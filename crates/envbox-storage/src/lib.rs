@@ -1,4 +1,4 @@
-//! TOML persistence for Application and Environment Profile under `%LOCALAPPDATA%\EnvBox\`.
+//! TOML persistence for Application and Environment Profile under `%LOCALAPPDATA%\com.aura.envbox\`.
 
 use envbox_core::{Application, DomainError, EnvironmentProfile};
 use std::fs;
@@ -28,6 +28,10 @@ pub struct ApplicationDocument {
     pub applications: Vec<Application>,
 }
 
+/// Per-user data folder name (Kite-style reverse-DNS). Also used by the
+/// Runtime audit sink — keep in sync with `runtime/src/audit.cpp`.
+pub const DATA_DIR_NAME: &str = "com.aura.envbox";
+
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     root: PathBuf,
@@ -42,10 +46,16 @@ impl ConfigStore {
         if let Some(root) = std::env::var_os("ENVBOX_CONFIG_ROOT") {
             return PathBuf::from(root);
         }
-        std::env::var_os("LOCALAPPDATA")
+        let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("EnvBox")
+            .unwrap_or_else(|| PathBuf::from("."));
+        let root = base.join(DATA_DIR_NAME);
+        // One-time rename from the pre-0.3 `%LOCALAPPDATA%\EnvBox` layout.
+        let legacy = base.join("EnvBox");
+        if !root.exists() && legacy.exists() {
+            let _ = fs::rename(&legacy, &root);
+        }
+        root
     }
 
     pub fn root(&self) -> &Path {
@@ -327,6 +337,29 @@ mod tests {
             registry: RegistryProfile::default(),
             browser: Default::default(),
         }
+    }
+
+    #[test]
+    fn data_dir_name_is_reverse_dns() {
+        assert_eq!(DATA_DIR_NAME, "com.aura.envbox");
+    }
+
+    #[test]
+    fn default_root_migrates_legacy_envbox_dir() {
+        let base = std::env::temp_dir().join(format!("envbox-data-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("EnvBox")).unwrap();
+        fs::write(base.join("EnvBox").join("profiles.toml"), "profiles = []\n").unwrap();
+
+        // Drive the same rename logic default_root() uses under LOCALAPPDATA.
+        let root = base.join(DATA_DIR_NAME);
+        let legacy = base.join("EnvBox");
+        if !root.exists() && legacy.exists() {
+            fs::rename(&legacy, &root).unwrap();
+        }
+        assert!(root.join("profiles.toml").exists());
+        assert!(!legacy.exists());
+        let _ = fs::remove_dir_all(&base);
     }
 
     fn sample_app() -> Application {

@@ -1,6 +1,7 @@
 // EnvBox Runtime - domain hooks (timezone / geo / locale / UI lang / DNS / process).
-// Policy: Fail Open on hook errors; complete init failure is fatal (Startup Fail Policy).
-// Never call SetDynamicTimeZoneInformation; never hook real-time APIs.
+// Policy: Fail Open on non-critical hook errors; complete init failure and
+// incomplete Strict Network Guard are fatal (Startup Fail Policy - no silent
+// downgrade). Never call SetDynamicTimeZoneInformation; never hook real-time APIs.
 
 #include <windows.h>
 
@@ -24,7 +25,12 @@ static int InstallAllHooks() {
   ok += EnvBoxInstallDnsHooks();
   ok += EnvBoxInstallRegistryHooks();
   ok += EnvBoxInstallProcessHooks();
-  ok += EnvBoxInstallNetworkHooks();
+  // Strict Network Guard is NOT Fail Open: incomplete attach must abort the
+  // process (Startup Fail Policy) instead of silently running without UDP deny.
+  if (!EnvBoxInstallNetworkHooks()) {
+    DetourTransactionAbort();
+    return 0;
+  }
 
   LONG err = DetourTransactionCommit();
   if (err != NO_ERROR) {
@@ -54,8 +60,10 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
       return FALSE;
     }
     EnvBoxAuditInit(EnvBoxProfile());
-    // Hooks may partially fail; process still starts (Fail Open).
-    InstallAllHooks();
+    if (!InstallAllHooks()) {
+      // Startup Fail Policy: never run with Strict Network Guard unarmed.
+      return FALSE;
+    }
     SetEnvironmentVariableA("ENVBOX_RUNTIME_LOADED", "1");
   } else if (reason == DLL_PROCESS_DETACH) {
     EnvBoxAuditShutdown();

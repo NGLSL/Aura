@@ -442,10 +442,8 @@ int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
   out->dns_mode = ParseFlag(m, "dns_mode", 0);
   out->dns_server_count =
       MsgGetAll(m, "dns_server", out->dns_servers, ENVBOX_DNS_MAX, 64);
-  if (out->dns_mode == 1 && out->dns_server_count == 0) {
-    // Same rule as the TOML path: VirtualView without servers -> Host.
-    out->dns_mode = 0;
-  }
+  // VirtualView + empty dns_servers stays VirtualView: no virtual resolve, but
+  // Network Guard can close external UDP/53 (empty allowlist).
   out->registry_path_count =
       MsgGetAllW(m, "registry_path", out->registry_paths, ENVBOX_REG_MAX, 128);
 

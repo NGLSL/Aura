@@ -90,18 +90,32 @@ fn info_row_with_action<'a>(
 }
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
+    use crate::version::{product_label, ENGINE_NAME, PRODUCT_NAME, PRODUCT_VERSION};
+
     let header = column![
         text("设置与系统概览").size(24).color(INK).font(font::name_font()),
-        text("Aura 1.0.0 · 核心引擎 EnvBox 进程级环境虚拟化").size(12).color(MUTED).font(font::ui_font()),
+        text(format!(
+            "{} · 核心引擎 EnvBox 进程级环境虚拟化",
+            product_label()
+        ))
+        .size(12)
+        .color(MUTED)
+        .font(font::ui_font()),
     ]
     .spacing(4);
 
     let engine_content = column![
         info_row("宿主操作系统", "Windows x86_64".into()),
-        info_row("控制台程序", "Aura 1.0.0 (Native GUI)".into()),
-        info_row("虚拟化引擎", "EnvBox Core · 进程级环境隔离".into()),
+        info_row("控制台程序", format!("{PRODUCT_NAME} {PRODUCT_VERSION} (Native GUI)")),
+        info_row(
+            "虚拟化引擎",
+            format!("{ENGINE_NAME} {PRODUCT_VERSION} · 进程级环境隔离"),
+        ),
         info_row("底层注入框架", "Microsoft Detours 4.0.1 x64".into()),
-        info_row("运行透明度", "目标进程直接运行在宿主 OS · 共享文件系统、网络与 GPU".into()),
+        info_row(
+            "运行透明度",
+            "目标进程直接运行在宿主 OS · 共享文件系统、网络与 GPU".into(),
+        ),
     ]
     .spacing(8);
 

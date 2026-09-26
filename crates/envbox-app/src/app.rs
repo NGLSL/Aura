@@ -828,14 +828,24 @@ impl EnvBoxApp {
                 let mut probe_path = None;
                 if let Ok(cur) = std::env::current_exe() {
                     if let Some(dir) = cur.parent() {
-                        let candidate = dir.join("envbox-probe.exe");
-                        if candidate.exists() {
-                            probe_path = Some(candidate);
+                        for cand in [
+                            dir.join("envbox-probe.exe"),
+                            dir.join("target").join("debug").join("envbox-probe.exe"),
+                            dir.join("target").join("release").join("envbox-probe.exe"),
+                        ] {
+                            if cand.exists() {
+                                probe_path = Some(cand);
+                                break;
+                            }
                         }
                     }
                 }
                 if probe_path.is_none() {
-                    for cand in &["target\\debug\\envbox-probe.exe", "target\\release\\envbox-probe.exe", ".\\envbox-probe.exe"] {
+                    for cand in &[
+                        "target\\debug\\envbox-probe.exe",
+                        "target\\release\\envbox-probe.exe",
+                        ".\\envbox-probe.exe",
+                    ] {
                         let p = std::path::PathBuf::from(cand);
                         if p.exists() {
                             probe_path = Some(p);
