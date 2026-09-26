@@ -13,8 +13,8 @@ use crate::widgets::{badge, primary_btn};
 pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
     let header = row![
         column![
-            text("配置文件").size(26).color(INK).font(font::name_font()),
-            text("可复用的 Environment Profile · Locale / Timezone / DNS / Env")
+            text("环境配置").size(26).color(INK).font(font::name_font()),
+            text("可复用的环境配置 · 地区 / 语言 / 时区 / 网络")
                 .size(13)
                 .color(MUTED)
                 .font(font::ui_font()),
@@ -24,7 +24,10 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
         button(
             row![
                 text("+").size(15).color(INK).font(font::name_font()),
-                text("新建配置文件").size(13).color(INK).font(font::ui_font()),
+                text("新建环境配置")
+                    .size(13)
+                    .color(INK)
+                    .font(font::ui_font()),
             ]
             .spacing(4)
             .align_y(Alignment::Center),
@@ -39,7 +42,10 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
         let new_btn = button(
             row![
                 icon(Icon::Play, INK, 11.0),
-                text("新建第一个配置文件").size(13).color(INK).font(font::name_font()),
+                text("新建第一个环境配置")
+                    .size(13)
+                    .color(INK)
+                    .font(font::name_font()),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
@@ -50,8 +56,8 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
 
         crate::widgets::empty_state(
             Icon::Globe,
-            "暂无环境配置文件",
-            "创建并定义目标进程专属的 Locale、语言、系统时区、DNS 虚拟视图与环境变量，供任意应用直接引用复用。",
+            "暂无环境配置",
+            "创建一组应用可以复用的地区、语言、时区、网络和环境变量设置。",
             Some(new_btn.into()),
         )
     } else {
@@ -77,7 +83,11 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                 badge(dns_label, dns_bg, dns_fg),
                 badge(
                     webrtc_choice.short_label(),
-                    if webrtc_active { ACCENT_BG } else { theme::BORDER },
+                    if webrtc_active {
+                        ACCENT_BG
+                    } else {
+                        theme::BORDER
+                    },
                     if webrtc_active { ACCENT_TEXT } else { MUTED },
                 ),
             ]
@@ -95,13 +105,16 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
             col.push(
                 button(
                     row![
-                        icon(Icon::Globe, if selected { ACCENT_LINE } else { MUTED }, 16.0),
+                        icon(
+                            Icon::Globe,
+                            if selected { ACCENT_LINE } else { MUTED },
+                            16.0
+                        ),
                         column![
-                            text(&p.name).size(15).color(if selected {
-                                ACCENT_TEXT
-                            } else {
-                                INK
-                            }).font(font::name_font()),
+                            text(&p.name)
+                                .size(15)
+                                .color(if selected { ACCENT_TEXT } else { INK })
+                                .font(font::name_font()),
                             text(format!(
                                 "{} · {} · {}",
                                 p.locale.region, p.locale.locale_name, p.timezone.windows_id

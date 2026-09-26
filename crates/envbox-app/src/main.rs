@@ -6,14 +6,16 @@
 
 mod app;
 mod app_icon;
-mod combo_overlay;
 mod close_behavior;
+mod combo_overlay;
 mod discover;
-mod package;
 mod font;
 mod icons;
 mod message;
 mod options;
+mod package;
+#[cfg(windows)]
+mod singleton;
 mod theme;
 #[cfg(windows)]
 mod tray;
@@ -24,6 +26,16 @@ mod widgets;
 use iced::{Size, Theme};
 
 fn main() -> iced::Result {
+    #[cfg(windows)]
+    match singleton::claim() {
+        Ok(singleton::Claim::Primary) => {}
+        Ok(singleton::Claim::AlreadyRunning) => return Ok(()),
+        Err(error) => {
+            show_startup_error(&error);
+            std::process::exit(1);
+        }
+    }
+
     let ui_font = font::install();
     iced::application("Aura", app::EnvBoxApp::update, app::EnvBoxApp::view)
         .subscription(app::EnvBoxApp::subscription)
@@ -40,6 +52,25 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .run_with(app::EnvBoxApp::new)
+}
+
+#[cfg(windows)]
+fn show_startup_error(error: &str) {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let text: Vec<u16> = format!("Aura 无法启动：{error}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            w!("Aura"),
+            MB_ICONERROR | MB_OK,
+        );
+    }
 }
 
 fn window_icon() -> Option<iced::window::Icon> {

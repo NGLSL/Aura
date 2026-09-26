@@ -40,12 +40,25 @@ pub struct Capability {
 }
 
 impl Capability {
-    #[allow(dead_code)]
     pub fn badge(&self) -> &'static str {
         match self.injection {
-            InjectionSupport::Supported => "可注入",
-            InjectionSupport::Delayed => "延迟注入",
-            InjectionSupport::Unsupported => "不支持注入",
+            InjectionSupport::Supported => "可使用环境配置",
+            InjectionSupport::Delayed => "兼容性有限",
+            InjectionSupport::Unsupported => "仅可直接启动",
+        }
+    }
+
+    /// Copy shown in the GUI. `reason` remains a diagnostic description for
+    /// the classifier and should not be rendered as product text.
+    pub fn user_explanation(&self) -> &'static str {
+        match self.injection {
+            InjectionSupport::Supported => "可以使用环境配置启动。",
+            InjectionSupport::Delayed => {
+                "Aura 会在 Windows 应用启动后尝试加载环境，启动初期的读取可能仍使用系统值。"
+            }
+            InjectionSupport::Unsupported => {
+                "此应用暂不支持环境配置启动；可以选择直接启动。"
+            }
         }
     }
 

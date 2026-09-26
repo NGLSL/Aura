@@ -11,5 +11,6 @@ mod picker;
 mod profiles;
 mod settings;
 mod shell;
+mod unsaved_dialog;
 
 pub use shell::view;

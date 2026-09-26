@@ -10,7 +10,7 @@ use crate::discover::DiscoveredApp;
 use crate::font;
 use crate::icons::{icon, Icon};
 use crate::message::Message;
-use crate::package::InjectionSupport;
+use crate::package::{InjectionSupport, Packaging};
 use crate::theme::*;
 use crate::widgets::{badge, primary_btn, secondary_btn};
 
@@ -204,7 +204,12 @@ fn item_row<'a>(idx: usize, item: &'a DiscoveredApp, selected: bool) -> Element<
         .color(INK)
         .font(font::name_font());
 
-    let path = text(ellipsize(&item.path, 56))
+    let path_label = if item.capability.packaging == Packaging::Win32 {
+        ellipsize(&item.path, 56)
+    } else {
+        "Windows 应用".to_string()
+    };
+    let path = text(path_label)
         .size(11)
         .color(MUTED)
         .font(font::ui_font());
@@ -215,30 +220,24 @@ fn item_row<'a>(idx: usize, item: &'a DiscoveredApp, selected: bool) -> Element<
         ACCENT_TEXT,
     );
 
-    let pkg_badge = badge(
-        item.capability.runtime_label,
-        if item.capability.injection == InjectionSupport::Unsupported {
-            DANGER_BG
-        } else {
-            ACCENT_BG
-        },
-        if item.capability.injection == InjectionSupport::Unsupported {
-            DANGER_TEXT
-        } else {
-            ACCENT_TEXT
-        },
-    );
-
-    let inject_badge = match item.capability.injection {
-        InjectionSupport::Supported => badge("可注入", SUCCESS_BG, SUCCESS_TEXT),
-        InjectionSupport::Delayed => badge("延迟注入", ACCENT_BG, ACCENT_TEXT),
-        InjectionSupport::Unsupported => badge("不支持注入", DANGER_BG, DANGER_TEXT),
+    let support_badge = match item.capability.injection {
+        InjectionSupport::Supported => None,
+        InjectionSupport::Delayed => {
+            Some(badge(item.capability.badge(), ACCENT_BG, ACCENT_TEXT))
+        }
+        InjectionSupport::Unsupported => {
+            Some(badge(item.capability.badge(), DANGER_BG, DANGER_TEXT))
+        }
     };
 
+    let mut title_row = row![name, source_badge]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    if let Some(support_badge) = support_badge {
+        title_row = title_row.push(support_badge);
+    }
     let meta = column![
-        row![name, source_badge, pkg_badge, inject_badge]
-            .spacing(6)
-            .align_y(Alignment::Center),
+        title_row,
         path,
     ]
     .spacing(4);

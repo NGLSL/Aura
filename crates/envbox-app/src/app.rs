@@ -1,5 +1,5 @@
 //! EnvBox GUI application state and message update.
-//! View rendering lives in `app/` modules; injection logic never lives here.
+//! UI workflows are split into child modules; injection logic never lives here.
 
 use envbox_core::{
     Application, AuditEvent, BrowserPrivacyProfile, DnsProfile, EnvironmentProfile,
@@ -15,14 +15,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+mod picker;
+mod window;
+
 use crate::close_behavior::{self, CloseBehavior};
-use crate::message::{
-    BottomTab, ComboField, DetailTab, DnsChoice, LaunchKind, Message, Nav, StatusKind, WebRtcChoice,
-};
+use crate::message::{ComboField, DnsChoice, LaunchKind, Message, Nav, StatusKind, WebRtcChoice};
 use crate::options;
 #[cfg(windows)]
 use crate::tray::{TrayAction, TrayState};
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct AppDraft {
     pub id: Option<Uuid>,
     pub name: String,
@@ -55,6 +57,7 @@ impl AppDraft {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProfileDraft {
     pub id: Option<Uuid>,
     pub name: String,
@@ -69,17 +72,27 @@ pub struct ProfileDraft {
     pub env: String,
 }
 
+#[derive(Clone, Copy)]
 pub enum RunSelection {
     Default,
     Profile(Uuid),
     Host,
 }
 
+#[derive(Clone, Copy)]
+enum PendingNavigation {
+    Nav(Nav),
+    App(Uuid),
+    Profile(Uuid),
+    NewApp,
+    NewProfile,
+    InstancesOf(Option<Uuid>),
+    Exit { remember: bool },
+}
+
 pub struct EnvBoxApp {
     pub store: ConfigStore,
     pub nav: Nav,
-    pub detail_tab: DetailTab,
-    pub bottom_tab: BottomTab,
     pub search: String,
     pub applications: Vec<Application>,
     pub profiles: Vec<EnvironmentProfile>,
@@ -87,6 +100,17 @@ pub struct EnvBoxApp {
     pub instances: InstanceManager,
     pub app_draft: AppDraft,
     pub profile_draft: ProfileDraft,
+    app_saved_draft: AppDraft,
+    profile_saved_draft: ProfileDraft,
+    pending_navigation: Option<PendingNavigation>,
+    pub unsaved_error: Option<String>,
+    pub app_edit_mode: bool,
+    pub app_advanced: bool,
+    pub profile_edit_mode: bool,
+    pub profile_advanced: bool,
+    pub instance_filter: Option<Uuid>,
+    pub app_capabilities: HashMap<Uuid, crate::package::Capability>,
+    resume_new_app: bool,
     pub audit_events: Vec<AuditEvent>,
     /// Empty = show all software.
     pub audit_filter: String,
@@ -149,18 +173,31 @@ impl EnvBoxApp {
             env: String::new(),
         };
         let close_behavior = close_behavior::load(store.root());
+        let app_capabilities = applications
+            .iter()
+            .map(|a| (a.id, capability_for_app(a)))
+            .collect();
         let mut app = Self {
             store,
             nav: Nav::Apps,
-            detail_tab: DetailTab::Basic,
-            bottom_tab: BottomTab::Instances,
             search: String::new(),
             applications,
             profiles,
             timezones,
             instances: InstanceManager::new(),
+            app_saved_draft: app_draft.clone(),
+            profile_saved_draft: profile_draft.clone(),
             app_draft,
             profile_draft,
+            pending_navigation: None,
+            unsaved_error: None,
+            app_edit_mode: false,
+            app_advanced: false,
+            profile_edit_mode: false,
+            profile_advanced: false,
+            instance_filter: None,
+            app_capabilities,
+            resume_new_app: false,
             audit_events: Vec::new(),
             audit_filter: String::new(),
             open_combo: None,
@@ -215,6 +252,9 @@ impl EnvBoxApp {
                     LaunchTarget::Packaged { aumid, .. } => aumid.clone(),
                 },
             };
+            self.app_saved_draft = self.app_draft.clone();
+            self.app_edit_mode = false;
+            self.app_advanced = false;
         }
     }
 
@@ -223,211 +263,141 @@ impl EnvBoxApp {
         self.status = msg.into();
     }
 
-    /// Icon cache directory beside config store.
-    pub fn icon_dir(&self) -> PathBuf {
-        self.store.root().join("icons")
+    pub fn running_count(&self, id: Uuid) -> usize {
+        self.instances
+            .list()
+            .into_iter()
+            .filter(|inst| inst.application_id == id && inst.status == InstanceStatus::Running)
+            .count()
     }
 
-    /// Scan into the picker off-thread (Kite-inspired). List first, icons later.
-    fn scan_apps_for_picker(&mut self) -> Task<Message> {
-        if let Some(p) = self.app_picker.as_mut() {
-            p.loading = true;
-            p.scanned = false;
-            p.items.clear();
-            p.selected = None;
-        }
-        Task::perform(
-            async move {
-                let (tx, rx) = iced::futures::channel::oneshot::channel();
-                std::thread::spawn(move || {
-                    let items = crate::discover::scan_installed_apps();
-                    let _ = tx.send(items);
-                });
-                rx.await.unwrap_or_default()
-            },
-            Message::AppPickerLoaded,
-        )
+    pub fn unsaved_dialog_open(&self) -> bool {
+        self.pending_navigation.is_some()
     }
 
-    /// Parallel icon extraction for picker rows (after the list is visible).
-    fn extract_picker_icons(&mut self) -> Task<Message> {
-        let icon_dir = self.icon_dir();
-        let Some(p) = self.app_picker.as_ref() else {
-            return Task::none();
-        };
-        if p.items.is_empty() {
-            return Task::none();
+    fn has_unsaved_edits(&self) -> bool {
+        match self.nav {
+            Nav::Apps => {
+                self.app_edit_mode
+                    && (self.app_draft != self.app_saved_draft
+                        || (self.app_draft.id.is_none() && !self.app_draft.name.is_empty()))
+            }
+            Nav::Profiles => self.profile_edit_mode && self.profile_draft != self.profile_saved_draft,
+            _ => false,
         }
-        let pending: Vec<(String, String, String)> = p
-            .items
-            .iter()
-            .filter(|a| a.icon_png.is_none())
-            .take(200)
-            .map(|a| (a.icon_key(), a.icon_src.clone(), a.path.clone()))
-            .collect();
-        if pending.is_empty() {
-            return Task::none();
+    }
+
+    fn request_navigation(&mut self, action: PendingNavigation) -> Task<Message> {
+        if self.has_unsaved_edits() {
+            self.pending_navigation = Some(action);
+            self.unsaved_error = None;
+            Task::none()
+        } else {
+            self.perform_navigation(action)
         }
-        Task::perform(
-            async move {
-                let (tx, rx) = iced::futures::channel::oneshot::channel();
-                std::thread::spawn(move || {
-                    use std::sync::{Arc, Mutex};
-                    let results = Arc::new(Mutex::new(Vec::<(String, Option<std::path::PathBuf>)>::new()));
-                    if pending.is_empty() {
-                        let _ = tx.send(Vec::new());
-                        return;
+    }
+
+    fn perform_navigation(&mut self, action: PendingNavigation) -> Task<Message> {
+        match action {
+            PendingNavigation::Nav(nav) => {
+                let previous_nav = self.nav;
+                self.nav = nav;
+                if nav != Nav::Profiles {
+                    self.resume_new_app = false;
+                }
+                if nav == Nav::Instances {
+                    self.instance_filter = None;
+                }
+                if previous_nav != nav && nav == Nav::Profiles && self.profile_draft.id.is_none() {
+                    if let Some(id) = self.profiles.first().map(|profile| profile.id) {
+                        self.select_profile(id);
                     }
-                    let chunk = pending.len().div_ceil(6).max(1);
-                    std::thread::scope(|s| {
-                        for part in pending.chunks(chunk) {
-                            let part = part.to_vec();
-                            let icon_dir = icon_dir.clone();
-                            let results = Arc::clone(&results);
-                            s.spawn(move || {
-                                for (key, src, _path) in &part {
-                                    let png =
-                                        crate::app_icon::cache_app_icon(&icon_dir, key, src);
-                                    if let Ok(mut g) = results.lock() {
-                                        g.push((key.clone(), png));
-                                    }
-                                }
-                            });
-                        }
-                    });
-                    let out: Vec<(String, std::path::PathBuf)> = results
-                        .lock()
-                        .map(|g| g.clone())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|(k, p)| p.map(|p| (k, p)))
-                        .collect();
-                    let _ = tx.send(out);
-                });
-                rx.await.unwrap_or_default()
-            },
-            Message::AppPickerIcons,
-        )
-    }
-
-    /// Background-extract icons for configured applications (cards + detail).
-    pub fn refresh_app_icons(&mut self) -> Task<Message> {
-        let icon_dir = self.icon_dir();
-        let targets: Vec<(Uuid, String)> = self
-            .applications
-            .iter()
-            .map(|a| {
-                let src = match &a.launch {
-                    LaunchTarget::Command { command } => command.clone(),
-                    LaunchTarget::Executable { path } => path.display().to_string(),
-                    LaunchTarget::Packaged { aumid, .. } => aumid.clone(),
-                };
-                (a.id, src)
-            })
-            .collect();
-        Task::perform(
-            async move {
-                let (tx, rx) = iced::futures::channel::oneshot::channel();
-                std::thread::spawn(move || {
-                    let mut out = Vec::new();
-                    for (id, src) in targets {
-                        if let Some(png) = crate::app_icon::cache_app_icon(&icon_dir, &id.to_string(), &src)
-                        {
-                            out.push((id, png));
-                        }
+                }
+                if previous_nav != nav && nav == Nav::Apps && self.app_draft.id.is_none() {
+                    if let Some(id) = self.applications.first().map(|app| app.id) {
+                        self.select_app(id);
                     }
-                    let _ = tx.send(out);
-                });
-                rx.await.unwrap_or_default()
-            },
-            Message::AppIconsLoaded,
-        )
+                }
+                Task::none()
+            }
+            PendingNavigation::InstancesOf(id) => {
+                self.instance_filter = id;
+                self.nav = Nav::Instances;
+                self.resume_new_app = false;
+                Task::none()
+            }
+            PendingNavigation::App(id) => {
+                self.select_app(id);
+                Task::none()
+            }
+            PendingNavigation::Profile(id) => {
+                self.select_profile(id);
+                Task::none()
+            }
+            PendingNavigation::NewApp => self.begin_new_app(),
+            PendingNavigation::NewProfile => {
+                self.begin_new_profile();
+                Task::none()
+            }
+            PendingNavigation::Exit { remember } => self.finish_exit(remember),
+        }
     }
 
-    pub fn filtered_picker_items(&self) -> Vec<(usize, &crate::discover::DiscoveredApp)> {
-        let Some(p) = self.app_picker.as_ref() else {
-            return Vec::new();
-        };
-        let q = p.query.trim().to_ascii_lowercase();
-        p.items
+    fn begin_new_app(&mut self) -> Task<Message> {
+        if self.profiles.is_empty() {
+            self.resume_new_app = true;
+            self.begin_new_profile();
+            self.set_status(StatusKind::Info, "先创建环境配置，保存后继续添加应用");
+            return Task::none();
+        }
+        self.nav = Nav::Apps;
+        self.app_picker = Some(AppPickerState::default());
+        self.scan_apps_for_picker()
+    }
+
+    fn blank_profile(&self) -> ProfileDraft {
+        let tz = self
+            .timezones
             .iter()
-            .enumerate()
-            .filter(|(_, a)| {
-                q.is_empty()
-                    || a.name.to_ascii_lowercase().contains(&q)
-                    || a.path.to_ascii_lowercase().contains(&q)
-                    || a.args.to_ascii_lowercase().contains(&q)
-                    || a.source.to_ascii_lowercase().contains(&q)
-            })
-            .collect()
-    }
-
-    /// Fill `app_draft` from the selected discovered entry.
-    fn apply_picker_selection(&mut self) -> Task<Message> {
-        let Some(idx) = self.app_picker.as_ref().and_then(|p| p.selected) else {
-            self.set_status(StatusKind::Error, "请先在列表中选择一个应用");
-            return Task::none();
-        };
-        let Some(item) = self
-            .app_picker
-            .as_ref()
-            .and_then(|p| p.items.get(idx).cloned())
-        else {
-            self.set_status(StatusKind::Error, "选择的应用无效");
-            return Task::none();
-        };
-
-        let profile_id = self.profiles.first().map(|p| p.id).unwrap_or_default();
-        let cap = item.capability;
-        self.app_draft = AppDraft {
+            .find(|t| t.eq_ignore_ascii_case("Pacific Standard Time"))
+            .cloned()
+            .or_else(|| self.timezones.first().cloned())
+            .unwrap_or_default();
+        let tz_iana = windows_id_to_iana(&tz).unwrap_or_default().to_string();
+        ProfileDraft {
             id: None,
-            name: item.name.clone(),
-            kind: if matches!(
-                cap.packaging,
-                crate::package::Packaging::PackagedWin32
-                    | crate::package::Packaging::AppContainer
-                    | crate::package::Packaging::PackagedUnknown
-            ) {
-                LaunchKind::Packaged
-            } else {
-                LaunchKind::Executable
-            },
-            path: item.path.clone(),
-            args: item.args.clone(),
-            work_dir: item.work_dir.clone(),
-            profile_id,
-            inherit: true,
-            audit: false,
-            icon_src: item.icon_src.clone(),
-        };
-        self.app_picker = None;
-        match cap.injection {
-            crate::package::InjectionSupport::Supported => {
-                self.set_status(
-                    StatusKind::Success,
-                    format!("已带入「{}」（{}），请确认 Profile 后保存", item.name, cap.runtime_label),
-                );
-            }
-            crate::package::InjectionSupport::Delayed => {
-                self.set_status(
-                    StatusKind::Info,
-                    format!(
-                        "已带入「{}」：{} / {}。{}",
-                        item.name, cap.runtime_label, cap.trust_label, cap.reason
-                    ),
-                );
-            }
-            crate::package::InjectionSupport::Unsupported => {
-                self.set_status(
-                    StatusKind::Error,
-                    format!(
-                        "已带入「{}」，但当前不支持 Runtime 注入：{} / {}。{}",
-                        item.name, cap.runtime_label, cap.trust_label, cap.reason
-                    ),
-                );
-            }
+            name: String::new(),
+            locale: "en-US".into(),
+            ui: "en-US".into(),
+            region: "US".into(),
+            tz,
+            tz_iana,
+            dns_mode: DnsChoice::Host,
+            dns_servers: String::new(),
+            webrtc: WebRtcChoice::Host,
+            env: String::new(),
         }
-        Task::none()
+    }
+
+    fn begin_new_profile(&mut self) {
+        self.nav = Nav::Profiles;
+        self.profile_draft = self.blank_profile();
+        self.profile_saved_draft = self.profile_draft.clone();
+        self.profile_edit_mode = true;
+        self.profile_advanced = false;
+        self.open_combo = None;
+        self.combo_query.clear();
+    }
+
+    fn select_profile(&mut self, id: Uuid) {
+        if let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) {
+            self.profile_draft = profile_to_draft(profile);
+            self.profile_saved_draft = self.profile_draft.clone();
+            self.profile_edit_mode = false;
+            self.profile_advanced = false;
+        }
+        self.open_combo = None;
+        self.combo_query.clear();
     }
 
     pub fn load_audit(&mut self) {
@@ -586,7 +556,8 @@ impl EnvBoxApp {
         self.combo_query.clear();
     }
 
-    pub fn filtered_apps(&self) -> Vec<&Application> {        let q = self.search.trim().to_ascii_lowercase();
+    pub fn filtered_apps(&self) -> Vec<&Application> {
+        let q = self.search.trim().to_ascii_lowercase();
         self.applications
             .iter()
             .filter(|a| {
@@ -615,13 +586,6 @@ impl EnvBoxApp {
             .unwrap_or_else(|| "—".into())
     }
 
-    pub fn is_app_running(&self, id: Uuid) -> bool {
-        self.instances
-            .list()
-            .into_iter()
-            .any(|i| i.application_id == id && i.status == InstanceStatus::Running)
-    }
-
     pub fn view(&self) -> iced::Element<'_, Message> {
         crate::views::view(self)
     }
@@ -629,6 +593,8 @@ impl EnvBoxApp {
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             iced::window::close_requests().map(Message::WindowCloseRequested),
+            #[cfg(windows)]
+            crate::singleton::subscription(),
             if self.tray.is_some() {
                 iced::time::every(std::time::Duration::from_millis(200))
                     .map(|_| Message::WindowTrayPoll)
@@ -638,89 +604,15 @@ impl EnvBoxApp {
         ])
     }
 
-    fn request_close(&mut self) -> Task<Message> {
-        if self.close_dialog || self.tray.is_some() {
-            return Task::none();
-        }
-        match self.close_behavior {
-            CloseBehavior::Ask => {
-                self.close_dialog = true;
-                self.remember_close_choice = false;
-                self.close_error = None;
-                Task::none()
-            }
-            CloseBehavior::Tray => self.hide_to_tray(),
-            CloseBehavior::Exit => iced::exit(),
-        }
-    }
-
-    fn save_close_choice(&mut self, choice: CloseBehavior) -> bool {
-        if !self.close_dialog || !self.remember_close_choice {
-            return true;
-        }
-        match close_behavior::save(self.store.root(), choice) {
-            Ok(()) => {
-                self.close_behavior = choice;
-                true
-            }
-            Err(err) => {
-                self.close_error = Some(format!("记住选择失败：{err}"));
-                false
-            }
-        }
-    }
-
-    fn hide_to_tray(&mut self) -> Task<Message> {
-        #[cfg(windows)]
-        {
-            if self.tray.is_some() {
-                return Task::none();
-            }
-            let tray = match TrayState::new() {
-                Ok(tray) => tray,
-                Err(err) => {
-                    self.close_dialog = true;
-                    self.close_error = Some(format!("无法最小化到系统托盘：{err}"));
-                    return Task::none();
-                }
-            };
-            if !self.save_close_choice(CloseBehavior::Tray) {
-                return Task::none();
-            }
-            self.tray = Some(tray);
-            self.close_dialog = false;
-            self.remember_close_choice = false;
-            self.close_error = None;
-            return iced::window::get_latest().then(|id| {
-                id.map(|id| iced::window::change_mode(id, iced::window::Mode::Hidden))
-                    .unwrap_or_else(Task::none)
-            });
-        }
-        #[cfg(not(windows))]
-        {
-            self.close_error = Some("当前平台不支持系统托盘".into());
-            Task::none()
-        }
-    }
-
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
-            Message::Nav(n) => self.nav = n,
-            Message::DetailTab(t) => self.detail_tab = t,
-            Message::BottomTab(t) => {
-                self.bottom_tab = t;
-                if t == BottomTab::Audit {
-                    self.load_audit();
+            Message::Nav(n) => {
+                if n != self.nav {
+                    return self.request_navigation(PendingNavigation::Nav(n));
                 }
             }
             Message::Search(v) => self.search = v,
-            Message::AppNew => {
-                self.app_draft =
-                    AppDraft::blank(self.profiles.first().map(|p| p.id).unwrap_or_default());
-                // Open local picker (Kite-style discovery) first.
-                self.app_picker = Some(AppPickerState::default());
-                return self.scan_apps_for_picker();
-            }
+            Message::AppNew => return self.request_navigation(PendingNavigation::NewApp),
             Message::AppPickerQuery(q) => {
                 if let Some(p) = self.app_picker.as_mut() {
                     p.query = q;
@@ -778,6 +670,9 @@ impl EnvBoxApp {
                 self.app_picker = None;
                 self.app_draft =
                     AppDraft::blank(self.profiles.first().map(|p| p.id).unwrap_or_default());
+                self.app_saved_draft = self.app_draft.clone();
+                self.app_edit_mode = true;
+                self.app_advanced = false;
             }
             Message::AppPickerClose => {
                 self.app_picker = None;
@@ -790,19 +685,33 @@ impl EnvBoxApp {
             Message::AppProfile(id) => self.app_draft.profile_id = id,
             Message::AppInherit(v) => self.app_draft.inherit = v,
             Message::AppAudit(v) => self.app_draft.audit = v,
-            Message::AppSelect(id) => self.select_app(id),
-            Message::AppOpenLocation => {
-                let target = if !self.app_draft.work_dir.trim().is_empty() {
-                    self.app_draft.work_dir.trim().to_string()
-                } else if !self.app_draft.path.trim().is_empty() {
-                    self.app_draft.path.trim().to_string()
-                } else {
-                    String::new()
-                };
-                if !target.is_empty() {
-                    let _ = std::process::Command::new("explorer").arg(&target).spawn();
+            Message::AppSelect(id) => {
+                if self.app_draft.id != Some(id) {
+                    return self.request_navigation(PendingNavigation::App(id));
                 }
             }
+            Message::AppEdit => {
+                self.app_saved_draft = self.app_draft.clone();
+                self.app_edit_mode = true;
+                self.app_advanced = false;
+            }
+            Message::AppEditCancel => {
+                self.app_draft = self.app_saved_draft.clone();
+                self.app_edit_mode = false;
+                self.app_advanced = false;
+                if self.app_draft.id.is_none() {
+                    if let Some(id) = self.applications.first().map(|app| app.id) {
+                        self.select_app(id);
+                    }
+                }
+            }
+            Message::AppAdvancedToggle => self.app_advanced = !self.app_advanced,
+            Message::AppOpenLocation => {
+                if let Some(id) = self.app_draft.id {
+                    self.open_app_location(id);
+                }
+            }
+            Message::AppOpenLocationId(id) => self.open_app_location(id),
             Message::AppBrowseWorkDir => {
                 let target = if !self.app_draft.work_dir.trim().is_empty() {
                     self.app_draft.work_dir.trim().to_string()
@@ -811,33 +720,12 @@ impl EnvBoxApp {
                 };
                 let _ = std::process::Command::new("explorer").arg(&target).spawn();
             }
-            Message::AppToggleAuditCollapse => {}
             Message::AppSave => return self.save_app(),
             Message::AppDelete => return self.delete_app(),
-            Message::AppRun => return self.run_selected(RunSelection::Default),
-            Message::AppRunId(id) => {
-                self.select_app(id);
-                return self.run_selected(RunSelection::Default);
-            }
-            Message::AppStopId(id) => {
-                let inst_id = self.instances.list().into_iter().find(|i| {
-                    i.application_id == id && i.status == envbox_core::InstanceStatus::Running
-                }).map(|i| i.id);
-                if let Some(iid) = inst_id {
-                    if let Err(err) = self.instances.stop(iid) {
-                        self.set_status(StatusKind::Error, format!("停止失败: {err}"));
-                    } else {
-                        self.set_status(StatusKind::Success, "已停止运行");
-                    }
-                }
-            }
-            Message::AppRunWith(id) => {
-                let sel = if id.is_nil() {
-                    RunSelection::Host
-                } else {
-                    RunSelection::Profile(id)
-                };
-                return self.run_selected(sel);
+            Message::AppRunId(id) => return self.run_app(id, RunSelection::Default),
+            Message::AppRunWithId(id, profile_id) => {
+                let selection = profile_id.map(RunSelection::Profile).unwrap_or(RunSelection::Host);
+                return self.run_app(id, selection);
             }
             Message::ProfileName(v) => self.profile_draft.name = v,
             Message::ProfileLocale(v) => self.profile_draft.locale = v,
@@ -861,42 +749,38 @@ impl EnvBoxApp {
                 self.combo_query.clear();
             }
             Message::ProfileSelect(id) => {
-                if let Some(p) = self.profiles.iter().find(|p| p.id == id) {
-                    self.profile_draft = profile_to_draft(p);
+                if self.profile_draft.id != Some(id) {
+                    return self.request_navigation(PendingNavigation::Profile(id));
                 }
+            }
+            Message::ProfileEdit => {
+                self.profile_saved_draft = self.profile_draft.clone();
+                self.profile_edit_mode = true;
+                self.profile_advanced = false;
+            }
+            Message::ProfileEditCancel => {
+                self.profile_draft = self.profile_saved_draft.clone();
+                self.profile_edit_mode = false;
+                self.profile_advanced = false;
+                self.resume_new_app = false;
                 self.open_combo = None;
                 self.combo_query.clear();
+                if self.profile_draft.id.is_none() {
+                    if let Some(id) = self.profiles.first().map(|profile| profile.id) {
+                        self.select_profile(id);
+                    }
+                }
             }
+            Message::ProfileAdvancedToggle => self.profile_advanced = !self.profile_advanced,
             Message::ProfileSave => return self.save_profile(),
             Message::ProfileDelete => return self.delete_profile(),
-            Message::ProfileNew => {
-                let tz = self
-                    .timezones
-                    .iter()
-                    .find(|t| t.eq_ignore_ascii_case("Pacific Standard Time"))
-                    .cloned()
-                    .or_else(|| self.timezones.first().cloned())
-                    .unwrap_or_default();
-                let tz_iana = windows_id_to_iana(&tz).unwrap_or_default().to_string();
-                self.profile_draft = ProfileDraft {
-                    id: None,
-                    name: String::new(),
-                    locale: "en-US".into(),
-                    ui: "en-US".into(),
-                    region: "US".into(),
-                    tz,
-                    tz_iana,
-                    dns_mode: DnsChoice::Host,
-                    dns_servers: String::new(),
-                    webrtc: WebRtcChoice::Host,
-                    env: String::new(),
-                };
-                self.open_combo = None;
-                self.combo_query.clear();
-            }
+            Message::ProfileNew => return self.request_navigation(PendingNavigation::NewProfile),
             Message::InstanceRefresh => {
                 self.instances.refresh_all();
                 self.set_status(StatusKind::Success, "实例已刷新");
+            }
+            Message::InstanceFilter(id) => {
+                return self.request_navigation(PendingNavigation::InstancesOf(id));
             }
             Message::InstanceStop(id) => {
                 if let Err(err) = self.instances.stop(id) {
@@ -968,6 +852,49 @@ impl EnvBoxApp {
                     self.set_status(StatusKind::Error, "未找到 envbox-probe.exe，请先通过 cargo build 构建探针");
                 }
             }
+            Message::StatusDismiss => self.status.clear(),
+            Message::UnsavedCancel => {
+                self.pending_navigation = None;
+                self.unsaved_error = None;
+            }
+            Message::UnsavedDiscard => {
+                let Some(action) = self.pending_navigation.take() else {
+                    return Task::none();
+                };
+                self.unsaved_error = None;
+                match self.nav {
+                    Nav::Apps => {
+                        self.app_draft = self.app_saved_draft.clone();
+                        self.app_edit_mode = false;
+                    }
+                    Nav::Profiles => {
+                        self.profile_draft = self.profile_saved_draft.clone();
+                        self.profile_edit_mode = false;
+                    }
+                    _ => {}
+                }
+                return self.perform_navigation(action);
+            }
+            Message::UnsavedSave => {
+                let Some(action) = self.pending_navigation.take() else {
+                    return Task::none();
+                };
+                // The pending navigation takes precedence over the first-run
+                // "create a Profile, then add an app" continuation.
+                self.resume_new_app = false;
+                let save_task = match self.nav {
+                    Nav::Apps => self.save_app(),
+                    Nav::Profiles => self.save_profile(),
+                    _ => Task::none(),
+                };
+                if self.has_unsaved_edits() {
+                    self.pending_navigation = Some(action);
+                    self.unsaved_error = Some(self.status.clone());
+                    return save_task;
+                }
+                self.unsaved_error = None;
+                return Task::batch([save_task, self.perform_navigation(action)]);
+            }
             Message::WindowDrag => {
                 return iced::window::get_latest().then(|id| {
                     id.map(iced::window::drag).unwrap_or_else(Task::none)
@@ -993,11 +920,7 @@ impl EnvBoxApp {
                 self.close_error = None;
             }
             Message::WindowCloseToTray => return self.hide_to_tray(),
-            Message::WindowExit => {
-                if !self.close_dialog || self.save_close_choice(CloseBehavior::Exit) {
-                    return iced::exit();
-                }
-            }
+            Message::WindowExit => return self.request_exit(),
             Message::WindowClosePreferenceReset => {
                 match close_behavior::save(self.store.root(), CloseBehavior::Ask) {
                     Ok(()) => {
@@ -1013,7 +936,13 @@ impl EnvBoxApp {
                 if let Some(tray) = &self.tray {
                     match tray.poll() {
                         Some(TrayAction::Restore) => return self.update(Message::WindowRestore),
-                        Some(TrayAction::Exit) => return iced::exit(),
+                        Some(TrayAction::Exit) => {
+                            let exit = self.request_exit();
+                            if self.pending_navigation.is_some() {
+                                return self.update(Message::WindowRestore);
+                            }
+                            return exit;
+                        }
                         None => {}
                     }
                 }
@@ -1021,10 +950,16 @@ impl EnvBoxApp {
             Message::WindowRestore => {
                 #[cfg(windows)]
                 {
-                    self.tray = None;
-                    return iced::window::get_latest().then(|id| {
+                    let was_hidden = self.tray.take().is_some();
+                    return iced::window::get_latest().then(move |id| {
                         id.map(|id| {
-                            iced::window::change_mode(id, iced::window::Mode::Windowed)
+                            let reveal = if was_hidden {
+                                iced::window::change_mode(id, iced::window::Mode::Windowed)
+                            } else {
+                                Task::none()
+                            };
+                            reveal
+                                .chain(iced::window::minimize(id, false))
                                 .chain(iced::window::gain_focus(id))
                         })
                         .unwrap_or_else(Task::none)
@@ -1037,7 +972,7 @@ impl EnvBoxApp {
 
     fn save_app(&mut self) -> Task<Message> {
         if self.profiles.is_empty() {
-            self.set_status(StatusKind::Error, "保存失败：请先创建配置文件");
+            self.set_status(StatusKind::Error, "保存失败：请先创建环境配置");
             return Task::none();
         }
         if !self
@@ -1045,7 +980,7 @@ impl EnvBoxApp {
             .iter()
             .any(|p| p.id == self.app_draft.profile_id)
         {
-            self.set_status(StatusKind::Error, "保存失败：默认配置文件不存在");
+            self.set_status(StatusKind::Error, "保存失败：默认环境配置不存在");
             return Task::none();
         }
         // AUMID / shell:AppsFolder / WindowsApps / execution-alias paths must
@@ -1090,6 +1025,9 @@ impl EnvBoxApp {
             Ok(()) => {
                 self.applications = doc.applications;
                 self.app_draft.id = Some(app.id);
+                self.app_saved_draft = self.app_draft.clone();
+                self.app_edit_mode = false;
+                self.app_capabilities.insert(app.id, capability_for_app(&app));
                 self.set_status(StatusKind::Success, "应用已保存");
                 return self.refresh_app_icons();
             }
@@ -1108,7 +1046,16 @@ impl EnvBoxApp {
         match self.store.save_applications(&doc) {
             Ok(()) => {
                 self.applications = doc.applications;
-                self.app_draft.id = None;
+                self.app_capabilities.remove(&id);
+                if let Some(next_id) = self.applications.first().map(|app| app.id) {
+                    self.select_app(next_id);
+                } else {
+                    self.app_draft = AppDraft::blank(
+                        self.profiles.first().map(|profile| profile.id).unwrap_or_default(),
+                    );
+                    self.app_saved_draft = self.app_draft.clone();
+                    self.app_edit_mode = false;
+                }
                 self.set_status(StatusKind::Success, "应用已删除");
             }
             Err(err) => self.set_status(StatusKind::Error, format!("删除失败: {err}")),
@@ -1116,15 +1063,22 @@ impl EnvBoxApp {
         Task::none()
     }
 
-    fn run_selected(&mut self, sel: RunSelection) -> Task<Message> {
-        let Some(app_id) = self.app_draft.id else {
-            self.set_status(StatusKind::Error, "请先选择应用");
-            return Task::none();
-        };
+    fn run_app(&mut self, app_id: Uuid, sel: RunSelection) -> Task<Message> {
         let Some(app) = self.applications.iter().find(|a| a.id == app_id).cloned() else {
             self.set_status(StatusKind::Error, "应用不存在");
             return Task::none();
         };
+        if !matches!(sel, RunSelection::Host) {
+            if let Some(capability) = self.app_capabilities.get(&app_id) {
+                if capability.injection == crate::package::InjectionSupport::Unsupported {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!("「{}」无法使用环境配置启动。{}", app.name, capability.user_explanation()),
+                    );
+                    return Task::none();
+                }
+            }
+        }
         let target = match sel {
             RunSelection::Host => RunTarget::Host,
             RunSelection::Default => {
@@ -1134,14 +1088,14 @@ impl EnvBoxApp {
                     .find(|p| p.id == app.default_profile_id)
                     .cloned()
                 else {
-                    self.set_status(StatusKind::Error, "配置文件不存在");
+                    self.set_status(StatusKind::Error, "环境配置不存在");
                     return Task::none();
                 };
                 RunTarget::Profile(profile)
             }
             RunSelection::Profile(id) => {
                 let Some(profile) = self.profiles.iter().find(|p| p.id == id).cloned() else {
-                    self.set_status(StatusKind::Error, "配置文件不存在");
+                    self.set_status(StatusKind::Error, "环境配置不存在");
                     return Task::none();
                 };
                 RunTarget::Profile(profile)
@@ -1151,12 +1105,29 @@ impl EnvBoxApp {
             Ok(id) => {
                 self.set_status(StatusKind::Success, format!("已启动实例 {id}"));
                 self.nav = Nav::Apps;
-                self.bottom_tab = BottomTab::Instances;
                 self.instances.refresh_all();
             }
             Err(err) => self.set_status(StatusKind::Error, format!("启动失败: {err}")),
         }
         Task::none()
+    }
+
+    fn open_app_location(&mut self, app_id: Uuid) {
+        let Some(app) = self.applications.iter().find(|app| app.id == app_id) else {
+            self.set_status(StatusKind::Error, "应用不存在");
+            return;
+        };
+        let LaunchTarget::Executable { path } = &app.launch else {
+            self.set_status(StatusKind::Info, "此启动方式没有可打开的程序文件位置");
+            return;
+        };
+        let Some(folder) = path.parent().filter(|parent| parent.is_dir()) else {
+            self.set_status(StatusKind::Error, "程序所在目录不存在");
+            return;
+        };
+        if let Err(err) = std::process::Command::new("explorer.exe").arg(folder).spawn() {
+            self.set_status(StatusKind::Error, format!("打开程序位置失败：{err}"));
+        }
     }
 
     fn save_profile(&mut self) -> Task<Message> {
@@ -1238,7 +1209,13 @@ impl EnvBoxApp {
             Ok(()) => {
                 self.profiles = doc.profiles;
                 self.profile_draft.id = Some(profile.id);
-                self.set_status(StatusKind::Success, "配置文件已保存");
+                self.profile_saved_draft = self.profile_draft.clone();
+                self.profile_edit_mode = false;
+                self.set_status(StatusKind::Success, "环境配置已保存");
+                if self.resume_new_app {
+                    self.resume_new_app = false;
+                    return self.begin_new_app();
+                }
             }
             Err(err) => self.set_status(StatusKind::Error, format!("保存失败: {err}")),
         }
@@ -1247,21 +1224,48 @@ impl EnvBoxApp {
 
     fn delete_profile(&mut self) -> Task<Message> {
         let Some(id) = self.profile_draft.id else {
-            self.set_status(StatusKind::Error, "请先选择配置文件");
+            self.set_status(StatusKind::Error, "请先选择环境配置");
             return Task::none();
         };
+        let in_use = self
+            .applications
+            .iter()
+            .filter(|app| app.default_profile_id == id)
+            .count();
+        if in_use > 0 {
+            self.set_status(
+                StatusKind::Error,
+                format!("有 {in_use} 个应用使用此环境配置，请先更改这些应用的默认环境"),
+            );
+            return Task::none();
+        }
         let mut doc = self.store.load_profiles().unwrap_or_default();
         doc.profiles.retain(|p| p.id != id);
         match self.store.save_profiles(&doc) {
             Ok(()) => {
                 self.profiles = doc.profiles;
-                self.profile_draft.id = None;
-                self.set_status(StatusKind::Success, "配置文件已删除");
+                if let Some(next_id) = self.profiles.first().map(|profile| profile.id) {
+                    self.select_profile(next_id);
+                } else {
+                    self.profile_draft = self.blank_profile();
+                    self.profile_saved_draft = self.profile_draft.clone();
+                    self.profile_edit_mode = false;
+                }
+                self.set_status(StatusKind::Success, "环境配置已删除");
             }
             Err(err) => self.set_status(StatusKind::Error, format!("删除失败: {err}")),
         }
         Task::none()
     }
+}
+
+fn capability_for_app(app: &Application) -> crate::package::Capability {
+    let target = match &app.launch {
+        LaunchTarget::Command { command } => command.as_str(),
+        LaunchTarget::Executable { path } => path.to_str().unwrap_or_default(),
+        LaunchTarget::Packaged { aumid, .. } => aumid.as_str(),
+    };
+    crate::package::classify_target(target, &format_args(&app.arguments))
 }
 
 pub fn profile_to_draft(p: &EnvironmentProfile) -> ProfileDraft {

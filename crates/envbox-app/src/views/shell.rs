@@ -1,14 +1,14 @@
 //! Three-column shell with custom title bar (no native chrome).
 
-use iced::widget::{button, column, container, mouse_area, row, Space};
+use iced::widget::{button, column, container, mouse_area, row, text, Space};
 use iced::{Element, Fill, Length, Padding};
 
 use crate::app::EnvBoxApp;
 use crate::icons::{icon, Icon};
-use crate::message::Message;
+use crate::message::{Message, StatusKind};
 use crate::theme::{self, win_button, win_close_button, MUTED, WINDOW};
 
-use super::{apps, audit, close_dialog, detail, instances, nav, picker, profiles, settings};
+use super::{apps, audit, close_dialog, detail, instances, nav, picker, profiles, settings, unsaved_dialog};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::message::Nav;
@@ -22,7 +22,11 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         }
     };
 
-    let shell = column![title_bar(), body].spacing(0);
+    let mut shell = column![title_bar()].spacing(0);
+    if !app.status.is_empty() {
+        shell = shell.push(status_banner(app));
+    }
+    let shell = shell.push(body);
 
     let base = container(shell)
         .width(Fill)
@@ -39,14 +43,52 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         base.into()
     };
 
-    if app.close_dialog {
+    let content = if app.close_dialog {
         iced::widget::stack![content, close_dialog::view(app)]
             .width(Fill)
             .height(Fill)
             .into()
     } else {
         content
+    };
+
+    if app.unsaved_dialog_open() {
+        iced::widget::stack![content, unsaved_dialog::view(app)]
+            .width(Fill)
+            .height(Fill)
+            .into()
+    } else {
+        content
     }
+}
+
+fn status_banner(app: &EnvBoxApp) -> Element<'_, Message> {
+    let (background, foreground) = match app.status_kind {
+        StatusKind::Info => (theme::ACCENT_BG, theme::ACCENT_TEXT),
+        StatusKind::Success => (theme::SUCCESS_BG, theme::SUCCESS_TEXT),
+        StatusKind::Error => (theme::DANGER_BG, theme::DANGER_TEXT),
+    };
+    container(
+        row![
+            text(&app.status)
+                .size(12)
+                .color(foreground)
+                .width(Fill),
+            button(icon(Icon::Close, foreground, 11.0))
+                .on_press(Message::StatusDismiss)
+                .style(win_button)
+                .padding(Padding::from([3, 6])),
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center),
+    )
+    .width(Fill)
+    .padding(Padding::from([7, 16]))
+    .style(move |_| container::Style {
+        background: Some(iced::Background::Color(background)),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// Custom title bar: drag region + window controls (matches mockup chrome).

@@ -22,7 +22,7 @@ impl Nav {
     pub fn label(self) -> &'static str {
         match self {
             Nav::Apps => "应用",
-            Nav::Profiles => "配置文件",
+            Nav::Profiles => "环境配置",
             Nav::Instances => "运行实例",
             Nav::Audit => "审计",
             Nav::Settings => "设置",
@@ -166,21 +166,6 @@ impl std::fmt::Display for LaunchKind {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetailTab {
-    Basic,
-    Env,
-    Advanced,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BottomTab {
-    Instances,
-    Audit,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     Info,
@@ -202,8 +187,6 @@ pub enum ComboField {
 #[derive(Debug, Clone)]
 pub enum Message {
     Nav(Nav),
-    DetailTab(DetailTab),
-    BottomTab(BottomTab),
     Search(String),
     // Application form
     AppNew,
@@ -227,16 +210,16 @@ pub enum Message {
     AppInherit(bool),
     AppAudit(bool),
     AppSelect(Uuid),
+    AppEdit,
+    AppEditCancel,
+    AppAdvancedToggle,
     AppSave,
     AppDelete,
-    AppRun,
     AppRunId(Uuid),
-    AppStopId(Uuid),
-    /// nil = Host (real host, no virtualization)
-    AppRunWith(Uuid),
+    AppRunWithId(Uuid, Option<Uuid>),
     AppOpenLocation,
+    AppOpenLocationId(Uuid),
     AppBrowseWorkDir,
-    AppToggleAuditCollapse,
     // Profile form
     ProfileName(String),
     ProfileLocale(String),
@@ -254,11 +237,15 @@ pub enum Message {
     ComboPick(ComboField, String),
     ComboClose,
     ProfileSelect(Uuid),
+    ProfileEdit,
+    ProfileEditCancel,
+    ProfileAdvancedToggle,
     ProfileSave,
     ProfileDelete,
     ProfileNew,
     // Instances / audit
     InstanceRefresh,
+    InstanceFilter(Option<Uuid>),
     InstanceStop(Uuid),
     AuditRefresh,
     AuditFilter(String),
@@ -266,6 +253,10 @@ pub enum Message {
     // Settings / diagnostics
     OpenConfigDir,
     RunProbe,
+    StatusDismiss,
+    UnsavedSave,
+    UnsavedDiscard,
+    UnsavedCancel,
     // Custom window chrome
     WindowDrag,
     WindowMinimize,
