@@ -573,6 +573,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires AppsFolder entries in an interactive Windows profile"]
     fn scan_includes_apps_folder_entries() {
         let items = scan_installed_apps();
         assert!(
@@ -588,6 +589,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires ChatGPT installed in the interactive Windows profile"]
     fn chat_query_matches_chatgpt() {
         let items = scan_installed_apps();
         let hits: Vec<_> = items
