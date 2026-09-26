@@ -49,6 +49,12 @@ envbox run --profile <id> .\target\debug\envbox-probe.exe
 
 Config lives under `%LOCALAPPDATA%\com.aura.envbox\` (or `ENVBOX_CONFIG_ROOT`).
 
+## Windows installer
+
+`scripts/build-installer.ps1` builds the Rust workspace, both C++ Runtime DLLs, and the NSIS installer. The version shown in Aura and the version registered by the installer both come from `workspace.package.version` in `Cargo.toml`. When bumping it, update and commit `Cargo.lock` too; an explicit `-Version` value is accepted only when it matches the Cargo version.
+
+For a build in the private GitHub repository, run **Actions → Build Windows installer → Run workflow**. Download the `aura-windows-installer` artifact from the completed run; it contains `aura-setup.exe` and its SHA-256 checksum. The workflow uses a Windows 2022 runner, builds pinned Microsoft Detours for x64 and x86, then runs the same installer script. It does not publish a GitHub Release.
+
 ## Instance lifecycle
 
 Closing Aura, or replacing Aura during an installer upgrade, leaves applications already launched by Aura running. Those detached instances keep the immutable Profile they received at launch, including for later child processes. The **Stop** action still explicitly terminates the tracked process tree. After Aura exits, its in-memory tracking is gone, so a reopened Aura cannot stop or inspect the detached instance.

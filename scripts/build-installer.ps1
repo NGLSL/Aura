@@ -3,12 +3,24 @@
 # rebuilds only targets whose inputs changed.
 [CmdletBinding()]
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "0.3.0",
+    [string]$Version = "",
     [string]$Nsis = ""
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
+$manifest = Join-Path $root "Cargo.toml"
+$metadataJson = & cargo metadata --locked --no-deps --format-version 1 --manifest-path $manifest
+if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed ($LASTEXITCODE)" }
+$metadata = ($metadataJson -join "`n") | ConvertFrom-Json
+$appPackage = @($metadata.packages | Where-Object { $_.name -eq "envbox-app" })
+if ($appPackage.Count -ne 1) { throw "expected exactly one envbox-app package in Cargo metadata" }
+$cargoVersion = [string]$appPackage[0].version
+if ($cargoVersion -notmatch '^\d+\.\d+\.\d+$') { throw "unsupported Cargo version: $cargoVersion" }
+if ($Version -and $Version -ne $cargoVersion) {
+    throw "installer version $Version differs from envbox-app version $cargoVersion; update Cargo.toml and Cargo.lock"
+}
+$Version = $cargoVersion
+
 $artifacts = Join-Path $root "artifacts"
 $rel = Join-Path $root "target\release"
 New-Item -ItemType Directory -Force $artifacts | Out-Null
@@ -64,9 +76,8 @@ if (Test-Path -LiteralPath $setup -PathType Leaf) {
     Remove-Item -LiteralPath $setup -Force
 }
 
-$manifest = Join-Path $root "Cargo.toml"
 Write-Host "== cargo build --workspace --release =="
-& cargo build --workspace --release --manifest-path $manifest
+& cargo build --workspace --release --locked --manifest-path $manifest
 if ($LASTEXITCODE -ne 0) { throw "cargo release build failed ($LASTEXITCODE)" }
 
 Build-Runtime -Arch "x64" -CMakeArch "x64" -DllName "runtime64" -BuildDirName "runtime-build"

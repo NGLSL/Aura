@@ -1,7 +1,7 @@
 ﻿; Aura / EnvBox native installer (NSIS) — Kite-style per-machine install
 Unicode True
 !ifndef VERSION
-  !define VERSION "0.3.0"
+  !error "VERSION is required; use scripts/build-installer.ps1"
 !endif
 Name "Aura"
 OutFile "..\artifacts\aura-setup.exe"

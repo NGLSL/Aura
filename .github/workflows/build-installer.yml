@@ -1,0 +1,101 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out Aura
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check out Microsoft Detours
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/Detours
+          ref: adb07604aa56508448b95bf037c2a6d0d3b6831a
+          path: third_party/Detours
+          persist-credentials: false
+
+      - name: Restore Detours libraries
+        id: detours-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/Detours/lib.X64
+            third_party/Detours/lib.X86
+            third_party/Detours/include
+          key: detours-windows-2022-adb07604aa56508448b95bf037c2a6d0d3b6831a
+
+      - name: Build Microsoft Detours for x64 and x86
+        env:
+          DETOURS_CACHE_HIT: ${{ steps.detours-cache.outputs.cache-hit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $detours = Join-Path $env:GITHUB_WORKSPACE 'third_party\Detours'
+          $revision = (git -C $detours rev-parse HEAD).Trim()
+          if ($revision -ne 'adb07604aa56508448b95bf037c2a6d0d3b6831a') {
+            throw "Unexpected Detours revision: $revision"
+          }
+
+          if ($env:DETOURS_CACHE_HIT -ne 'true') {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if (-not $vs) { throw 'Visual Studio C++ tools not found' }
+            $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat'
+            Push-Location (Join-Path $detours 'src')
+            try {
+              foreach ($arch in @('x64', 'x86')) {
+                $target = $arch.ToUpperInvariant()
+                $command = "call `"$vcvars`" $arch >nul && set `"DETOURS_TARGET_PROCESSOR=$target`" && nmake /nologo"
+                & cmd.exe /d /s /c $command
+                if ($LASTEXITCODE -ne 0) { throw "Detours $arch build failed ($LASTEXITCODE)" }
+              }
+            } finally {
+              Pop-Location
+            }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $detours 'include\detours.h'))) {
+            throw 'Detours header missing'
+          }
+          foreach ($target in @('X64', 'X86')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $detours "lib.$target\detours.lib"))) {
+              throw "Detours $target library missing"
+            }
+          }
+          "DETOURS_ROOT=$detours" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Aura installer
+        run: .\scripts\build-installer.ps1
+
+      - name: Write installer checksum
+        run: |
+          $hash = (Get-FileHash -LiteralPath artifacts\aura-setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath artifacts\aura-setup.exe.sha256 -Value "$hash  aura-setup.exe" -Encoding ascii
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: aura-windows-installer
+          path: |
+            artifacts/aura-setup.exe
+            artifacts/aura-setup.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
