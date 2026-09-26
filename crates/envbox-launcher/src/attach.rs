@@ -115,6 +115,7 @@ fn handshake_probe(_pid: u32) -> bool {
 fn win_inject_remote(pid: u32, dll: &Path) -> Result<(), AttachError> {
     use crate::launcher::win::SafeHandle;
     use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{GetLastError, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -126,7 +127,6 @@ fn win_inject_remote(pid: u32, dll: &Path) -> Result<(), AttachError> {
         PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
         PROCESS_VM_WRITE,
     };
-    use windows::core::PCWSTR;
 
     /// Frees remote allocation when the inject path returns early or finishes.
     struct RemoteAlloc {
@@ -199,10 +199,12 @@ fn win_inject_remote(pid: u32, dll: &Path) -> Result<(), AttachError> {
                 pid,
                 message: format!("GetModuleHandleW(kernel32) failed ({})", GetLastError().0),
             })?;
-        let load_library = GetProcAddress(k32, windows::core::s!("LoadLibraryW"))
-            .ok_or_else(|| AttachError::InjectFailed {
-                pid,
-                message: format!("GetProcAddress(LoadLibraryW) failed ({})", GetLastError().0),
+        let load_library =
+            GetProcAddress(k32, windows::core::s!("LoadLibraryW")).ok_or_else(|| {
+                AttachError::InjectFailed {
+                    pid,
+                    message: format!("GetProcAddress(LoadLibraryW) failed ({})", GetLastError().0),
+                }
             })?;
 
         let thread = CreateRemoteThread(
@@ -247,9 +249,8 @@ fn win_inject_remote(pid: u32, dll: &Path) -> Result<(), AttachError> {
         if load_result == 0 {
             return Err(AttachError::InjectFailed {
                 pid,
-                message:
-                    "LoadLibraryW returned NULL (Runtime DllMain Fail Closed or DLL rejected)"
-                        .into(),
+                message: "LoadLibraryW returned NULL (Runtime DllMain Fail Closed or DLL rejected)"
+                    .into(),
             });
         }
         Ok(())
@@ -278,9 +279,7 @@ impl RuntimeAttacher for RuntimeInjector {
 }
 
 /// Pick attach strategy from capabilities (delegates to core policy).
-pub fn select_strategy(
-    caps: &envbox_core::TargetCapabilities,
-) -> Option<AttachStrategy> {
+pub fn select_strategy(caps: &envbox_core::TargetCapabilities) -> Option<AttachStrategy> {
     envbox_core::select_attach_strategy(caps)
 }
 
@@ -292,10 +291,7 @@ mod tests {
     #[test]
     fn pre_execution_when_can_suspend() {
         let caps = TargetCapabilities::win32();
-        assert_eq!(
-            select_strategy(&caps),
-            Some(AttachStrategy::PreExecution)
-        );
+        assert_eq!(select_strategy(&caps), Some(AttachStrategy::PreExecution));
     }
 
     #[test]
@@ -307,9 +303,6 @@ mod tests {
             can_assign_job: true,
             can_track_children: true,
         };
-        assert_eq!(
-            select_strategy(&caps),
-            Some(AttachStrategy::PostActivation)
-        );
+        assert_eq!(select_strategy(&caps), Some(AttachStrategy::PostActivation));
     }
 }

@@ -181,7 +181,8 @@ fn find_identity_by_exe_stem(stem: &str) -> Option<PackageIdentity> {
                     .map(|s| s.to_string_lossy().to_ascii_lowercase())
                     .unwrap_or_default();
                 if exe_stem == stem_l {
-                    let app_id = application_id_from_manifest_dir(&dir).unwrap_or_else(|| "App".into());
+                    let app_id =
+                        application_id_from_manifest_dir(&dir).unwrap_or_else(|| "App".into());
                     return Some(PackageIdentity {
                         aumid: format!("{family}!{app_id}"),
                         package_full_name: full_name,
@@ -491,8 +492,12 @@ fn extract_attr_near(text: &str, tag: &str, attr: &str) -> Option<String> {
         // Require a real element boundary so `<Application` does not match
         // `<Applications>`.
         let boundary = lower.as_bytes().get(after).copied().unwrap_or(b'x');
-        if boundary == b'>' || boundary == b'/' || boundary == b' ' || boundary == b'\t'
-            || boundary == b'\n' || boundary == b'\r'
+        if boundary == b'>'
+            || boundary == b'/'
+            || boundary == b' '
+            || boundary == b'\t'
+            || boundary == b'\n'
+            || boundary == b'\r'
         {
             break hit;
         }

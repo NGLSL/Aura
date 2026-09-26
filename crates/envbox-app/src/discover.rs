@@ -1,4 +1,4 @@
-//! Local installed-app discovery (Start Menu / Desktop), Kite-inspired.
+//! Local installed-app discovery (Start Menu / Desktop / command directories), Kite-inspired.
 //! Entry collection + `.lnk` resolve + package classification. No UWP COM index yet.
 
 use std::path::{Path, PathBuf};
@@ -31,12 +31,24 @@ impl DiscoveredApp {
     pub fn icon_key(&self) -> String {
         format!("{}|{}", self.path.to_lowercase(), self.icon_src.to_lowercase())
     }
+
+    /// CLI entries are supplemental search hits, not the default app catalogue.
+    pub fn matches_picker_query(&self, query: &str) -> bool {
+        if query.is_empty() {
+            return self.source != "commands";
+        }
+        self.name.to_ascii_lowercase().contains(query)
+            || self.path.to_ascii_lowercase().contains(query)
+            || self.args.to_ascii_lowercase().contains(query)
+            || self.source.to_ascii_lowercase().contains(query)
+    }
 }
 
 const MAX_ITEMS: usize = 400;
+const MAX_COMMAND_ITEMS: usize = 400;
 const MAX_DEPTH: usize = 3;
 
-/// Scan Start Menu + Desktop + shell:AppsFolder for launchable entries.
+/// Scan Start Menu + Desktop + shell:AppsFolder + CLI command directories.
 /// Caps and skips junk names so the picker stays responsive.
 pub fn scan_installed_apps() -> Vec<DiscoveredApp> {
     let mut out: Vec<DiscoveredApp> = Vec::new();
@@ -53,6 +65,10 @@ pub fn scan_installed_apps() -> Vec<DiscoveredApp> {
     if out.len() < MAX_ITEMS {
         collect_windows_apps_aliases(&mut seen, &mut out);
     }
+    // CLI entries are search-only and have their own budget. The installed-app
+    // cap must not consume every slot before a late PATH directory is visited.
+    let command_limit = out.len() + MAX_COMMAND_ITEMS;
+    crate::discover_commands::collect_command_apps(&mut seen, &mut out, command_limit);
 
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out

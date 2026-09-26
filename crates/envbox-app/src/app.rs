@@ -11,7 +11,7 @@ use envbox_storage::{
     ConfigStore,
 };
 use iced::{Subscription, Task};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -141,6 +141,7 @@ pub struct AppPickerState {
     pub selected: Option<usize>,
     pub scanned: bool,
     pub loading: bool,
+    pub icon_requests: HashSet<String>,
 }
 
 impl EnvBoxApp {
@@ -619,19 +620,12 @@ impl EnvBoxApp {
             Message::AppPickerQuery(q) => {
                 if let Some(p) = self.app_picker.as_mut() {
                     p.query = q;
-                    // Keep selection when the same row is still visible.
-                    if let Some(sel) = p.selected {
-                        let q = p.query.trim().to_ascii_lowercase();
-                        let still = p.items.get(sel).map(|a| {
-                            q.is_empty()
-                                || a.name.to_ascii_lowercase().contains(&q)
-                                || a.path.to_ascii_lowercase().contains(&q)
-                        });
-                        if !still.unwrap_or(false) {
-                            p.selected = None;
-                        }
-                    }
                 }
+                let first = self.filtered_picker_items().first().map(|(idx, _)| *idx);
+                if let Some(p) = self.app_picker.as_mut() {
+                    p.selected = first;
+                }
+                return self.extract_picker_icons();
             }
             Message::AppPickerLoaded(items) => {
                 let n = items.len();
@@ -639,9 +633,12 @@ impl EnvBoxApp {
                     p.items = items;
                     p.loading = false;
                     p.scanned = true;
-                    p.selected = p.items.first().map(|_| 0);
                 }
-                self.set_status(StatusKind::Info, format!("已发现 {n} 个本机应用"));
+                let first = self.filtered_picker_items().first().map(|(idx, _)| *idx);
+                if let Some(p) = self.app_picker.as_mut() {
+                    p.selected = first;
+                }
+                self.set_status(StatusKind::Info, format!("已发现 {n} 个本机入口"));
                 return self.extract_picker_icons();
             }
             Message::AppPickerIcons(pairs) => {

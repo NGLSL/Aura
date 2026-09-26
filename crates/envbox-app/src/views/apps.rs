@@ -260,8 +260,10 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
         .map(|png| {
             container(
                 iced::widget::image(iced::widget::image::Handle::from_path(png.clone()))
-                    .width(Length::Fixed(36.0))
-                    .height(Length::Fixed(36.0)),
+                    .width(Length::Fixed(38.0))
+                    .height(Length::Fixed(38.0))
+                    .content_fit(iced::ContentFit::Contain)
+                    .filter_method(iced::widget::image::FilterMethod::Linear),
             )
             .width(Length::Fixed(40.0))
             .height(Length::Fixed(40.0))

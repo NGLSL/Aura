@@ -85,8 +85,7 @@ impl ProcessTracker {
         }
         match (&self.package, package_family) {
             (Some(ident), Some(fam)) => {
-                ident.package_family_name.eq_ignore_ascii_case(fam)
-                    && created_in_activation_window
+                ident.package_family_name.eq_ignore_ascii_case(fam) && created_in_activation_window
             }
             _ => false,
         }
@@ -137,9 +136,6 @@ mod tests {
     #[test]
     fn track_mode_matches_activation() {
         assert_eq!(ProcessTracker::win32().mode, TrackMode::Job);
-        assert_eq!(
-            ProcessTracker::packaged(pkg()).mode,
-            TrackMode::PackagePid
-        );
+        assert_eq!(ProcessTracker::packaged(pkg()).mode, TrackMode::PackagePid);
     }
 }

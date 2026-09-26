@@ -258,7 +258,10 @@ pub fn short_id(id: uuid::Uuid) -> String {
 /// Brand or monogram icon badge for applications, matching Figure 2.
 pub fn app_icon_badge(name: &str, size: f32) -> Element<'static, Message> {
     let lower = name.trim().to_lowercase();
-    let inner_size = size * 0.58;
+    // Keep the brand mark visually comparable to extracted icons. The SVG
+    // viewboxes already include a little breathing room, so 58% made the
+    // glyph look noticeably undersized inside a 40px tile.
+    let inner_size = size * 0.68;
 
     if lower.contains("claude") {
         container(icon(

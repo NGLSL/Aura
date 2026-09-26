@@ -20,6 +20,7 @@ impl EnvBoxApp {
             p.scanned = false;
             p.items.clear();
             p.selected = None;
+            p.icon_requests.clear();
         }
         Task::perform(
             async move {
@@ -43,12 +44,21 @@ impl EnvBoxApp {
         if p.items.is_empty() {
             return Task::none();
         }
-        let pending: Vec<(String, String, String)> = p
-            .items
-            .iter()
+        let limit = if p.query.trim().is_empty() { 200 } else { 12 };
+        let candidates: Vec<(String, String)> = self
+            .filtered_picker_items()
+            .into_iter()
+            .map(|(_, a)| a)
             .filter(|a| a.icon_png.is_none())
-            .take(200)
-            .map(|a| (a.icon_key(), a.icon_src.clone(), a.path.clone()))
+            .take(limit)
+            .map(|a| (a.icon_key(), a.icon_src.clone()))
+            .collect();
+        let Some(p) = self.app_picker.as_mut() else {
+            return Task::none();
+        };
+        let pending: Vec<_> = candidates
+            .into_iter()
+            .filter(|(key, _)| p.icon_requests.insert(key.clone()))
             .collect();
         if pending.is_empty() {
             return Task::none();
@@ -70,7 +80,7 @@ impl EnvBoxApp {
                             let icon_dir = icon_dir.clone();
                             let results = Arc::clone(&results);
                             s.spawn(move || {
-                                for (key, src, _path) in &part {
+                                for (key, src) in &part {
                                     let png =
                                         crate::app_icon::cache_app_icon(&icon_dir, key, src);
                                     if let Ok(mut g) = results.lock() {
@@ -134,17 +144,26 @@ impl EnvBoxApp {
             return Vec::new();
         };
         let q = p.query.trim().to_ascii_lowercase();
-        p.items
+        let mut matches: Vec<_> = p.items
             .iter()
             .enumerate()
-            .filter(|(_, a)| {
-                q.is_empty()
-                    || a.name.to_ascii_lowercase().contains(&q)
-                    || a.path.to_ascii_lowercase().contains(&q)
-                    || a.args.to_ascii_lowercase().contains(&q)
-                    || a.source.to_ascii_lowercase().contains(&q)
-            })
-            .collect()
+            .filter(|(_, a)| a.matches_picker_query(&q))
+            .collect();
+        if !q.is_empty() {
+            matches.sort_by_key(|(_, a)| {
+                let name = a.name.to_ascii_lowercase();
+                if name == q {
+                    0
+                } else if name.starts_with(&q) {
+                    1
+                } else if name.contains(&q) {
+                    2
+                } else {
+                    3
+                }
+            });
+        }
+        matches
     }
 
     /// Fill `app_draft` from the selected discovered entry.
@@ -167,7 +186,10 @@ impl EnvBoxApp {
         self.app_draft = AppDraft {
             id: None,
             name: item.name.clone(),
-            kind: if matches!(
+            kind: if item.source == "commands" {
+                // .cmd/.bat wrappers need the Command resolver's ComSpec path.
+                LaunchKind::Command
+            } else if matches!(
                 cap.packaging,
                 crate::package::Packaging::PackagedWin32
                     | crate::package::Packaging::AppContainer

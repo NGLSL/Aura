@@ -40,7 +40,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             .size(18)
             .color(INK)
             .font(font::name_font()),
-        text("从本机已安装应用中选择。商店 / AppContainer 目标可能无法注入 Runtime。")
+        text("从本机应用或命令行工具中选择。商店 / AppContainer 目标可能无法注入 Runtime。")
             .size(12)
             .color(MUTED)
             .font(font::ui_font()),
@@ -59,7 +59,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let search = container(
         row![
             icon(Icon::Search, MUTED, 13.0),
-            text_input("搜索应用名称或路径…", &state.query)
+            text_input("搜索应用、命令或路径…", &state.query)
                 .on_input(Message::AppPickerQuery)
                 .padding(Padding::from([8, 10]))
                 .style(input_style)
@@ -75,16 +75,16 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let filtered = app.filtered_picker_items();
     let count_text = if state.loading {
-        "正在扫描本机应用…".to_string()
+        "正在扫描本机应用和命令…".to_string()
     } else {
-        format!("{} 个应用", filtered.len())
+        format!("{} 个结果", filtered.len())
     };
 
     let list: Element<_> = if state.loading && state.items.is_empty() {
         container(
             column![
                 icon(Icon::Apps, MUTED, 22.0),
-                text("正在读取开始菜单 / 桌面…")
+                text("正在读取开始菜单 / 桌面 / 命令目录…")
                     .size(13)
                     .color(INK_2)
                     .font(font::name_font()),
@@ -297,6 +297,7 @@ fn source_label(source: &'static str) -> &'static str {
         "start-menu" => "开始菜单",
         "desktop" => "桌面",
         "apps-folder" => "商店",
+        "commands" => "命令行",
         other => other,
     }
 }

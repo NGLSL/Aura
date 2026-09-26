@@ -9,6 +9,7 @@ mod app_icon;
 mod close_behavior;
 mod combo_overlay;
 mod discover;
+mod discover_commands;
 mod font;
 mod icons;
 mod message;

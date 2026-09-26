@@ -89,7 +89,10 @@ pub fn win32_capabilities() -> TargetCapabilities {
 /// Derive capabilities after activation (packaged root / child attach).
 ///
 /// `can_suspend` is false for already-running packaged roots (PostActivation).
-pub fn capabilities_after_probe(probe: &ProcessProbe, injection_supported: bool) -> TargetCapabilities {
+pub fn capabilities_after_probe(
+    probe: &ProcessProbe,
+    injection_supported: bool,
+) -> TargetCapabilities {
     TargetCapabilities {
         can_suspend: false,
         can_inject_runtime: injection_supported && probe.can_open_process,
@@ -173,14 +176,14 @@ mod win {
     use windows::Win32::Security::{
         GetTokenInformation, TokenIntegrityLevel, TokenIsAppContainer, TOKEN_QUERY,
     };
+    use windows::Win32::System::SystemServices::{
+        PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY, PROCESS_MITIGATION_DYNAMIC_CODE_POLICY,
+        PROCESS_MITIGATION_IMAGE_LOAD_POLICY,
+    };
     use windows::Win32::System::Threading::{
         GetProcessMitigationPolicy, OpenProcess, OpenProcessToken, ProcessDynamicCodePolicy,
         ProcessImageLoadPolicy, ProcessSignaturePolicy, PROCESS_QUERY_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    use windows::Win32::System::SystemServices::{
-        PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY, PROCESS_MITIGATION_DYNAMIC_CODE_POLICY,
-        PROCESS_MITIGATION_IMAGE_LOAD_POLICY,
     };
 
     struct OwnedHandle(HANDLE);

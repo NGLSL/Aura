@@ -21,7 +21,10 @@ pub struct ResolvedCommand {
 /// PATH resolution order: absolute/relative path, then PATH `.exe`/`.com`/`.cmd`/`.bat`.
 /// `.cmd`/`.bat` are wrapped with `%ComSpec% /d /s /c`.
 /// Extension-less candidates must be PE images (npm shims are not; prefer `.cmd`).
-pub fn resolve_command(command: &str, path_env: Option<&str>) -> Result<ResolvedCommand, CommandError> {
+pub fn resolve_command(
+    command: &str,
+    path_env: Option<&str>,
+) -> Result<ResolvedCommand, CommandError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err(CommandError::CommandNotFound(command.to_string()));
@@ -122,7 +125,11 @@ mod tests {
         let resolved = resolve_command("agent-shim", Some(&path)).unwrap();
         assert!(resolved.via_comspec, "must wrap .cmd via ComSpec");
         assert!(
-            resolved.program.extension().map(|e| e == "cmd").unwrap_or(false),
+            resolved
+                .program
+                .extension()
+                .map(|e| e == "cmd")
+                .unwrap_or(false),
             "got {:?}",
             resolved.program
         );
