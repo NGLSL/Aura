@@ -7,6 +7,7 @@
 mod app;
 mod app_icon;
 mod combo_overlay;
+mod close_behavior;
 mod discover;
 mod package;
 mod font;
@@ -14,6 +15,8 @@ mod icons;
 mod message;
 mod options;
 mod theme;
+#[cfg(windows)]
+mod tray;
 mod version;
 mod views;
 mod widgets;
@@ -23,6 +26,8 @@ use iced::{Size, Theme};
 fn main() -> iced::Result {
     let ui_font = font::install();
     iced::application("Aura", app::EnvBoxApp::update, app::EnvBoxApp::view)
+        .subscription(app::EnvBoxApp::subscription)
+        .exit_on_close_request(false)
         .theme(|_| Theme::Dark)
         .default_font(ui_font)
         .window(iced::window::Settings {

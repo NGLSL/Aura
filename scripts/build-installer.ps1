@@ -1,5 +1,6 @@
 # Build the complete Aura / EnvBox NSIS installer.
-# This command always rebuilds the Rust workspace and both Runtime DLLs.
+# Run Cargo and CMake for all packaged binaries; their dependency tracking
+# rebuilds only targets whose inputs changed.
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
@@ -47,8 +48,7 @@ function Build-Runtime {
     Write-Host "== runtime $Arch cmake (Detours: $detours) =="
     & $cmake -S (Join-Path $root "runtime") -B $buildDir -G "Visual Studio 17 2022" -A $CMakeArch "-DDETOURS_ROOT=$detours"
     if ($LASTEXITCODE -ne 0) { throw "cmake configure failed for $Arch ($LASTEXITCODE)" }
-    # Packaging requires a freshly compiled and linked Runtime DLL on every run.
-    & $cmake --build $buildDir --config Release --target "envbox-$DllName" --clean-first
+    & $cmake --build $buildDir --config Release --target "envbox-$DllName"
     if ($LASTEXITCODE -ne 0) { throw "cmake build failed for $Arch ($LASTEXITCODE)" }
 
     $dll = Join-Path $buildDir "Release\envbox-$DllName.dll"
@@ -65,10 +65,6 @@ if (Test-Path -LiteralPath $setup -PathType Leaf) {
 }
 
 $manifest = Join-Path $root "Cargo.toml"
-Write-Host "== cargo clean --workspace --release =="
-& cargo clean --workspace --release --manifest-path $manifest
-if ($LASTEXITCODE -ne 0) { throw "cargo release clean failed ($LASTEXITCODE)" }
-
 Write-Host "== cargo build --workspace --release =="
 & cargo build --workspace --release --manifest-path $manifest
 if ($LASTEXITCODE -ne 0) { throw "cargo release build failed ($LASTEXITCODE)" }

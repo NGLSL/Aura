@@ -157,6 +157,26 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         storage_content.into(),
     );
 
+    let window_card = section_card(
+        Icon::Settings,
+        "窗口关闭行为",
+        "点击关闭按钮或按 Alt+F4 时的操作",
+        column![
+            info_row_with_action(
+                "当前选择",
+                app.close_behavior.label().into(),
+                "下次重新选择",
+                Message::WindowClosePreferenceReset,
+            ),
+            text("缩到系统托盘后，可点击托盘图标恢复，或右键选择退出。")
+                .size(11)
+                .color(MUTED)
+                .font(font::ui_font()),
+        ]
+        .spacing(8)
+        .into(),
+    );
+
     let invariants_content = column![
         row![
             container(badge("进程级隔离", ACCENT_BG, ACCENT_TEXT)).width(Length::Fixed(86.0)),
@@ -242,6 +262,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         header,
         engine_card,
         storage_card,
+        window_card,
         invariants_card,
         probe_card,
     ]
@@ -258,4 +279,3 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     .style(theme::dark_scrollable)
     .into()
 }
-

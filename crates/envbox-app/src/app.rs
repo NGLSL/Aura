@@ -10,15 +10,18 @@ use envbox_storage::{
     enumerate_dynamic_timezone_ids, validate_application, validate_profile, windows_id_to_iana,
     ConfigStore,
 };
-use iced::Task;
+use iced::{Subscription, Task};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::close_behavior::{self, CloseBehavior};
 use crate::message::{
     BottomTab, ComboField, DetailTab, DnsChoice, LaunchKind, Message, Nav, StatusKind, WebRtcChoice,
 };
 use crate::options;
+#[cfg(windows)]
+use crate::tray::{TrayAction, TrayState};
 
 pub struct AppDraft {
     pub id: Option<Uuid>,
@@ -96,6 +99,12 @@ pub struct EnvBoxApp {
     pub app_picker: Option<AppPickerState>,
     /// Cached icon PNGs for configured applications (uuid → png).
     pub app_icons: HashMap<Uuid, PathBuf>,
+    pub close_behavior: CloseBehavior,
+    pub close_dialog: bool,
+    pub remember_close_choice: bool,
+    pub close_error: Option<String>,
+    #[cfg(windows)]
+    tray: Option<TrayState>,
 }
 
 /// Local installed-app picker state.
@@ -139,6 +148,7 @@ impl EnvBoxApp {
             webrtc: WebRtcChoice::Host,
             env: String::new(),
         };
+        let close_behavior = close_behavior::load(store.root());
         let mut app = Self {
             store,
             nav: Nav::Apps,
@@ -159,6 +169,12 @@ impl EnvBoxApp {
             status_kind: StatusKind::Info,
             app_picker: None,
             app_icons: HashMap::new(),
+            close_behavior,
+            close_dialog: false,
+            remember_close_choice: false,
+            close_error: None,
+            #[cfg(windows)]
+            tray: None,
         };
         app.load_audit();
         let icons_task = app.refresh_app_icons();
@@ -610,6 +626,83 @@ impl EnvBoxApp {
         crate::views::view(self)
     }
 
+    pub fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
+            iced::window::close_requests().map(Message::WindowCloseRequested),
+            if self.tray.is_some() {
+                iced::time::every(std::time::Duration::from_millis(200))
+                    .map(|_| Message::WindowTrayPoll)
+            } else {
+                Subscription::none()
+            },
+        ])
+    }
+
+    fn request_close(&mut self) -> Task<Message> {
+        if self.close_dialog || self.tray.is_some() {
+            return Task::none();
+        }
+        match self.close_behavior {
+            CloseBehavior::Ask => {
+                self.close_dialog = true;
+                self.remember_close_choice = false;
+                self.close_error = None;
+                Task::none()
+            }
+            CloseBehavior::Tray => self.hide_to_tray(),
+            CloseBehavior::Exit => iced::exit(),
+        }
+    }
+
+    fn save_close_choice(&mut self, choice: CloseBehavior) -> bool {
+        if !self.close_dialog || !self.remember_close_choice {
+            return true;
+        }
+        match close_behavior::save(self.store.root(), choice) {
+            Ok(()) => {
+                self.close_behavior = choice;
+                true
+            }
+            Err(err) => {
+                self.close_error = Some(format!("记住选择失败：{err}"));
+                false
+            }
+        }
+    }
+
+    fn hide_to_tray(&mut self) -> Task<Message> {
+        #[cfg(windows)]
+        {
+            if self.tray.is_some() {
+                return Task::none();
+            }
+            let tray = match TrayState::new() {
+                Ok(tray) => tray,
+                Err(err) => {
+                    self.close_dialog = true;
+                    self.close_error = Some(format!("无法最小化到系统托盘：{err}"));
+                    return Task::none();
+                }
+            };
+            if !self.save_close_choice(CloseBehavior::Tray) {
+                return Task::none();
+            }
+            self.tray = Some(tray);
+            self.close_dialog = false;
+            self.remember_close_choice = false;
+            self.close_error = None;
+            return iced::window::get_latest().then(|id| {
+                id.map(|id| iced::window::change_mode(id, iced::window::Mode::Hidden))
+                    .unwrap_or_else(Task::none)
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            self.close_error = Some("当前平台不支持系统托盘".into());
+            Task::none()
+        }
+    }
+
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
             Message::Nav(n) => self.nav = n,
@@ -892,10 +985,51 @@ impl EnvBoxApp {
                         .unwrap_or_else(Task::none)
                 })
             }
-            Message::WindowClose => {
-                return iced::window::get_latest().then(|id| {
-                    id.map(iced::window::close).unwrap_or_else(Task::none)
-                })
+            Message::WindowClose | Message::WindowCloseRequested(_) => return self.request_close(),
+            Message::WindowRememberChoice(remember) => self.remember_close_choice = remember,
+            Message::WindowCloseCancel => {
+                self.close_dialog = false;
+                self.remember_close_choice = false;
+                self.close_error = None;
+            }
+            Message::WindowCloseToTray => return self.hide_to_tray(),
+            Message::WindowExit => {
+                if !self.close_dialog || self.save_close_choice(CloseBehavior::Exit) {
+                    return iced::exit();
+                }
+            }
+            Message::WindowClosePreferenceReset => {
+                match close_behavior::save(self.store.root(), CloseBehavior::Ask) {
+                    Ok(()) => {
+                        self.close_behavior = CloseBehavior::Ask;
+                        self.remember_close_choice = false;
+                        self.set_status(StatusKind::Success, "下次关闭 Aura 时将重新询问");
+                    }
+                    Err(err) => self.set_status(StatusKind::Error, format!("保存关闭设置失败：{err}")),
+                }
+            }
+            Message::WindowTrayPoll => {
+                #[cfg(windows)]
+                if let Some(tray) = &self.tray {
+                    match tray.poll() {
+                        Some(TrayAction::Restore) => return self.update(Message::WindowRestore),
+                        Some(TrayAction::Exit) => return iced::exit(),
+                        None => {}
+                    }
+                }
+            }
+            Message::WindowRestore => {
+                #[cfg(windows)]
+                {
+                    self.tray = None;
+                    return iced::window::get_latest().then(|id| {
+                        id.map(|id| {
+                            iced::window::change_mode(id, iced::window::Mode::Windowed)
+                                .chain(iced::window::gain_focus(id))
+                        })
+                        .unwrap_or_else(Task::none)
+                    });
+                }
             }
         }
         Task::none()

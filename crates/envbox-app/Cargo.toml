@@ -17,9 +17,12 @@ uuid = { workspace = true }
 iced = { version = "0.13", features = ["tokio", "image", "svg", "advanced"] }
 iced_graphics = "0.13"
 image = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+tray-icon = { version = "0.24.2", default-features = false }
 
 [build-dependencies]
 winres = "0.1"

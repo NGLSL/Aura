@@ -3,6 +3,7 @@
 
 mod apps;
 mod audit;
+mod close_dialog;
 mod detail;
 mod instances;
 mod nav;

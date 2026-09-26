@@ -271,6 +271,14 @@ pub enum Message {
     WindowMinimize,
     WindowToggleMaximize,
     WindowClose,
+    WindowCloseRequested(iced::window::Id),
+    WindowRememberChoice(bool),
+    WindowCloseCancel,
+    WindowCloseToTray,
+    WindowExit,
+    WindowClosePreferenceReset,
+    WindowTrayPoll,
+    WindowRestore,
 }
 
 #[cfg(test)]

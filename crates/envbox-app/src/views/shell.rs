@@ -8,7 +8,7 @@ use crate::icons::{icon, Icon};
 use crate::message::Message;
 use crate::theme::{self, win_button, win_close_button, MUTED, WINDOW};
 
-use super::{apps, audit, detail, instances, nav, picker, profiles, settings};
+use super::{apps, audit, close_dialog, detail, instances, nav, picker, profiles, settings};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::message::Nav;
@@ -30,13 +30,22 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         .padding(1)
         .style(theme::shell_style);
 
-    if app.app_picker.is_some() {
+    let content: Element<'_, Message> = if app.app_picker.is_some() {
         iced::widget::stack![base, picker::view(app)]
             .width(Fill)
             .height(Fill)
             .into()
     } else {
         base.into()
+    };
+
+    if app.close_dialog {
+        iced::widget::stack![content, close_dialog::view(app)]
+            .width(Fill)
+            .height(Fill)
+            .into()
+    } else {
+        content
     }
 }
 
