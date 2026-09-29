@@ -310,7 +310,8 @@ fn run_leaves_host_probe_snapshot_unchanged() {
     assert!(after.status.success());
     let b = String::from_utf8_lossy(&before.stdout);
     let a = String::from_utf8_lossy(&after.stdout);
-    // Host sections must match; Runtime Loaded line is process-local and may differ.
+    // Compare host configuration, excluding wall-clock readings that naturally
+    // advance between the two snapshots.
     for section in ["=== GEO ===", "=== LOCALE ===", "=== LANGUAGE ===", "=== TIMEZONE ===", "=== DNS ===", "=== REGISTRY ==="] {
         let slice = |s: &str| {
             let start = s.find(section).unwrap_or(0);
@@ -319,7 +320,27 @@ fn run_leaves_host_probe_snapshot_unchanged() {
                 .find("=== ")
                 .map(|i| i + 1)
                 .unwrap_or(rest.len());
-            rest[..end].to_string()
+            let mut skip_value = false;
+            rest[..end]
+                .lines()
+                .filter(|line| {
+                    if skip_value {
+                        skip_value = false;
+                        return false;
+                    }
+                    if matches!(
+                        *line,
+                        "GetSystemTime:"
+                            | "GetLocalTime:"
+                            | "SystemTimeToTzSpecificLocalTime_Now:"
+                    ) {
+                        skip_value = true;
+                        return false;
+                    }
+                    true
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         assert_eq!(
             slice(&b),

@@ -226,6 +226,9 @@ impl InstanceManager {
         match close_result {
             Some(Ok(())) | None => {
                 handle.meta.status = InstanceStatus::Exited;
+                if let Some(session) = handle.session.as_mut() {
+                    session.broker.take();
+                }
                 Ok(())
             }
             Some(Err(err)) => {
@@ -242,10 +245,7 @@ impl InstanceManager {
         };
         // Only terminal Failed/Exited freeze. Stopping must resolve via Job
         // (stop failure no longer leaves a permanent Stopping).
-        if matches!(
-            handle.meta.status,
-            InstanceStatus::Exited | InstanceStatus::Failed
-        ) {
+        if handle.meta.status == InstanceStatus::Exited {
             return Ok(handle.meta.status);
         }
         let job = handle.external_job.as_ref().or_else(|| {
@@ -303,6 +303,14 @@ impl InstanceManager {
             handle.meta.status == InstanceStatus::Starting && handle.handoff_deadline.is_some();
         if handle.meta.status != InstanceStatus::Failed && !waiting_for_handoff {
             handle.meta.status = status_from_stats(&stats, handle.meta.status);
+        }
+        if matches!(
+            handle.meta.status,
+            InstanceStatus::Exited | InstanceStatus::Failed
+        ) {
+            if let Some(session) = handle.session.as_mut() {
+                session.broker.take();
+            }
         }
         Ok(handle.meta.status)
     }

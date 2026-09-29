@@ -60,6 +60,8 @@ pub struct ActivationRequest {
     pub require_runtime: bool,
     /// Browser / Network Guard: root-process Chromium switch (Win32 only).
     pub webrtc_policy: Option<envbox_core::WebRtcPolicy>,
+    /// Profile locale for Chromium's process-level Intl and language switches.
+    pub browser_locale: Option<String>,
     /// GUI-selected Cmd/PowerShell roots need their own interactive console.
     /// Direct CLI runs keep the caller's existing console.
     pub create_new_console: bool,
@@ -319,6 +321,7 @@ mod tests {
             runtime_dll: None,
             require_runtime: false,
             webrtc_policy: None,
+            browser_locale: None,
             create_new_console: false,
         }
     }

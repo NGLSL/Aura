@@ -4,7 +4,9 @@
 //
 // Wire protocol (must match the Rust Host/Broker side):
 //
-//   Transport : Named Pipe, byte mode. Default name `\\.\pipe\envbox-runtime`.
+//   Transport : Named Pipe, byte mode. Packaged roots first use
+//               `\\.\pipe\envbox-runtime-pid-<pid>`. A standalone broker
+//               requires an explicit ENVBOX_IPC_PIPE.
 //               Override with ENVBOX_IPC_PIPE: either a bare pipe name
 //               (prefixed automatically) or a full `\\.\pipe\...` path.
 //   Framing   : one message per line, UTF-8, terminated by '\n' (0x0A).

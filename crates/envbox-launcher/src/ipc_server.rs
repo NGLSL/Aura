@@ -18,6 +18,52 @@ pub struct HostBroker {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     pipe_name: String,
+    #[cfg(windows)]
+    _owner: PipeOwner,
+}
+
+#[cfg(windows)]
+struct PipeOwner(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for PipeOwner {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn claim_pipe_name(name: &str) -> std::io::Result<PipeOwner> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    // A mutex reserves the name even while the server replaces a completed
+    // pipe instance. The hash keeps the Windows object name path-independent.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in name.bytes().map(|b| b.to_ascii_lowercase()) {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    let object_name = format!(r"Local\AuraPipe-{hash:016x}");
+    let wide: Vec<u16> = std::ffi::OsStr::new(&object_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = CreateMutexW(None, false, PCWSTR(wide.as_ptr()))?;
+        let already_exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        if already_exists {
+            let _ = CloseHandle(handle);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("pipe {name} is already owned by another Aura session"),
+            ));
+        }
+        Ok(PipeOwner(handle))
+    }
 }
 
 impl HostBroker {
@@ -28,6 +74,8 @@ impl HostBroker {
 
     /// Start on an explicit pipe path (per-session names avoid cross-test races).
     pub fn start_on(table: SharedTable, pipe_name: String) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        let owner = claim_pipe_name(&pipe_name)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let table2 = table.clone();
@@ -43,7 +91,12 @@ impl HostBroker {
             .spawn(move || serve_loop(table2, stop2, name2, Some(ready_tx)))?;
 
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(()) => {}
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                stop.store(true, Ordering::SeqCst);
+                let _ = join.join();
+                return Err(err);
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 stop.store(true, Ordering::SeqCst);
                 nudge_pipe(&pipe_name);
@@ -68,6 +121,8 @@ impl HostBroker {
             stop,
             join: Some(join),
             pipe_name,
+            #[cfg(windows)]
+            _owner: owner,
         })
     }
 
@@ -110,6 +165,11 @@ pub fn session_pipe_name(instance_id: &str) -> String {
     format!(r"\\.\pipe\envbox-runtime-{instance_id}")
 }
 
+/// Packaged roots derive this pipe path from their PID before requesting a Profile.
+pub fn packaged_pipe_name(pid: u32) -> String {
+    format!(r"\\.\pipe\envbox-runtime-pid-{pid}")
+}
+
 fn nudge_pipe(name: &str) {
     #[cfg(windows)]
     {
@@ -146,12 +206,16 @@ fn serve_loop(
     table: SharedTable,
     stop: Arc<AtomicBool>,
     pipe_name: String,
-    mut ready: Option<std::sync::mpsc::SyncSender<()>>,
+    mut ready: Option<std::sync::mpsc::SyncSender<std::io::Result<()>>>,
 ) {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HANDLE};
-    use windows::Win32::Storage::FileSystem::{FlushFileBuffers, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, HANDLE,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        FlushFileBuffers, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+    };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
         PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -173,10 +237,16 @@ fn serve_loop(
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
+        let first_instance = ready.is_some();
+        let open_mode = if first_instance {
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            PIPE_ACCESS_DUPLEX
+        };
         let raw = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
-                PIPE_ACCESS_DUPLEX,
+                open_mode,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 8,
                 8192,
@@ -186,6 +256,13 @@ fn serve_loop(
             )
         };
         if raw.is_invalid() {
+            let error = unsafe { GetLastError() };
+            if first_instance && error == ERROR_ACCESS_DENIED {
+                if let Some(tx) = ready.take() {
+                    let _ = tx.send(Err(std::io::Error::from_raw_os_error(error.0 as i32)));
+                }
+                return;
+            }
             // Preserve the existing retry behavior for a transient bind
             // failure. start_on will stop the loop if the first instance does
             // not become available within its bounded readiness window.
@@ -197,7 +274,7 @@ fn serve_loop(
         }
         let pipe = OwnedHandle(raw);
         if let Some(tx) = ready.take() {
-            let _ = tx.send(());
+            let _ = tx.send(Ok(()));
         }
 
         match unsafe { ConnectNamedPipe(pipe.0, None) } {
@@ -263,10 +340,10 @@ fn serve_loop(
     _table: SharedTable,
     stop: Arc<AtomicBool>,
     _pipe_name: String,
-    ready: Option<std::sync::mpsc::SyncSender<()>>,
+    ready: Option<std::sync::mpsc::SyncSender<std::io::Result<()>>>,
 ) {
     if let Some(tx) = ready {
-        let _ = tx.send(());
+        let _ = tx.send(Ok(()));
     }
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -338,5 +415,21 @@ mod tests {
             let _ = CloseHandle(client);
         }
         broker.stop();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_sessions_cannot_own_the_same_pipe() {
+        use uuid::Uuid;
+
+        let name = session_pipe_name(&Uuid::new_v4().to_string());
+        let table = || Arc::new(Mutex::new(SessionTable::new()));
+        let mut first = HostBroker::start_on(table(), name.clone()).expect("first owner");
+        let second = HostBroker::start_on(table(), name.clone());
+        assert_eq!(second.err().unwrap().kind(), std::io::ErrorKind::AddrInUse);
+        first.stop();
+        drop(first);
+        let mut next = HostBroker::start_on(table(), name).expect("owner released");
+        next.stop();
     }
 }

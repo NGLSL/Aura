@@ -209,6 +209,27 @@ static BOOL(WINAPI* TrueCreateProcessA)(
     LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
     LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION) = CreateProcessA;
 
+static BOOL(WINAPI* TrueCreateProcessAsUserW)(
+    HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
+    BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW,
+    LPPROCESS_INFORMATION) = CreateProcessAsUserW;
+
+// Detours accepts a CreateProcessW-shaped callback. Keep the AsUser token on
+// this thread while Detours synchronously invokes the callback so the target
+// retains Chrome's restricted token and sandbox startup attributes.
+static thread_local HANDLE g_asuser_token = nullptr;
+
+static BOOL WINAPI CreateProcessAsUserAdapter(
+    LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES process_attributes,
+    LPSECURITY_ATTRIBUTES thread_attributes, BOOL inherit_handles, DWORD flags,
+    LPVOID environment, LPCWSTR current_directory, LPSTARTUPINFOW startup,
+    LPPROCESS_INFORMATION process_info) {
+  return TrueCreateProcessAsUserW(
+      g_asuser_token, app, cmd, process_attributes, thread_attributes,
+      inherit_handles, flags, environment, current_directory, startup,
+      process_info);
+}
+
 // CreateProcessW lpEnvironment is ANSI MULTI_SZ unless CREATE_UNICODE_ENVIRONMENT.
 // Returns UTF-16 copy of the block (always Unicode for overlay work).
 static std::vector<wchar_t> EnvToWide(LPVOID lpEnvironment, DWORD creation_flags) {
@@ -414,12 +435,14 @@ static BOOL SpawnInjected(
     LPSECURITY_ATTRIBUTES lpProcessAttributes,
     LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles,
     DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
-    LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
+    LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation,
+    PDETOUR_CREATE_PROCESS_ROUTINEW create_process,
+    const char* audit_api) {
   const char* dll = EnvBoxRuntimeDllPathA();
   if (dll == nullptr) {
     // Startup Fail Policy: never create an unvirtualized child.
     SetLastError(ERROR_MOD_NOT_FOUND);
-    EnvBoxAuditEvent("CreateProcessW", 0, "no-runtime-dll");
+    EnvBoxAuditEvent(audit_api, 0, "no-runtime-dll");
     return FALSE;
   }
 
@@ -461,7 +484,7 @@ static BOOL SpawnInjected(
           lpApplicationName, cmd_ptr, lpProcessAttributes,
           lpThreadAttributes, bInheritHandles, flags, env_ptr,
           lpCurrentDirectory, lpStartupInfo, lpProcessInformation, dll,
-          reinterpret_cast<PDETOUR_CREATE_PROCESS_ROUTINEW>(TrueCreateProcessW))) {
+          create_process)) {
     DWORD err = GetLastError();
     if (lpProcessInformation != nullptr) {
       if (lpProcessInformation->hThread != nullptr) {
@@ -478,9 +501,9 @@ static BOOL SpawnInjected(
     // Ticket 30: surface elevation/integrity vs generic inject failure (audit only).
     if (err == ERROR_ELEVATION_REQUIRED || err == ERROR_ACCESS_DENIED ||
         err == ERROR_PRIVILEGE_NOT_HELD) {
-      EnvBoxAuditEvent("CreateProcessW", 0, "inject-failed-elevation");
+      EnvBoxAuditEvent(audit_api, 0, "inject-failed-elevation");
     } else {
-      EnvBoxAuditEvent("CreateProcessW", 0, "inject-failed");
+      EnvBoxAuditEvent(audit_api, 0, "inject-failed");
     }
     return FALSE;
   }
@@ -503,13 +526,17 @@ static BOOL SpawnInjected(
       lpProcessInformation->hProcess = nullptr;
       lpProcessInformation->hThread = nullptr;
       SetLastError(err);
-      EnvBoxAuditEvent("CreateProcessW", 0, "inject-resume-failed");
+      EnvBoxAuditEvent(audit_api, 0, "inject-resume-failed");
       return FALSE;
     }
   }
-  // Never log command bodies or environment blocks (ticket 21).
-  EnvBoxAuditEvent("CreateProcessW", 1,
-                   caller_requested_suspended ? "inject-suspended" : "inject-resumed");
+  // Never log command bodies or environment blocks (ticket 21). The child PID
+  // lets Audit Mode correlate a successful Detours patch with a live process.
+  char summary[80] = {};
+  _snprintf_s(summary, sizeof(summary), _TRUNCATE, "%s child-pid=%lu",
+              caller_requested_suspended ? "inject-suspended" : "inject-resumed",
+              (unsigned long)lpProcessInformation->dwProcessId);
+  EnvBoxAuditEvent(audit_api, 1, summary);
   return TRUE;
 }
 
@@ -538,7 +565,70 @@ static BOOL WINAPI HookCreateProcessW(
   return SpawnInjected(lpApplicationName, lpCommandLine, lpProcessAttributes,
                        lpThreadAttributes, bInheritHandles, dwCreationFlags,
                        lpEnvironment, lpCurrentDirectory, lpStartupInfo,
-                       lpProcessInformation);
+                       lpProcessInformation, TrueCreateProcessW,
+                       "CreateProcessW");
+}
+
+static bool HasCommandSwitch(const wchar_t* command, const wchar_t* wanted) {
+  if (command == nullptr) return false;
+  size_t length = wcslen(wanted);
+  for (const wchar_t* match = command;
+       (match = wcsstr(match, wanted)) != nullptr; match += length) {
+    if ((match == command || iswspace(match[-1])) &&
+        (match[length] == L'\0' || iswspace(match[length]))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static BOOL WINAPI HookCreateProcessAsUserW(
+    HANDLE token, LPCWSTR app, LPWSTR cmd,
+    LPSECURITY_ATTRIBUTES process_attributes,
+    LPSECURITY_ATTRIBUTES thread_attributes, BOOL inherit_handles, DWORD flags,
+    LPVOID environment, LPCWSTR current_directory, LPSTARTUPINFOW startup,
+    LPPROCESS_INFORMATION process_info) {
+  const RuntimeProfile* profile = EnvBoxProfile();
+  if (profile == nullptr) {
+    SetLastError(ERROR_INVALID_DATA);
+    EnvBoxAuditEvent("CreateProcessAsUserW", 0, "no-profile");
+    return FALSE;
+  }
+  if (!profile->inherit_children) {
+    EnvBoxAuditEvent("CreateProcessAsUserW", 0, "inherit-off-plain");
+    return TrueCreateProcessAsUserW(
+        token, app, cmd, process_attributes, thread_attributes, inherit_handles,
+        flags, environment, current_directory, startup, process_info);
+  }
+
+  // Chromium's sandboxed renderer rejects third-party Runtime DLLs. Detours
+  // can patch its suspended image yet the module is absent after startup;
+  // repeatedly attempting this path causes renderer restart churn. Keep the
+  // browser's own sandbox creation intact and report this partial coverage.
+  BrowserEngineKind engine = ClassifyBrowserEngine(app);
+  if ((engine == kEngineChromium || engine == kEngineEdge) &&
+      HasCommandSwitch(cmd, L"--type=renderer")) {
+    BOOL created = TrueCreateProcessAsUserW(
+        token, app, cmd, process_attributes, thread_attributes, inherit_handles,
+        flags, environment, current_directory, startup, process_info);
+    DWORD error = GetLastError();
+    EnvBoxAuditEvent("CreateProcessAsUserW", 0,
+                     "chromium-sandboxed-renderer-unsupported");
+    SetLastError(error);
+    return created;
+  }
+
+  struct TokenScope {
+    HANDLE previous;
+    explicit TokenScope(HANDLE token) : previous(g_asuser_token) {
+      g_asuser_token = token;
+    }
+    ~TokenScope() { g_asuser_token = previous; }
+  } token_scope(token);
+  return SpawnInjected(
+      app, cmd, process_attributes, thread_attributes, inherit_handles, flags,
+      environment, current_directory, startup, process_info,
+      CreateProcessAsUserAdapter, "CreateProcessAsUserW");
 }
 
 static BOOL WINAPI HookCreateProcessA(
@@ -591,5 +681,6 @@ int EnvBoxInstallProcessHooks() {
   int ok = 0;
   ok += EnvBoxAttach(&TrueCreateProcessW, HookCreateProcessW);
   ok += EnvBoxAttach(&TrueCreateProcessA, HookCreateProcessA);
+  ok += EnvBoxAttach(&TrueCreateProcessAsUserW, HookCreateProcessAsUserW);
   return ok;
 }

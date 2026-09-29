@@ -19,12 +19,14 @@ constexpr int kMaxKv = 96;
 
 // ---------------------------------------------------------------------------
 // Pipe name resolution: ENVBOX_IPC_PIPE (bare name or \\.\pipe\... path).
-// Default: \\.\pipe\envbox-runtime.
+// Packaged root default: a PID-scoped pipe; Win32/children use the explicit
+// ENVBOX_IPC_PIPE inherited from their launcher or parent.
 // ---------------------------------------------------------------------------
 void GetPipePath(wchar_t* out, size_t cap) {
   DWORD n = GetEnvironmentVariableW(L"ENVBOX_IPC_PIPE", out, (DWORD)cap);
   if (n == 0 || n >= cap) {
-    wcsncpy_s(out, cap, L"\\\\.\\pipe\\envbox-runtime", _TRUNCATE);
+    _snwprintf_s(out, cap, _TRUNCATE, L"\\\\.\\pipe\\envbox-runtime-pid-%lu",
+                 static_cast<unsigned long>(GetCurrentProcessId()));
     return;
   }
   // Bare name -> full pipe path.
@@ -168,9 +170,7 @@ int ReadLine(PipeReader* r, char* out, size_t cap, ULONGLONG deadline) {
 // Connect: retry until deadline (covers PostActivation early-start race).
 // Opens with FILE_FLAG_OVERLAPPED so reads can time out.
 // ---------------------------------------------------------------------------
-HANDLE ConnectPipe(DWORD timeout_ms) {
-  wchar_t path[256];
-  GetPipePath(path, 256);
+HANDLE ConnectPipePath(const wchar_t* path, DWORD timeout_ms) {
   ULONGLONG deadline = GetTickCount64() + timeout_ms;
   for (;;) {
     // Wait briefly for an instance; ignore failure and still try CreateFileW.
@@ -213,6 +213,12 @@ HANDLE ConnectPipe(DWORD timeout_ms) {
   }
   OutputDebugStringA("EnvBox IPC: connect deadline reached\n");
   return INVALID_HANDLE_VALUE;
+}
+
+HANDLE ConnectPipe(DWORD timeout_ms) {
+  wchar_t path[256];
+  GetPipePath(path, 256);
+  return ConnectPipePath(path, timeout_ms);
 }
 
 void ClosePipe(HANDLE h) {
@@ -515,7 +521,10 @@ int EnvBoxIpcFetchProfile(RuntimeProfile* out) {
   // Packaged roots need a retry window because they have no Environment
   // Block. Descendants already carry a complete ENVBOX_* fallback and only
   // make a short broker attempt so they remain responsive after Aura exits.
-  HANDLE h = ConnectPipe(profile_hint[0] != L'\0' ? 100 : kConnectTimeoutMs);
+  wchar_t pipe_path[256];
+  GetPipePath(pipe_path, 256);
+  HANDLE h = ConnectPipePath(pipe_path,
+                             profile_hint[0] != L'\0' ? 100 : kConnectTimeoutMs);
   if (h == INVALID_HANDLE_VALUE) {
     return 0;
   }
@@ -579,6 +588,7 @@ int EnvBoxIpcFetchProfile(RuntimeProfile* out) {
         ClosePipe(h);
         return 0;
       }
+      SetEnvironmentVariableW(L"ENVBOX_IPC_PIPE", pipe_path);
       got = 1;
       break;
     }

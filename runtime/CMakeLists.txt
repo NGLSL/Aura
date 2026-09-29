@@ -46,7 +46,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
 target_compile_features(${ENVBOX_RT_TARGET} PRIVATE cxx_std_17)
 target_compile_definitions(${ENVBOX_RT_TARGET} PRIVATE ENVBOX_RUNTIME=1 ENVBOX_ARCH=${ENVBOX_RT_ARCH})
 set_target_properties(${ENVBOX_RT_TARGET} PROPERTIES OUTPUT_NAME "${ENVBOX_RT_NAME}")
-target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE iphlpapi ws2_32 runtimeobject)
+target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE advapi32 iphlpapi ws2_32 runtimeobject)
 
 if(ENVBOX_WITH_DETOURS)
   if(NOT DETOURS_ROOT)

@@ -226,6 +226,18 @@ fn app_overview<'a>(
             content = content.push(compatibility_notice(capability));
         }
     }
+    if selected_app.is_some_and(crate::package::chromium_renderer_sandbox_limited) {
+        content = content.push(
+            container(
+                text("Chrome / Edge 新建浏览器进程时会按配置设置网页语言；复用已运行的浏览器需重启。网页沙箱中的原生系统信息仍可能显示本机值。")
+                    .size(12)
+                    .color(ACCENT_TEXT)
+                    .font(font::ui_font()),
+            )
+            .padding(Padding::from([10, 12]))
+            .style(inner_card_style),
+        );
+    }
     container(content).width(Fill).into()
 }
 

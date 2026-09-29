@@ -303,6 +303,9 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
     if let Some(status_badge) = capability_badge(capability) {
         top_left = top_left.push(status_badge);
     }
+    if crate::package::chromium_renderer_sandbox_limited(a) {
+        top_left = top_left.push(badge("网页沙箱：部分环境受限", ACCENT_BG, ACCENT_TEXT));
+    }
 
     let left_info = column![top_left, meta_cmd].spacing(6).width(Length::Fill);
 

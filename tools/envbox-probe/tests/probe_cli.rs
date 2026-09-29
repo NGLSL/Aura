@@ -61,6 +61,27 @@ fn spawn_child_prints_parent_and_child_blocks() {
     );
 }
 
+#[test]
+fn spawn_as_user_child_reports_child_or_privilege_skip() {
+    let output = probe_exe()
+        .arg("--spawn-as-user-child")
+        .output()
+        .expect("run probe --spawn-as-user-child");
+    assert!(output.status.success(), "as-user probe failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("=== PARENT PROBE ==="), "{stdout}");
+    assert!(stdout.contains("=== CREATEPROCESSASUSERW ==="), "{stdout}");
+    if stdout.contains("Status: succeeded") {
+        assert!(stdout.contains("=== CHILD PROBE ==="), "{stdout}");
+        assert!(stdout.contains("GetUserDefaultLocaleName:"), "{stdout}");
+    } else {
+        assert!(
+            stdout.contains("Status: skipped (") && stdout.contains("Windows privilege error"),
+            "unexpected as-user result: {stdout}"
+        );
+    }
+}
+
 /// Ticket 26: --resolve prints a stable RESOLVE section (getaddrinfo seam).
 #[test]
 fn resolve_flag_prints_getaddrinfo_section() {

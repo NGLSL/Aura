@@ -221,37 +221,27 @@ fn start_session_with_options(
 
     let host_env: HashMap<String, String> = std::env::vars().collect();
     let is_packaged = matches!(req.launch, LaunchTarget::Packaged { .. });
-    // Packaged roots have no Environment Block → must use the well-known
-    // default pipe (C++ cannot learn a per-session name). Win32 may use a
-    // per-session pipe via ENVBOX_IPC_PIPE.
-    let pipe_path = if is_packaged {
-        crate::ipc::DEFAULT_PIPE_NAME.to_string()
-    } else {
-        crate::ipc_server::session_pipe_name(&instance_id.to_string())
-    };
+    // Win32 receives a per-session pipe through its Environment Block.
+    // Packaged roots derive a pipe from their PID after activation.
+    let pipe_path =
+        (!is_packaged).then(|| crate::ipc_server::session_pipe_name(&instance_id.to_string()));
 
-    // Start HostBroker BEFORE activation/attach: DllMain loads Profile during
-    // LoadLibrary, so the pipe must already accept HELLO/GET_PROFILE.
+    // Win32 starts the broker before its suspended process is created.
     let mut table = SessionTable::new();
     if let Some(profile) = &req.profile {
         table.set_instance_id(&instance_id.to_string());
         table.register_profile_flags(profile, req.inherit_children, req.audit);
     }
     let shared: crate::ipc_server::SharedTable = std::sync::Arc::new(std::sync::Mutex::new(table));
-    let broker = if host_mode {
+    let mut broker = if host_mode || is_packaged {
         None
     } else {
-        match crate::ipc_server::HostBroker::start_on(shared.clone(), pipe_path.clone()) {
+        match crate::ipc_server::HostBroker::start_on(
+            shared.clone(),
+            pipe_path.clone().expect("Win32 pipe path"),
+        ) {
             Ok(b) => Some(b),
-            Err(err) => {
-                // Packaged cannot fall back to ENVBOX_*; Win32 still can.
-                if is_packaged {
-                    return Err(SessionError::Unsupported(format!(
-                        "IPC Broker bind failed for packaged root ({err})"
-                    )));
-                }
-                None // Fail open for Win32: ENVBOX_* value fallback still works.
-            }
+            Err(_) => None, // Win32 keeps its ENVBOX_* fallback.
         }
     };
 
@@ -267,7 +257,9 @@ fn start_session_with_options(
             req.audit,
         );
         // Point Runtime IPC Bootstrap at this session's Host pipe (Win32 only).
-        env.insert("ENVBOX_IPC_PIPE".into(), pipe_path.clone());
+        if let Some(pipe_path) = &pipe_path {
+            env.insert("ENVBOX_IPC_PIPE".into(), pipe_path.clone());
+        }
         env
     };
 
@@ -335,6 +327,7 @@ fn start_session_with_options(
         runtime_dll: runtime_dll.clone(),
         require_runtime: !host_mode,
         webrtc_policy: req.profile.as_ref().map(|p| p.browser.webrtc),
+        browser_locale: req.profile.as_ref().map(|p| p.locale.locale_name.clone()),
         create_new_console,
     };
 
@@ -349,6 +342,19 @@ fn start_session_with_options(
                 .clone()
                 .unwrap_or_else(|| "runtime injection unsupported".into()),
         ));
+    }
+
+    // No custom Environment Block reaches an AUMID target. The Runtime can
+    // compute this PID-scoped path itself, avoiding another session's pipe.
+    if !host_mode && is_packaged {
+        let path = crate::ipc_server::packaged_pipe_name(activated.pid);
+        broker = Some(
+            crate::ipc_server::HostBroker::start_on(shared.clone(), path).map_err(|err| {
+                SessionError::Unsupported(format!(
+                    "IPC Broker bind failed for packaged root ({err})"
+                ))
+            })?,
+        );
     }
 
     session.register_root(activated.pid);

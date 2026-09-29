@@ -482,6 +482,53 @@ pub struct ActivationSpawn {
     pub thread: Option<win::SafeHandle>,
 }
 
+/// Chrome and Edge can choose their persisted UI language over the OS locale.
+/// Supply the Profile locale before user URLs and replace conflicting switches.
+fn ensure_chromium_locale_argv(args: &mut Vec<String>, locale: &str) {
+    fn remove_switch(args: &mut Vec<String>, name: &str) {
+        let mut i = 0;
+        while i < args.len() {
+            if args[i].eq_ignore_ascii_case(name) {
+                args.remove(i);
+                if i < args.len() && !args[i].starts_with('-') {
+                    args.remove(i);
+                }
+            } else if args[i]
+                .split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case(name))
+            {
+                args.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    remove_switch(args, "--lang");
+    remove_switch(args, "--accept-lang");
+    let language = locale.split(['-', '_']).next().unwrap_or(locale);
+    let accept_languages = if language.eq_ignore_ascii_case(locale) {
+        locale.to_string()
+    } else {
+        format!("{locale},{language}")
+    };
+    args.insert(0, format!("--accept-lang={accept_languages}"));
+    args.insert(0, format!("--lang={locale}"));
+}
+
+fn ensure_browser_locale_argv(
+    engine: envbox_core::BrowserEngine,
+    args: &mut Vec<String>,
+    locale: &str,
+) {
+    if matches!(
+        engine,
+        envbox_core::BrowserEngine::Chromium | envbox_core::BrowserEngine::Edge
+    ) {
+        ensure_chromium_locale_argv(args, locale);
+    }
+}
+
 /// Spawn a Win32/Command target for the activation seam.
 ///
 /// Profile mode: DetourCreateProcessWithDllExW (CREATE_SUSPENDED) when
@@ -496,8 +543,11 @@ pub fn spawn_for_activation(
         .map_err(|e| crate::activation::ActivateError::Resolve(e.to_string()))?;
 
     // Browser Policy on the activation seam (Win32 root).
+    let engine = envbox_core::BrowserEngine::from_image(&program.display().to_string());
+    if let Some(locale) = &req.browser_locale {
+        ensure_browser_locale_argv(engine, &mut args, locale);
+    }
     if let Some(policy) = req.webrtc_policy {
-        let engine = envbox_core::BrowserEngine::from_image(&program.display().to_string());
         if matches!(
             engine,
             envbox_core::BrowserEngine::Chromium
@@ -910,6 +960,39 @@ fn validate_cmd_value(value: &str) -> Result<(), LaunchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chromium_locale_replaces_persisted_language_switches() {
+        let mut args = vec![
+            "--lang=zh-CN".into(),
+            "--accept-lang".into(),
+            "zh-CN,zh".into(),
+            "https://example.test/".into(),
+        ];
+        ensure_chromium_locale_argv(&mut args, "en-US");
+        assert_eq!(
+            args,
+            [
+                "--lang=en-US",
+                "--accept-lang=en-US,en",
+                "https://example.test/"
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_gets_browser_locale_switches() {
+        let mut args = vec!["https://example.test/".into()];
+        ensure_browser_locale_argv(envbox_core::BrowserEngine::Edge, &mut args, "en-US");
+        assert_eq!(
+            args,
+            [
+                "--lang=en-US",
+                "--accept-lang=en-US,en",
+                "https://example.test/"
+            ]
+        );
+    }
 
     #[test]
     fn cmd_command_tail_keeps_its_own_quotes() {

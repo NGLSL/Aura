@@ -6,6 +6,8 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 
+mod as_user;
+
 #[repr(C)]
 struct DnsQueryRequest {
     version: u32,
@@ -222,7 +224,22 @@ unsafe extern "system" fn dns_query_ex_reentry_completion(
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let spawn_child = args.iter().any(|a| a == "--spawn-child");
+    let spawn_as_user_child = args.iter().any(|a| a == "--spawn-as-user-child");
     let is_child = args.iter().any(|a| a == "--child");
+
+    if let Some(path) = args.iter().position(|a| a == "--as-user-child-output") {
+        let Some(path) = args.get(path + 1) else {
+            eprintln!("--as-user-child-output requires a path");
+            return ExitCode::FAILURE;
+        };
+        return match std::fs::write(path, child_output()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("as-user child output failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Optional DNS routing probe: `--resolve <name>` prints getaddrinfo results.
     // Optional DnsQuery_A smoke: `--resolve-dnsquery <name>`.
@@ -314,6 +331,22 @@ fn main() -> ExitCode {
     print_parent();
     if spawn_child {
         spawn_child_probe();
+    }
+    if spawn_as_user_child {
+        println!("=== CREATEPROCESSASUSERW ===");
+        match as_user::spawn_child() {
+            Ok(as_user::Outcome::Succeeded(output)) => {
+                println!("Status: succeeded");
+                print!("{output}");
+            }
+            Ok(as_user::Outcome::SkippedPrivilege(stage, error)) => {
+                println!("Status: skipped ({stage}: Windows privilege error {error})");
+            }
+            Err(error) => {
+                eprintln!("CreateProcessAsUserW probe failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     ExitCode::SUCCESS
 }
@@ -1130,10 +1163,17 @@ fn runtime_loaded() -> bool {
 }
 
 fn print_child() {
-    print_runtime_marker();
-    let snapshot = collect_host_snapshot();
-    println!("=== CHILD PROBE ===");
-    print!("{}", snapshot.render());
+    print!("{}", child_output());
+}
+
+fn child_output() -> String {
+    let mut text = String::new();
+    if runtime_loaded() {
+        text.push_str("EnvBox Runtime Loaded\n");
+    }
+    text.push_str("=== CHILD PROBE ===\n");
+    text.push_str(&collect_host_snapshot().render());
+    text
 }
 
 fn spawn_child_probe() {

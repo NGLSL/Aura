@@ -393,6 +393,14 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
                 "envbox: started pid={} instance={} profile={} (Runtime + core hooks active)",
                 handle.instance.root_pid, handle.instance.id, handle.instance.profile_id
             );
+            if matches!(
+                envbox_core::BrowserEngine::from_image(command),
+                envbox_core::BrowserEngine::Chromium | envbox_core::BrowserEngine::Edge
+            ) {
+                eprintln!(
+                    "envbox: Chrome/Edge sandboxed renderers have partial native environment coverage"
+                );
+            }
             match handle.wait_root() {
                 Ok(code) => {
                     if code == 0 {

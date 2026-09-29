@@ -5,6 +5,21 @@
 
 use std::path::{Path, PathBuf};
 
+use envbox_core::{Application, BrowserEngine, LaunchTarget};
+
+/// Chrome and Edge keep sandboxed renderers outside Aura's native Runtime.
+/// Browser-level language settings still apply, but native APIs in those
+/// renderers can expose host values.
+pub fn chromium_renderer_sandbox_limited(app: &Application) -> bool {
+    let LaunchTarget::Executable { path } = &app.launch else {
+        return false;
+    };
+    matches!(
+        BrowserEngine::from_image(&path.to_string_lossy()),
+        BrowserEngine::Chromium | BrowserEngine::Edge
+    )
+}
+
 /// How the target is packaged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Packaging {
