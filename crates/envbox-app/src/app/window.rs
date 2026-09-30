@@ -27,6 +27,13 @@ impl EnvBoxApp {
     }
 
     pub(super) fn request_close(&mut self) -> Task<Message> {
+        if self.update_checking {
+            self.set_status(
+                StatusKind::Info,
+                "更新正在进行，请等待检查或下载完成后再关闭 Aura",
+            );
+            return Task::none();
+        }
         if self.close_dialog || self.tray.is_some() || self.pending_navigation.is_some() {
             return Task::none();
         }

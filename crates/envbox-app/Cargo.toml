@@ -18,7 +18,9 @@ iced = { version = "0.13", features = ["tokio", "image", "svg", "advanced"] }
 iced_graphics = "0.13"
 image = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

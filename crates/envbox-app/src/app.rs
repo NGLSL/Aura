@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 mod picker;
+mod update;
 mod window;
 
 use crate::close_behavior::{self, CloseBehavior};
@@ -121,6 +122,12 @@ pub struct EnvBoxApp {
     pub combo_query: String,
     pub status: String,
     pub status_kind: StatusKind,
+    /// Explicit GitHub update workflow; no request is made at startup.
+    pub update_checking: bool,
+    pub update_status: Option<Result<crate::updater::CheckResult, String>>,
+    pub update_asset: Option<crate::updater::InstallerAsset>,
+    /// A verified installer waiting for the user to finish unsaved edits.
+    pub update_installer_path: Option<PathBuf>,
     /// Local app picker (Kite-style discovery). `None` = closed.
     pub app_picker: Option<AppPickerState>,
     /// Cached icon PNGs for configured applications (uuid → png).
@@ -207,6 +214,10 @@ impl EnvBoxApp {
             combo_query: String::new(),
             status: String::new(),
             status_kind: StatusKind::Info,
+            update_checking: false,
+            update_status: None,
+            update_asset: None,
+            update_installer_path: None,
             app_picker: None,
             app_icons: HashMap::new(),
             close_behavior,
@@ -612,6 +623,10 @@ impl EnvBoxApp {
         match msg {
             Message::Nav(n) => {
                 if n != self.nav {
+                    if self.update_checking {
+                        self.set_status(StatusKind::Info, "更新正在进行，请等待完成后再切换页面");
+                        return Task::none();
+                    }
                     return self.request_navigation(PendingNavigation::Nav(n));
                 }
             }
@@ -853,6 +868,15 @@ impl EnvBoxApp {
                     self.set_status(StatusKind::Error, "未找到 envbox-probe.exe，请先通过 cargo build 构建探针");
                 }
             }
+            Message::CheckUpdate => return self.start_update_check(),
+            Message::UpdateResult(result) => return self.finish_update_check(result),
+            Message::InstallUpdate => return self.start_update_install(),
+            Message::UpdateDownloadResult(result) => {
+                return self.finish_update_download(result)
+            }
+            Message::UpdateInstallResult(result) => return self.finish_update_install(result),
+            Message::OpenReleases => return self.open_releases(),
+            Message::OpenRepository => return self.open_repository(),
             Message::StatusDismiss => self.status.clear(),
             Message::UnsavedCancel => {
                 self.pending_navigation = None;

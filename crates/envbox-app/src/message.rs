@@ -254,6 +254,15 @@ pub enum Message {
     // Settings / diagnostics
     OpenConfigDir,
     RunProbe,
+    /// User-requested GitHub release check.  Network I/O runs off the UI thread.
+    CheckUpdate,
+    UpdateResult(Result<crate::updater::CheckResult, String>),
+    /// Download the verified installer, or launch one that is already ready.
+    InstallUpdate,
+    UpdateDownloadResult(Result<std::path::PathBuf, String>),
+    UpdateInstallResult(Result<(), crate::updater::InstallError>),
+    OpenReleases,
+    OpenRepository,
     StatusDismiss,
     UnsavedSave,
     UnsavedDiscard,

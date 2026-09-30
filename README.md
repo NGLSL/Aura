@@ -53,9 +53,15 @@ Config lives under `%LOCALAPPDATA%\com.aura.envbox\` (or `ENVBOX_CONFIG_ROOT`).
 
 `scripts/build-installer.ps1` builds the Rust workspace, both C++ Runtime DLLs, and the NSIS installer. The version shown in Aura and the version registered by the installer both come from `workspace.package.version` in `Cargo.toml`. When bumping it, update and commit `Cargo.lock` too; an explicit `-Version` value is accepted only when it matches the Cargo version.
 
-For a test build in the private GitHub repository, run **Actions → Build Windows installer → Run workflow**. Download the `aura-windows-installer` artifact from the completed run; it contains `aura-setup.exe` and its SHA-256 checksum.
+For a test build, run **Actions → Build Windows installer → Run workflow**. Download the `aura-windows-installer` artifact from the completed run; it contains `aura-setup.exe` and its SHA-256 checksum.
 
 For a release, update `Cargo.toml` and `Cargo.lock`, add `docs/releases/v<version>.md`, then push `main` and wait for `ci.yml` to pass on that exact commit. Create and push an annotated `v<version>` tag on the same commit. `release.yml` checks the tag, version, `main` commit and CI result, builds the complete Windows installer, and publishes a GitHub Release with the installer and checksum. Both workflows build pinned Microsoft Detours for x64 and x86 on a Windows 2022 runner.
+
+### Updates
+
+Open **Settings → About Aura and updates** to check the latest stable release, open its release page, or visit the [GitHub repository](https://github.com/NGLSL/Aura). Update checks are manual and contact the GitHub API.
+
+When a newer version is available, choose **Download and install**. Aura downloads the official release installer and its SHA-256 checksum, verifies the download, and opens the Windows installer. Windows may ask for administrator approval. Aura exits only after the installer starts successfully; finish the installation wizard and reopen Aura afterwards. Applications already launched through Aura keep running, and your local configuration is retained. If checking, downloading, verification, or installer startup fails, the error stays visible and you can retry or use the release page to install manually.
 
 ## Instance lifecycle
 
@@ -71,3 +77,13 @@ Extra launch latency target: ideal &lt; 100 ms, acceptable &lt; 300 ms. Runtime 
 - DNS View only — no packet redirection
 - Registry Virtual View is whitelist-only — not a registry sandbox
 - No anti-stealth / anti-detection goals
+
+## Community
+
+Thanks to the [LINUX DO](https://linux.do/) community for supporting open-source projects.
+
+## License
+
+Aura / EnvBox is licensed under the [Apache License 2.0](LICENSE).
+
+Microsoft Detours retains its MIT license; see [third-party notices](THIRD_PARTY_NOTICES.txt). Other dependencies retain their respective licenses.

@@ -20,6 +20,7 @@ mod singleton;
 mod theme;
 #[cfg(windows)]
 mod tray;
+pub(crate) mod updater;
 mod version;
 mod views;
 mod widgets;

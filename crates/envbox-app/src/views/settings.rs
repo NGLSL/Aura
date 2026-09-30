@@ -89,6 +89,103 @@ fn info_row_with_action<'a>(
     .into()
 }
 
+fn update_hint(app: &EnvBoxApp) -> String {
+    match &app.update_status {
+        None => "对比 GitHub 最新稳定版本".into(),
+        Some(Err(error)) => format!("检查失败：{error}"),
+        Some(Ok(crate::updater::CheckResult::UpToDate)) => "已是最新版本".into(),
+        Some(Ok(crate::updater::CheckResult::Available {
+            tag,
+            installer: Some(_),
+        })) if app.update_installer_path.is_some() => {
+            format!("发现 {tag}，安装包已完成校验")
+        }
+        Some(Ok(crate::updater::CheckResult::Available {
+            tag,
+            installer: Some(_),
+        })) => format!("发现新版本 {tag}，可下载并安装"),
+        Some(Ok(crate::updater::CheckResult::Available {
+            tag,
+            installer: None,
+        })) => format!("发现新版本 {tag}，请打开发布页手动下载"),
+    }
+}
+
+fn about_card<'a>(app: &'a EnvBoxApp) -> Element<'a, Message> {
+    let update_label = if app.update_checking {
+        "处理中…"
+    } else if app.update_installer_path.is_some() {
+        "安装更新"
+    } else if app.update_asset.is_some() {
+        "下载并安装"
+    } else {
+        "检查"
+    };
+    let update_action = if app.update_checking {
+        None
+    } else if app.update_asset.is_some() {
+        Some(Message::InstallUpdate)
+    } else {
+        Some(Message::CheckUpdate)
+    };
+    let update_button: Element<'a, Message> = button(
+        row![
+            icon(Icon::ExternalLink, INK_2, 11.0),
+            text(update_label).size(11).color(INK_2).font(font::ui_font()),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([5, 10]))
+    .style(secondary_btn)
+    .on_press_maybe(update_action)
+    .into();
+    let update_row: Element<'a, Message> = row![
+        text("检查更新")
+            .size(12)
+            .color(MUTED)
+            .font(font::ui_font())
+            .width(Length::Fixed(130.0)),
+        text(update_hint(app))
+            .size(12)
+            .color(INK_2)
+            .font(font::ui_font())
+            .width(Fill),
+        update_button,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into();
+
+    let content = column![
+        info_row(
+            "Aura",
+            format!("轻量 Windows 进程级环境虚拟化 · v{}", crate::version::PRODUCT_VERSION),
+        ),
+        update_row,
+        info_row_with_action(
+            "最新发布",
+            "在 GitHub 下载官方安装包".into(),
+            "打开发布页",
+            Message::OpenReleases,
+        ),
+        info_row_with_action(
+            "GitHub 仓库",
+            crate::updater::REPOSITORY_URL.into(),
+            "访问仓库",
+            Message::OpenRepository,
+        ),
+    ]
+    .spacing(8);
+
+    section_card(
+        Icon::Info,
+        "关于 Aura 与更新",
+        "版本信息、官方发布与开源仓库",
+        content.into(),
+    )
+}
+
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::version::{product_label, ENGINE_NAME, PRODUCT_NAME, PRODUCT_VERSION};
 
@@ -260,6 +357,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let page_content = column![
         header,
+        about_card(app),
         engine_card,
         storage_card,
         window_card,
