@@ -1,5 +1,7 @@
 //! Left navigation column.
 
+use std::sync::OnceLock;
+
 use iced::widget::{button, column, container, image, row, text};
 use iced::{Alignment, Element, Fill, Length, Padding};
 
@@ -10,14 +12,22 @@ use crate::message::{Message, Nav};
 use crate::theme::{self, BORDER, FAINT, INK, INK_2, MUTED, SUCCESS};
 use crate::widgets::status_dot;
 
+fn logo_handle() -> image::Handle {
+    static LOGO: OnceLock<image::Handle> = OnceLock::new();
+
+    // A stable ID lets Iced reuse the decoded image when hidden windows rebuild.
+    LOGO.get_or_init(|| {
+        image::Handle::from_bytes(include_bytes!("../../../../icons/64x64.png").as_slice())
+    })
+    .clone()
+}
+
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     // Product mark: rounded icon container matching Figure 2
     let mark = container(
-        image(image::Handle::from_bytes(
-            include_bytes!("../../../../icons/64x64.png").as_slice(),
-        ))
-        .width(Length::Fixed(36.0))
-        .height(Length::Fixed(36.0)),
+        image(logo_handle())
+            .width(Length::Fixed(36.0))
+            .height(Length::Fixed(36.0)),
     )
     .width(Length::Fixed(40.0))
     .height(Length::Fixed(40.0))
@@ -100,4 +110,17 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     .height(Fill)
     .style(theme::sidebar_style)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logo_handle;
+
+    #[test]
+    fn navigation_rebuilds_reuse_logo_image_id() {
+        let first = logo_handle();
+        for _ in 0..100 {
+            assert_eq!(logo_handle().id(), first.id());
+        }
+    }
 }

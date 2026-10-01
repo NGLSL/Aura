@@ -238,7 +238,7 @@ unsafe fn hicon_to_png(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) ->
 /// 64×64 canvas. Windows shell icons frequently expose a larger bitmap whose
 /// visible artwork occupies only a small centered region; rendering that
 /// bitmap directly makes the icon look much smaller than neighbouring badges.
-fn normalize_icon(img: &image::RgbaImage) -> image::RgbaImage {
+pub(crate) fn normalize_icon(img: &image::RgbaImage) -> image::RgbaImage {
     use image::imageops::{crop_imm, overlay, resize, FilterType};
 
     const SIDE: u32 = 64;
