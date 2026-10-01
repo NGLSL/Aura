@@ -7,3 +7,4 @@ CMakeUserPresets.json
 
 artifacts/
 .zcode/
+.claude/
