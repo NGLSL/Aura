@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-app"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -973,6 +973,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tiny-skia",
  "toml 0.8.23",
  "tray-icon",
  "uuid",
@@ -982,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-broker"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -992,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-browser-probe"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "envbox-core",
  "serde",
@@ -1002,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-cli"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -1012,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -1023,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-launcher"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "envbox-core",
  "thiserror 2.0.21",
@@ -1033,14 +1034,14 @@ dependencies = [
 
 [[package]]
 name = "envbox-probe"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "windows 0.58.0",
 ]
 
 [[package]]
 name = "envbox-storage"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "envbox-core",
  "serde",
@@ -1052,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-suspended-helper"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "windows 0.58.0",
 ]
@@ -1694,8 +1695,6 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c625d368284fcc43b0b36b176f76eff1abebe7959dd58bd8ce6897d641962a50"
 dependencies = [
  "bytemuck",
  "cosmic-text",

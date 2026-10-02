@@ -106,3 +106,6 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --locked
+
+      - name: Test CPU renderer SVG DPI regressions
+        run: cargo test -p iced_tiny_skia --lib --locked

@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/NGLSL/Aura"
@@ -58,6 +58,10 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 image = "0.24"
+
+# Backport the SVG DPI fix without changing Aura's renderer or Iced API.
+[patch.crates-io]
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
 
 # Keep line information for project debugging without generating full type data.
 # Incremental compilation stays enabled for fast edit/build cycles.

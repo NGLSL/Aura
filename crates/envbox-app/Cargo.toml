@@ -30,3 +30,6 @@ tray-icon = { version = "0.24.2", default-features = false }
 
 [build-dependencies]
 winres = "0.1"
+
+[dev-dependencies]
+tiny-skia = "0.11"

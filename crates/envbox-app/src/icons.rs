@@ -155,3 +155,140 @@ pub fn nav_icon_for(nav: Nav) -> Icon {
         Nav::Settings => Icon::Settings,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::advanced::{layout, mouse, renderer, widget::Tree, Layout};
+    use iced::{Element, Font, Pixels, Point, Rectangle, Size, Theme};
+
+    #[test]
+    #[ignore = "writes UI snapshots; requires isolated ENVBOX_CONFIG_ROOT and AURA_RENDER_SNAPSHOT_DIR"]
+    fn render_display_scale_snapshots() {
+        assert!(std::env::var_os("ENVBOX_CONFIG_ROOT").is_some());
+        let output = std::path::PathBuf::from(
+            std::env::var_os("AURA_RENDER_SNAPSHOT_DIR").expect("snapshot output directory"),
+        );
+        std::fs::create_dir_all(&output).unwrap();
+        let ui_font = crate::font::install();
+        let (mut app, _) = crate::app::EnvBoxApp::new();
+        app.audit_events.clear();
+        let mut renderer = iced::Renderer::new(ui_font, Pixels(16.0));
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for nav in [Nav::Apps, Nav::Audit, Nav::Settings] {
+                use iced::advanced::Renderer as _;
+                app.nav = nav;
+                renderer.clear();
+                let viewport =
+                    iced_graphics::Viewport::with_physical_size(Size::new(2560, 1440), scale);
+                let bounds = Rectangle::with_size(viewport.logical_size());
+                let element = app.view();
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(viewport.logical_size(), viewport.logical_size()),
+                );
+                element.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &Theme::Dark,
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &bounds,
+                );
+                let mut pixels = tiny_skia::Pixmap::new(2560, 1440).unwrap();
+                let mut mask = tiny_skia::Mask::new(2560, 1440).unwrap();
+                renderer.draw(
+                    &mut pixels.as_mut(),
+                    &mut mask,
+                    &viewport,
+                    &[bounds],
+                    crate::theme::WINDOW,
+                    &[] as &[&str],
+                );
+                // The CPU renderer presents BGR to softbuffer; PNG expects RGB.
+                for pixel in pixels.data_mut().chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                pixels
+                    .save_png(output.join(format!("{nav:?}-{}.png", (scale * 100.0) as u32)))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn icons_stay_inside_widget_bounds_across_display_scales() {
+        // Exercise Aura's SVG widget, including its tint and fixed-size layout,
+        // through the production CPU renderer. Reuse it while DPI changes so
+        // the test also reaches the vector raster cache.
+        let mut renderer = iced::Renderer::new(Font::DEFAULT, Pixels(14.0));
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 1.0] {
+            for (name, size) in [
+                (Icon::Apps, 18.0),
+                (Icon::Profiles, 18.0),
+                (Icon::Instances, 18.0),
+                (Icon::Audit, 18.0),
+                (Icon::Settings, 18.0),
+                (Icon::Document, 28.0),
+                (Icon::Play, 11.0),
+            ] {
+                use iced::advanced::Renderer as _;
+                renderer.clear();
+                let element: Element<'_, ()> = icon(name, Color::WHITE, size).into();
+                let mut tree = Tree::new(&element);
+                let node = element
+                    .as_widget()
+                    .layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, Size::new(320.0, 240.0)),
+                    )
+                    .move_to(Point::new(80.0, 100.0));
+                let bounds = node.bounds();
+                let viewport_bounds = Rectangle::with_size(Size::new(320.0, 240.0));
+                element.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &Theme::Dark,
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport_bounds,
+                );
+                let width = (320.0 * scale) as u32;
+                let height = (240.0 * scale) as u32;
+                let mut pixels = tiny_skia::Pixmap::new(width, height).unwrap();
+                let mut mask = tiny_skia::Mask::new(width, height).unwrap();
+                let viewport =
+                    iced_graphics::Viewport::with_physical_size(Size::new(width, height), scale);
+                renderer.draw(
+                    &mut pixels.as_mut(),
+                    &mut mask,
+                    &viewport,
+                    &[viewport_bounds],
+                    Color::TRANSPARENT,
+                    &[] as &[&str],
+                );
+                let expected = bounds * scale as f32;
+                let mut visible = 0;
+                for (i, pixel) in pixels.pixels().iter().enumerate() {
+                    if pixel.alpha() == 0 {
+                        continue;
+                    }
+                    visible += 1;
+                    let x = (i as u32 % width) as f32;
+                    let y = (i as u32 / width) as f32;
+                    assert!(
+                        x >= expected.x.floor() && x < (expected.x + expected.width).ceil()
+                            && y >= expected.y.floor() && y < (expected.y + expected.height).ceil(),
+                        "{name:?} at {scale}x escaped its widget: pixel ({x}, {y}), expected {expected:?}",
+                    );
+                }
+                assert!(visible > 0, "{name:?} at {scale}x was not rendered");
+            }
+        }
+    }
+}
