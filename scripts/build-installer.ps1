@@ -7,6 +7,7 @@ param(
     [string]$Nsis = ""
 )
 $ErrorActionPreference = "Stop"
+$packagingTimer = [System.Diagnostics.Stopwatch]::StartNew()
 $root = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $root "Cargo.toml"
 $metadataJson = & cargo metadata --locked --no-deps --format-version 1 --manifest-path $manifest
@@ -39,36 +40,13 @@ function Find-CMake {
     return $null
 }
 
-function Build-Runtime {
-    param(
-        [string]$Arch,
-        [string]$CMakeArch,
-        [string]$DllName,
-        [string]$BuildDirName
-    )
-
-    $cmake = Find-CMake
-    if (-not $cmake) { throw "cmake not found. Install VS Build Tools CMake or put cmake on PATH." }
-
-    $detours = $env:DETOURS_ROOT
-    if (-not $detours) { $detours = "D:\Tools\Detours" }
-    if (-not (Test-Path -LiteralPath $detours -PathType Container)) {
-        throw "Detours not found at $detours. Set DETOURS_ROOT or build Detours first."
-    }
-
-    $buildDir = Join-Path $root "target\$BuildDirName"
-    Write-Host "== runtime $Arch cmake (Detours: $detours) =="
-    & $cmake -S (Join-Path $root "runtime") -B $buildDir -G "Visual Studio 17 2022" -A $CMakeArch "-DDETOURS_ROOT=$detours"
-    if ($LASTEXITCODE -ne 0) { throw "cmake configure failed for $Arch ($LASTEXITCODE)" }
-    & $cmake --build $buildDir --config Release --target "envbox-$DllName"
-    if ($LASTEXITCODE -ne 0) { throw "cmake build failed for $Arch ($LASTEXITCODE)" }
-
-    $dll = Join-Path $buildDir "Release\envbox-$DllName.dll"
-    if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
-        throw "runtime build succeeded but output is missing: $dll"
-    }
-    New-Item -ItemType Directory -Force $rel | Out-Null
-    Copy-Item -LiteralPath $dll -Destination (Join-Path $rel "envbox-$DllName.dll") -Force
+$cmake = Find-CMake
+if (-not $cmake) { throw "cmake not found. Install VS Build Tools CMake or put cmake on PATH." }
+$cargo = (Get-Command cargo -ErrorAction Stop).Source
+$detours = $env:DETOURS_ROOT
+if (-not $detours) { $detours = "D:\Tools\Detours" }
+if (-not (Test-Path -LiteralPath $detours -PathType Container)) {
+    throw "Detours not found at $detours. Set DETOURS_ROOT or build Detours first."
 }
 
 $setup = Join-Path $artifacts "aura-setup.exe"
@@ -76,12 +54,74 @@ if (Test-Path -LiteralPath $setup -PathType Leaf) {
     Remove-Item -LiteralPath $setup -Force
 }
 
-Write-Host "== cargo build --workspace --release =="
-& cargo build --workspace --release --locked --manifest-path $manifest
-if ($LASTEXITCODE -ne 0) { throw "cargo release build failed ($LASTEXITCODE)" }
+# Independent builds reuse their existing output directories. Stage only after
+# all three succeed, including when another build fails while they are running.
+$buildTask = {
+    param($Name, $Root, $Cargo, $CMake, $Detours, $CMakeArch, $BuildDirName, $DllName)
+    $ErrorActionPreference = "Stop"
+    Set-Location -LiteralPath $Root
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    function Invoke-BuildCommand {
+        param([string]$Command, [string[]]$Arguments, [string]$Stage)
+        # Native stderr is build output, not a PowerShell terminating error.
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = $null
+        & $Command @Arguments 2>&1 | ForEach-Object { "[$Name] $_" }
+        if ($null -eq $LASTEXITCODE) { throw "$Stage could not start: $Command" }
+        if ($LASTEXITCODE -ne 0) { throw "$Stage failed ($LASTEXITCODE)" }
+    }
+    try {
+        if ($Name -eq "cargo") {
+            Invoke-BuildCommand $Cargo @("build", "--workspace", "--release", "--locked", "--manifest-path", (Join-Path $Root "Cargo.toml")) "cargo release build"
+        } else {
+            $buildDir = Join-Path $Root "target\$BuildDirName"
+            Invoke-BuildCommand $CMake @("-S", (Join-Path $Root "runtime"), "-B", $buildDir, "-G", "Visual Studio 17 2022", "-A", $CMakeArch, "-DDETOURS_ROOT=$Detours") "cmake configure for $Name"
+            Invoke-BuildCommand $CMake @("--build", $buildDir, "--config", "Release", "--target", "envbox-$DllName") "cmake build for $Name"
+            $dll = Join-Path $buildDir "Release\envbox-$DllName.dll"
+            if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+                throw "runtime build succeeded but output is missing: $dll"
+            }
+        }
+    } finally {
+        "[$Name] elapsed: $([math]::Round($timer.Elapsed.TotalSeconds, 1)) s"
+    }
+}
 
-Build-Runtime -Arch "x64" -CMakeArch "x64" -DllName "runtime64" -BuildDirName "runtime-build"
-Build-Runtime -Arch "x86" -CMakeArch "Win32" -DllName "runtime32" -BuildDirName "runtime-build32"
+$buildTimer = [System.Diagnostics.Stopwatch]::StartNew()
+$jobs = @()
+try {
+    Write-Host "== parallel release builds: cargo, runtime x64, runtime x86 =="
+    $jobs += Start-Job -Name "cargo" -ScriptBlock $buildTask -ArgumentList "cargo", $root, $cargo, $cmake, $detours
+    $jobs += Start-Job -Name "runtime-x64" -ScriptBlock $buildTask -ArgumentList "runtime-x64", $root, $cargo, $cmake, $detours, "x64", "runtime-build", "runtime64"
+    $jobs += Start-Job -Name "runtime-x86" -ScriptBlock $buildTask -ArgumentList "runtime-x86", $root, $cargo, $cmake, $detours, "Win32", "runtime-build32", "runtime32"
+    do {
+        $running = @($jobs | Where-Object { $_.State -eq "Running" -or $_.State -eq "NotStarted" })
+        if ($running.Count) { Wait-Job -Job $running -Any -Timeout 1 | Out-Null }
+        $jobs | Receive-Job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+    } while ($running.Count)
+    $failed = @($jobs | Where-Object { $_.State -ne "Completed" })
+    if ($failed.Count) {
+        $details = $failed | ForEach-Object { "$($_.Name): $($_.ChildJobs[0].JobStateInfo.Reason.Message)" }
+        throw "release builds failed: $($details -join '; ')"
+    }
+} finally {
+    # Let native tools finish before removing their job hosts, even on failure.
+    if ($jobs.Count) {
+        $jobs | Wait-Job | Out-Null
+        $jobs | Receive-Job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+        $jobs | Remove-Job
+    }
+    Write-Host "Release builds elapsed: $([math]::Round($buildTimer.Elapsed.TotalSeconds, 1)) s"
+}
+
+New-Item -ItemType Directory -Force $rel | Out-Null
+foreach ($runtime in @(
+    @{ BuildDir = "runtime-build"; Dll = "envbox-runtime64.dll" },
+    @{ BuildDir = "runtime-build32"; Dll = "envbox-runtime32.dll" }
+)) {
+    $dll = Join-Path $root "target\$($runtime.BuildDir)\Release\$($runtime.Dll)"
+    Copy-Item -LiteralPath $dll -Destination (Join-Path $rel $runtime.Dll) -Force
+}
 
 # Stage every file expected by the NSIS script from this release build.
 $bins = @(
@@ -121,4 +161,5 @@ if (-not (Test-Path -LiteralPath $setup)) { throw "expected setup missing: $setu
 $size = [math]::Round((Get-Item $setup).Length / 1MB, 1)
 Write-Host ""
 Write-Host "Installer: $setup (${size} MB)  version=$Version"
+Write-Host "Total packaging elapsed: $([math]::Round($packagingTimer.Elapsed.TotalSeconds, 1)) s"
 Write-Host "Silent:    `"$setup`" /S"

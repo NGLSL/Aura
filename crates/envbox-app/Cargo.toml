@@ -14,7 +14,9 @@ envbox-core = { workspace = true }
 envbox-storage = { workspace = true }
 envbox-launcher = { workspace = true }
 uuid = { workspace = true }
-iced = { version = "0.13", features = ["tokio", "image", "svg", "advanced"] }
+# CPU rendering avoids the GPU backend's device and driver overhead for this UI.
+# Keep the existing font/theme defaults while selecting only tiny-skia.
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "image", "svg", "advanced", "fira-sans", "auto-detect-theme"] }
 iced_graphics = "0.13"
 image = { workspace = true }
 serde = { workspace = true }
