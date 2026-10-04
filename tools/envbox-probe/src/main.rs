@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 mod as_user;
+mod dns_rr;
+mod dns_strict;
 
 #[repr(C)]
 struct DnsQueryRequest {
@@ -84,10 +86,7 @@ struct AsyncDnsState {
 unsafe impl Send for AsyncDnsState {}
 unsafe impl Sync for AsyncDnsState {}
 
-unsafe fn consume_dns_result(
-    results: *mut DnsQueryResult,
-    addresses: &Mutex<Vec<String>>,
-) -> i32 {
+unsafe fn consume_dns_result(results: *mut DnsQueryResult, addresses: &Mutex<Vec<String>>) -> i32 {
     if results.is_null() {
         return -1;
     }
@@ -149,10 +148,8 @@ unsafe fn start_reentry(state: *mut AsyncDnsState) {
     // have replaced DNS_REQUEST_PENDING with its final status; do not infer
     // this value from the function return code.
     let initial_status = if (*state).inspect_pending {
-        AtomicI32::from_ptr(std::ptr::addr_of_mut!(
-            (*state).reentry_result.query_status
-        ))
-        .load(Ordering::Acquire)
+        AtomicI32::from_ptr(std::ptr::addr_of_mut!((*state).reentry_result.query_status))
+            .load(Ordering::Acquire)
     } else {
         -1
     };
@@ -223,6 +220,36 @@ unsafe extern "system" fn dns_query_ex_reentry_completion(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--udp-send-to") {
+        let Some(target) = args
+            .get(index + 1)
+            .and_then(|arg| arg.parse::<std::net::SocketAddr>().ok())
+        else {
+            eprintln!("usage: --udp-send-to literalSocketAddr");
+            return ExitCode::FAILURE;
+        };
+        let bind = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        match std::net::UdpSocket::bind(bind)
+            .and_then(|socket| socket.send_to(b"aura-endpoint-fixture", target))
+        {
+            Ok(bytes) => println!("UdpSend_Bytes:\n{bytes}\nUdpSend_Error:\n0"),
+            Err(error) => println!(
+                "UdpSend_Bytes:\n0\nUdpSend_Error:\n{}",
+                error.raw_os_error().unwrap_or(-1)
+            ),
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "--dns-strict") {
+        return dns_strict::run(&args[index + 1..]);
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "--dns-rr") {
+        return dns_rr::run(&args[index + 1..]);
+    }
     let spawn_child = args.iter().any(|a| a == "--spawn-child");
     let spawn_as_user_child = args.iter().any(|a| a == "--spawn-as-user-child");
     let is_child = args.iter().any(|a| a == "--child");
@@ -569,11 +596,21 @@ fn print_dns_system_settings() {
     let entries = [
         (
             r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
-            &["SearchList", "Domain", "UseDomainNameDevolution", "DomainNameDevolutionLevel"][..],
+            &[
+                "SearchList",
+                "Domain",
+                "UseDomainNameDevolution",
+                "DomainNameDevolutionLevel",
+            ][..],
         ),
         (
             r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
-            &["SearchList", "Domain", "UseDomainNameDevolution", "DomainNameDevolutionLevel"][..],
+            &[
+                "SearchList",
+                "Domain",
+                "UseDomainNameDevolution",
+                "DomainNameDevolutionLevel",
+            ][..],
         ),
         (
             r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
@@ -780,7 +817,10 @@ fn dns_registry_value(path: &str, name: &str) -> String {
             };
         }
         if value_type == REG_DWORD && data.len() >= 4 {
-            return format!("{}", u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+            return format!(
+                "{}",
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+            );
         }
         format!("<type {value_type}, {size} bytes>")
     }
@@ -1149,8 +1189,8 @@ fn runtime_loaded() -> bool {
     // Require the module to be mapped; env alone can false-positive from the Host.
     #[cfg(windows)]
     {
-        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::core::w;
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         unsafe {
             return GetModuleHandleW(w!("envbox-runtime64.dll")).is_ok()
                 || GetModuleHandleW(w!("envbox-runtime32.dll")).is_ok();

@@ -1,15 +1,16 @@
 //! DNS routing acceptance (tickets 24-26 + review): VirtualView routes
 //! getaddrinfo and DnsQueryEx via Profile servers; Host mode leaves resolution
-//! untouched; Fail Open never hangs; truncated / CNAME-only never fake NXDOMAIN.
+//! untouched; Profile failures never query Host; incomplete results never fake NXDOMAIN.
 
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-/// Only one fixture DNS server may bind 127.0.0.1:53 at a time.
+/// Fixture tests share one explicitly configured loopback port.
 static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 fn envbox_with_root(root: &std::path::Path) -> Command {
@@ -22,8 +23,7 @@ fn envbox_with_root(root: &std::path::Path) -> Command {
     cmd
 }
 
-/// Test seam: host DNS proxies often own :53. Fixture binds a high port and
-/// ENVBOX_DNS_UDP_PORT points the runtime client at it.
+/// Typed Profile upstreams explicitly select the fixture's high port.
 fn fixture_dns_port() -> u16 {
     std::env::var("ENVBOX_TEST_DNS_PORT")
         .ok()
@@ -55,6 +55,15 @@ fn test_runtime_dll() -> Option<std::path::PathBuf> {
 }
 
 fn probe_exe() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("ENVBOX_TEST_PROBE_EXE") {
+        let path = std::path::PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "configured Probe missing: {}",
+            path.display()
+        );
+        return Some(path);
+    }
     let mut candidates = Vec::new();
     if let Some(dir) = std::path::PathBuf::from(env!("CARGO_BIN_EXE_envbox")).parent() {
         candidates.push(dir.join("envbox-probe.exe"));
@@ -95,17 +104,48 @@ fn make_profile(root: &std::path::Path, dns_servers: &[&str], virtual_view: bool
         "--tz-iana".to_string(),
         "America/Los_Angeles".to_string(),
     ];
-    if virtual_view {
-        args.push("--dns-mode".into());
-        args.push("virtual_view".into());
-    }
-    for s in dns_servers {
-        args.push("--dns".into());
-        args.push((*s).to_string());
-    }
-    let out = envbox_with_root(root).args(&args).output().expect("profile add");
+    args.extend(["--dns-mode".into(), "host".into()]);
+    let out = envbox_with_root(root)
+        .args(&args)
+        .output()
+        .expect("profile add");
     assert!(out.status.success(), "profile add failed: {out:?}");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if virtual_view {
+        for server in dns_servers {
+            let out = envbox_with_root(root)
+                .args([
+                    "profile",
+                    "dns",
+                    "add",
+                    &id,
+                    "--type",
+                    "udp",
+                    "--address",
+                    server,
+                    "--port",
+                    &fixture_dns_port().to_string(),
+                ])
+                .output()
+                .expect("add typed fixture upstream");
+            assert!(out.status.success(), "typed DNS add failed: {out:?}");
+        }
+        let out = envbox_with_root(root)
+            .args([
+                "profile",
+                "dns",
+                "set",
+                &id,
+                "--mode",
+                "virtual_view",
+                "--strict",
+                "true",
+            ])
+            .output()
+            .expect("set strict Profile DNS");
+        assert!(out.status.success(), "strict DNS set failed: {out:?}");
+    }
+    id
 }
 
 fn run_probe_resolve(
@@ -170,7 +210,11 @@ fn run_probe_dnsquery_ex_async(
         .env("ENVBOX_RUNTIME_DLL", dll)
         .args(["run", "--profile", profile_id])
         .arg(probe_exe().expect("envbox-probe.exe required"))
-        .args(["--resolve-dnsquery-ex-async", name, "--inspect-pending-status"]);
+        .args([
+            "--resolve-dnsquery-ex-async",
+            name,
+            "--inspect-pending-status",
+        ]);
     if cancel {
         cmd.arg("--cancel");
     }
@@ -230,6 +274,10 @@ enum FixtureMode {
     Nodata,
     /// NOERROR + empty answer + NS authority (referral; no SOA).
     Referral,
+    Servfail,
+    Refused,
+    Nxdomain,
+    Silent,
 }
 
 /// Bind fixture DNS on the test port (not 53: host DNS proxies own :53).
@@ -334,6 +382,72 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
     let question = query[12..off].to_vec();
     let qname = qname.unwrap_or_default();
 
+    if mode == FixtureMode::Silent {
+        return Vec::new();
+    }
+    let rcode = match mode {
+        FixtureMode::Servfail => Some(2),
+        FixtureMode::Refused => Some(5),
+        FixtureMode::Nxdomain => Some(3),
+        _ => None,
+    };
+    if let Some(rcode) = rcode {
+        let mut response = query[..off].to_vec();
+        response[2..4].copy_from_slice(&(0x8480u16 | rcode).to_be_bytes());
+        response[6..12].fill(0);
+        return response;
+    }
+
+    if qname == "rr.servfail.test" {
+        let mut response = query[..off].to_vec();
+        response[2..4].copy_from_slice(&0x8482u16.to_be_bytes());
+        response[6..12].fill(0);
+        return response;
+    }
+
+    if mode != FixtureMode::Truncated
+        && (qname == "rr.fixture.test"
+            || qname == "rr.mismatch.test"
+            || qname == "rr.wrongtype.test"
+            || qname.is_empty()
+            || (qname == "localhost" && qtype == 65))
+    {
+        let rdata = match qtype {
+            1 => vec![10, 99, 0, 1],
+            64 | 65 => vec![0, 1, 0], // priority 1, root target, no svcparams
+            16 => {
+                let mut bytes = vec![14];
+                bytes.extend_from_slice(b"profile-marker");
+                bytes
+            }
+            2 | 5 | 12 => encode_name("target.fixture.test"),
+            33 => {
+                let mut bytes = vec![0, 7, 0, 11, 1, 187];
+                bytes.extend_from_slice(&encode_name("target.fixture.test"));
+                bytes
+            }
+            65280 => vec![0xde, 0xad, 0xbe, 0xef],
+            _ => vec![],
+        };
+        let mut response = query[..off].to_vec();
+        response[2..4].copy_from_slice(&0x8480u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response[8..12].fill(0);
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&qtype.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(&rdata);
+        if qname == "rr.mismatch.test" {
+            response[13] = b'x';
+        }
+        if qname == "rr.wrongtype.test" {
+            response[off - 4..off - 2].copy_from_slice(&1u16.to_be_bytes());
+        }
+        return response;
+    }
+
     // Truncated: unusable answer, never a final result.
     if mode == FixtureMode::Truncated {
         let mut resp = Vec::with_capacity(64);
@@ -357,9 +471,7 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
 
     let answer = match mode {
         FixtureMode::Address | FixtureMode::DelayedAddress => {
-            if (qname == FIXTURE_NAME
-                || qname == ASYNC_FIXTURE_NAME
-                || qname == ASYNC_CANCEL_NAME)
+            if (qname == FIXTURE_NAME || qname == ASYNC_FIXTURE_NAME || qname == ASYNC_CANCEL_NAME)
                 && qtype == 1
             {
                 Answer::A(FIXTURE_A)
@@ -381,9 +493,13 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
             n if n == FIXTURE_NAME && qtype == 1 => Answer::A(FIXTURE_A),
             _ => Answer::None,
         },
-        FixtureMode::Nodata | FixtureMode::Referral | FixtureMode::Truncated => {
-            Answer::None
-        }
+        FixtureMode::Nodata
+        | FixtureMode::Referral
+        | FixtureMode::Truncated
+        | FixtureMode::Servfail
+        | FixtureMode::Refused
+        | FixtureMode::Nxdomain
+        | FixtureMode::Silent => Answer::None,
     };
 
     let soa_authority = mode == FixtureMode::Nodata && qname == NODATA_NAME;
@@ -412,7 +528,11 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
     resp.extend_from_slice(&flags.to_be_bytes());
     resp.extend_from_slice(&qd.to_be_bytes());
     resp.extend_from_slice(&ancount.to_be_bytes());
-    let nscount: u16 = if soa_authority || referral_authority { 1 } else { 0 };
+    let nscount: u16 = if soa_authority || referral_authority {
+        1
+    } else {
+        0
+    };
     resp.extend_from_slice(&nscount.to_be_bytes());
     resp.extend_from_slice(&0u16.to_be_bytes());
     resp.extend_from_slice(&question);
@@ -468,14 +588,65 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
     resp
 }
 
-fn spawn_fixture_dns(sock: UdpSocket, mode: FixtureMode) -> Arc<AtomicBool> {
+struct FixtureServer {
+    stop: Arc<AtomicBool>,
+    queries: Arc<AtomicU32>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct TcpFixture {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<u32>>,
+}
+
+impl TcpFixture {
+    fn finish(mut self) -> u32 {
+        self.stop.store(true, Ordering::SeqCst);
+        self.thread
+            .take()
+            .unwrap()
+            .join()
+            .expect("TCP fixture thread")
+    }
+}
+
+impl Drop for TcpFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            // Preserve the original assertion panic while releasing the listener.
+            let _ = thread.join();
+        }
+    }
+}
+
+impl std::ops::Deref for FixtureServer {
+    type Target = AtomicBool;
+    fn deref(&self) -> &AtomicBool {
+        &self.stop
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("fixture DNS thread");
+        }
+    }
+}
+
+fn spawn_fixture_dns(sock: UdpSocket, mode: FixtureMode) -> FixtureServer {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
-    std::thread::spawn(move || {
+    let queries = Arc::new(AtomicU32::new(0));
+    let seen = queries.clone();
+    let thread = std::thread::spawn(move || {
         let mut buf = [0u8; 1500];
         while !stop2.load(Ordering::SeqCst) {
             match sock.recv_from(&mut buf) {
                 Ok((n, peer)) => {
+                    seen.fetch_add(1, Ordering::SeqCst);
                     if mode == FixtureMode::DelayedAddress {
                         std::thread::sleep(Duration::from_millis(750));
                     }
@@ -488,13 +659,528 @@ fn spawn_fixture_dns(sock: UdpSocket, mode: FixtureMode) -> Arc<AtomicBool> {
             }
         }
     });
-    stop
+    FixtureServer {
+        stop,
+        queries,
+        thread: Some(thread),
+    }
 }
 
 fn lock_fixture() -> MutexGuard<'static, ()> {
     FIXTURE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Unsupported native providers must reject synchronously before creating work.
+/// Packet counts cover this Profile fixture only, not system-wide Host traffic.
+#[test]
+fn strict_unsupported_entrypoints_reject_without_pending_work() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let stop = spawn_fixture_dns(
+        try_bind_fixture_dns().expect("fixture bind"),
+        FixtureMode::Address,
+    );
+    let root = std::env::temp_dir().join(format!("envbox-dns-strict-{}", Uuid::new_v4()));
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let host = make_profile(&root, &[], false);
+    let probe = probe_exe().expect("probe required");
+    let cases = [
+        ("ex-a", "event", "10045"),
+        ("ex-a", "callback", "10045"),
+        ("ex-a", "namespace", "10045"),
+        ("ex-a", "provider", "10045"),
+        ("ex-w", "event", "10045"),
+        ("ex-w", "callback", "10045"),
+        ("ex-w", "namespace", "10045"),
+        ("ex-w", "provider", "10045"),
+        ("raw", "name", "50"),
+        ("raw", "packet", "50"),
+        ("null-ex", "request", "87"),
+        ("null-ex", "result", "87"),
+    ];
+    for (api, mode, expected) in cases {
+        let run = |id: &str| {
+            envbox_with_root(&root)
+                .env("ENVBOX_RUNTIME_DLL", &dll)
+                .args(["run", "--profile", id])
+                .arg(&probe)
+                .args(["--dns-strict", api, mode])
+                .output()
+                .expect("strict probe")
+        };
+        let out = run(&profile);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{api}/{mode}: {out:?}");
+        if api == "raw" && text.contains("StrictProbe_Available:\nfalse") {
+            eprintln!("DnsQueryRaw export unavailable; {mode} not covered");
+            continue;
+        }
+        assert_eq!(
+            field_after(&text, "StrictProbe_Status:"),
+            expected,
+            "{api}/{mode}: {text}"
+        );
+        if api != "null-ex" {
+            for key in [
+                "StrictProbe_InitialCallbacks:",
+                "StrictProbe_FinalCallbacks:",
+            ] {
+                assert_eq!(field_after(&text, key), "0", "{api}/{mode}: {text}");
+            }
+            for key in ["StrictProbe_InitialEvent:", "StrictProbe_FinalEvent:"] {
+                assert_eq!(field_after(&text, key), "258", "{api}/{mode}: {text}");
+            }
+            assert_eq!(
+                field_after(&text, "StrictProbe_InitialToken:"),
+                "false",
+                "{api}/{mode}: {text}"
+            );
+        }
+        let control = Command::new(&probe)
+            .args(["--dns-strict", api, mode])
+            .output()
+            .expect("native Host control");
+        let host_out = run(&host);
+        assert!(control.status.success() && host_out.status.success());
+        assert_eq!(
+            field_after(
+                &String::from_utf8_lossy(&host_out.stdout),
+                "StrictProbe_Status:"
+            ),
+            field_after(
+                &String::from_utf8_lossy(&control.stdout),
+                "StrictProbe_Status:"
+            ),
+            "Host mode changed {api}/{mode} native return"
+        );
+    }
+    assert_eq!(
+        stop.queries.load(Ordering::SeqCst),
+        0,
+        "unsupported calls must not enter Profile DNS transport"
+    );
+}
+
+#[test]
+fn typed_upstream_order_negative_answers_and_total_deadline() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    for (mode, name, expected, second_expected) in [
+        (FixtureMode::Servfail, "rr.fixture.test", "0", 1),
+        (FixtureMode::Refused, "rr.fixture.test", "0", 1),
+        (FixtureMode::Nxdomain, "rr.fixture.test", "9003", 0),
+        (FixtureMode::Nodata, NODATA_NAME, "9501", 0),
+        (FixtureMode::Silent, "strict.fixture.test", "11002", 0),
+    ] {
+        let first = spawn_fixture_dns(try_bind_fixture_dns().expect("first fixture"), mode);
+        let second_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        second_socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let second_port = second_socket.local_addr().unwrap().port().to_string();
+        let second = spawn_fixture_dns(second_socket, FixtureMode::Address);
+        let root = std::env::temp_dir().join(format!("envbox-dns-order-{}", Uuid::new_v4()));
+        let id = make_profile(&root, &["127.0.0.1"], true);
+        let out = envbox_with_root(&root)
+            .args([
+                "profile",
+                "dns",
+                "add",
+                &id,
+                "--type",
+                "udp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                &second_port,
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "second upstream: {out:?}");
+        let start = Instant::now();
+        let mut command = envbox_with_root(&root);
+        command
+            .env("ENVBOX_RUNTIME_DLL", &dll)
+            .args(["run", "--profile", &id])
+            .arg(probe_exe().unwrap());
+        let key = if mode == FixtureMode::Silent {
+            command.args(["--dns-strict", "ex-w", "deadline"]);
+            "StrictProbe_Status:"
+        } else {
+            command.args(["--dns-rr", name, "1", "ex"]);
+            "DnsRR_Status:"
+        };
+        let out = command.output().unwrap();
+        assert_eq!(
+            field_after(&String::from_utf8_lossy(&out.stdout), key),
+            expected,
+            "{mode:?}: {out:?}"
+        );
+        assert_eq!(
+            first.queries.load(Ordering::SeqCst),
+            1,
+            "first upstream must be tried first"
+        );
+        assert_eq!(
+            second.queries.load(Ordering::SeqCst),
+            second_expected,
+            "{mode:?}: fallback must respect authoritative negatives and total budget"
+        );
+        if mode == FixtureMode::Silent {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "deadline reset across upstreams: {:?}",
+                start.elapsed()
+            );
+        }
+    }
+}
+
+/// Every supported Windows DNS entry point must route every QTYPE to Profile.
+#[test]
+fn arbitrary_qtypes_route_to_profile_dns() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
+    let stop = spawn_fixture_dns(sock, FixtureMode::Address);
+    let root = std::env::temp_dir().join(format!("envbox-dns-rr-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+    let mut failures = Vec::new();
+    for api in ["a", "w", "utf8", "ex", "async"] {
+        for kind in [65u16, 64, 16, 12, 5, 33, 65280, 1] {
+            let out = envbox_with_root(&root)
+                .env("ENVBOX_RUNTIME_DLL", &dll)
+                .args(["run", "--profile", &profile_id])
+                .arg(probe_exe().expect("probe required"))
+                .args(["--dns-rr", "rr.fixture.test", &kind.to_string(), api])
+                .output()
+                .expect("run RR probe");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !out.status.success()
+                || !stdout.contains("DnsRR_Status:\n0")
+                || !stdout.contains(&format!("DnsRR_Record: type={kind} "))
+                || !stdout.contains("DnsRR_Freed:\ntrue")
+            {
+                failures.push(format!(
+                    "api={api} type={kind}: {stdout} stderr={}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+                if std::env::var_os("ENVBOX_DNS_RR_RED").is_some() {
+                    stop.store(true, Ordering::SeqCst);
+                    panic!(
+                        "fixture packets={}\n{}",
+                        stop.queries.load(Ordering::SeqCst),
+                        failures.join("\n")
+                    );
+                }
+            }
+            if kind == 16 && !stdout.contains("value=profile-marker") {
+                failures.push(format!("TXT content lost ({api}): {stdout}"));
+            }
+            if matches!(kind, 5 | 12 | 33) && !stdout.contains("target.fixture.test") {
+                failures.push(format!("name content lost ({api}, {kind}): {stdout}"));
+            }
+            if matches!(kind, 64 | 65) && !stdout.contains("value=000100") {
+                failures.push(format!("SVCB/HTTPS content lost ({api}, {kind}): {stdout}"));
+            }
+            if kind == 65280 && !stdout.contains("value=deadbeef") {
+                failures.push(format!("unknown RR content lost ({api}): {stdout}"));
+            }
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        failures.is_empty(),
+        "fixture packets={}\n{}",
+        stop.queries.load(Ordering::SeqCst),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn arbitrary_qtypes_profile_error_does_not_fall_back() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
+    let stop = spawn_fixture_dns(sock, FixtureMode::Address);
+    let root = std::env::temp_dir().join(format!("envbox-dns-rr-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+    let mut failures = Vec::new();
+    for api in ["a", "w", "utf8", "ex", "async"] {
+        for (name, kind, expected) in [
+            ("rr.servfail.test", 1u16, "9002"),
+            ("rr.servfail.test", 65, "9002"),
+            ("rr.servfail.test", 65280, "9002"),
+            ("rr.mismatch.test", 65, "1460"),
+            ("rr.wrongtype.test", 65, "1460"),
+        ] {
+            let out = envbox_with_root(&root)
+                .env("ENVBOX_RUNTIME_DLL", &dll)
+                .args(["run", "--profile", &profile_id])
+                .arg(probe_exe().expect("probe required"))
+                .args(["--dns-rr", name, &kind.to_string(), api])
+                .output()
+                .expect("run RR error probe");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Native host querying this .test name yields a different error.
+            // Preserving the Profile's SERVFAIL proves its result is returned.
+            if !out.status.success()
+                || field_after(&stdout, "DnsRR_Status:") != expected
+                || field_after(&stdout, "DnsRR_Records:") != "0"
+            {
+                failures.push(format!("api={api} kind={kind}: {stdout}"));
+            }
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn arbitrary_qtypes_root_localhost_and_tcp() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
+    let udp = spawn_fixture_dns(sock, FixtureMode::Truncated);
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, fixture_dns_port())).expect("TCP DNS fixture bind");
+    listener.set_nonblocking(true).unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stop = stopping.clone();
+    let tcp = TcpFixture {
+        stop: stopping.clone(),
+        thread: Some(std::thread::spawn(move || {
+            let mut requests = 0;
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut length = [0u8; 2];
+                    stream.read_exact(&mut length).unwrap();
+                    let mut query = vec![0; u16::from_be_bytes(length) as usize];
+                    stream.read_exact(&mut query).unwrap();
+                    let reply = build_fixture_response(&query, FixtureMode::Address);
+                    stream
+                        .write_all(&(reply.len() as u16).to_be_bytes())
+                        .unwrap();
+                    stream.write_all(&reply).unwrap();
+                    requests += 1;
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            requests
+        })),
+    };
+    let root = std::env::temp_dir().join(format!("envbox-dns-rr-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+    let mut failures = Vec::new();
+    for api in ["a", "w", "utf8", "ex", "async"] {
+        for (name, kind, options) in [
+            ("rr.fixture.test", 65, 0x108),
+            ("rr.fixture.test", 65280, 0x10a),
+            (".", 2, 0x108),
+            ("localhost", 65, 0x108),
+        ] {
+            let out = envbox_with_root(&root)
+                .env("ENVBOX_RUNTIME_DLL", &dll)
+                .args(["run", "--profile", &profile_id])
+                .arg(probe_exe().expect("probe required"))
+                .args([
+                    "--dns-rr",
+                    name,
+                    &kind.to_string(),
+                    api,
+                    &options.to_string(),
+                ])
+                .output()
+                .expect("run TCP RR probe");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !out.status.success()
+                || !stdout.contains("DnsRR_Status:\n0")
+                || !stdout.contains(&format!("DnsRR_Record: type={kind} "))
+            {
+                failures.push(format!(
+                    "api={api} name={name} kind={kind} options={options}: {stdout}"
+                ));
+            }
+        }
+    }
+    let address = run_probe_resolve(&root, &dll, &profile_id, "fixture.test");
+    assert!(
+        String::from_utf8_lossy(&address.stdout).contains("10.99.0.1"),
+        "AF_UNSPEC must follow UDP TC to TCP: {address:?}"
+    );
+    let udp_before = udp.queries.load(Ordering::SeqCst);
+    let port = fixture_dns_port().to_string();
+    for args in [
+        vec![
+            "profile",
+            "dns",
+            "add",
+            &profile_id,
+            "--type",
+            "tcp",
+            "--address",
+            "127.0.0.1",
+            "--port",
+            &port,
+        ],
+        vec!["profile", "dns", "remove", &profile_id, "--index", "0"],
+    ] {
+        let out = envbox_with_root(&root)
+            .args(args)
+            .output()
+            .expect("typed TCP configuration");
+        assert!(out.status.success(), "typed TCP config: {out:?}");
+    }
+    for api in ["a", "w", "utf8", "ex", "async"] {
+        let out = envbox_with_root(&root)
+            .env("ENVBOX_RUNTIME_DLL", &dll)
+            .args(["run", "--profile", &profile_id])
+            .arg(probe_exe().unwrap())
+            .args(["--dns-rr", "rr.fixture.test", "65", api])
+            .output()
+            .unwrap();
+        assert_eq!(
+            field_after(&String::from_utf8_lossy(&out.stdout), "DnsRR_Status:"),
+            "0",
+            "{out:?}"
+        );
+    }
+    assert_eq!(
+        udp.queries.load(Ordering::SeqCst),
+        udp_before,
+        "typed TCP must not send UDP"
+    );
+    stopping.store(true, Ordering::SeqCst);
+    assert_eq!(
+        tcp.finish(),
+        27,
+        "20 RR + AF_UNSPEC A/AAAA + 5 typed TCP queries"
+    );
+    udp.store(true, Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn dnsquery_numeric_literals_and_cname_chain() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
+    let stop = spawn_fixture_dns(sock, FixtureMode::CnameChain);
+    let root = std::env::temp_dir().join(format!("envbox-dns-rr-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+    let mut failures = Vec::new();
+    for api in ["a", "w", "utf8", "ex", "async"] {
+        for (name, kind, expected, options) in [
+            ("127.0.0.1", 1, "value=127.0.0.1", 0),
+            ("::1", 28, "type=28 ", 0),
+            ("127.0.0.1", 1, "value=127.0.0.1", 0x108),
+            ("::1", 28, "type=28 ", 0x108),
+            (CNAME_A_NAME, 1, "value=10.99.0.1", 0),
+        ] {
+            let out = envbox_with_root(&root)
+                .env("ENVBOX_RUNTIME_DLL", &dll)
+                .args(["run", "--profile", &profile_id])
+                .arg(probe_exe().expect("probe required"))
+                .args(["--dns-rr", name, &kind.to_string(), api])
+                .arg(options.to_string())
+                .output()
+                .expect("run literal/CNAME probe");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !out.status.success()
+                || !stdout.contains("DnsRR_Status:\n0")
+                || !stdout.contains(expected)
+            {
+                failures.push(format!("api={api} name={name}: {stdout}"));
+            }
+            if api == "async" && name != CNAME_A_NAME && !stdout.contains("DnsRR_ReturnStatus:\n0")
+            {
+                failures.push(format!("numeric literal must complete inline: {stdout}"));
+            }
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn dnsquery_tcp_timeout_and_cancel_stay_in_profile() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, fixture_dns_port())).expect("TCP DNS fixture bind");
+    listener.set_nonblocking(true).unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stop = stopping.clone();
+    let tcp = TcpFixture {
+        stop: stopping.clone(),
+        thread: Some(std::thread::spawn(move || {
+            let mut requests = 0;
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut prefix = [0; 2];
+                    if stream.read_exact(&mut prefix).is_ok() {
+                        let mut query = vec![0; u16::from_be_bytes(prefix) as usize];
+                        if stream.read_exact(&mut query).is_ok() {
+                            requests += 1;
+                            // Hold the reply until the client times out or cancels.
+                            let _ = stream.read(&mut prefix);
+                        }
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            requests
+        })),
+    };
+    let root = std::env::temp_dir().join(format!("envbox-dns-rr-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+    let mut failures = Vec::new();
+    for (api, cancel, expected) in [
+        ("ex", false, "1460"),
+        ("async", false, "1460"),
+        ("async", true, "1223"),
+    ] {
+        let mut command = envbox_with_root(&root);
+        command
+            .env("ENVBOX_RUNTIME_DLL", &dll)
+            .args(["run", "--profile", &profile_id])
+            .arg(probe_exe().expect("probe required"))
+            .args(["--dns-rr", "rr.fixture.test", "65", api, "266"]);
+        if cancel {
+            command.arg("--cancel");
+        }
+        let out = command.output().expect("run TCP failure probe");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success()
+            || field_after(&stdout, "DnsRR_Status:") != expected
+            || field_after(&stdout, "DnsRR_Records:") != "0"
+        {
+            failures.push(format!("api={api} cancel={cancel}: {stdout}"));
+        }
+        if cancel && field_after(&stdout, "DnsRR_CancelStatus:") != "0" {
+            failures.push(format!("cancel failed: {stdout}"));
+        }
+    }
+    stopping.store(true, Ordering::SeqCst);
+    assert_eq!(tcp.finish(), 3, "every request must reach Profile TCP");
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Ticket 26.1+2+3: VirtualView + fixture DNS resolves fixture.test to 10.99.0.1.
@@ -563,7 +1249,10 @@ fn unreachable_dns_server_does_not_hang() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Fail Open or definitive miss: must not return the fixture address.
     let got = field_after(&stdout, "getaddrinfo:");
-    assert_ne!(got, "10.99.0.1", "must not invent fixture answer:\n{stdout}");
+    assert_ne!(
+        got, "10.99.0.1",
+        "must not invent fixture answer:\n{stdout}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -628,83 +1317,42 @@ fn virtual_view_and_host_resolution_contrast() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Sorted unique IP list from a probe getaddrinfo/DnsQuery value line.
-fn parse_ip_set(value: &str) -> Vec<String> {
-    let mut ips: Vec<String> = value
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != "<error>" && s != "<empty>" && !s.starts_with("<error"))
-        .collect();
-    ips.sort();
-    ips.dedup();
-    ips
-}
-
-/// Review Hard: TC=1 is unusable. VirtualView must Fail Open to Host resolve
-/// (same result as Host profile), never invent NXDOMAIN/empty as final.
+/// A truncated Profile response returns a retryable error.
 #[test]
-fn truncated_response_fails_open_like_host() {
+fn truncated_response_returns_profile_error() {
     let dll = test_runtime_dll().expect("runtime DLL required");
-    let _probe = probe_exe().expect("envbox-probe.exe required");
     let _guard = lock_fixture();
-    let Some(sock) = try_bind_fixture_dns() else {
-        return;
-    };
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
     let stop = spawn_fixture_dns(sock, FixtureMode::Truncated);
-
     let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
-    let virt = make_profile(&root, &["127.0.0.1"], true);
-    let host = make_profile(&root, &[], false);
-
-    // localhost must resolve on Host; TC fixture forces Fail Open to same path.
-    let virt_out = run_probe_resolve(&root, &dll, &virt, "localhost");
-    let host_out = run_probe_resolve(&root, &dll, &host, "localhost");
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let out = run_probe_resolve(&root, &dll, &profile, "rr.truncated.test");
     stop.store(true, Ordering::SeqCst);
-
-    assert!(virt_out.status.success(), "virt run: {virt_out:?}");
-    assert!(host_out.status.success(), "host run: {host_out:?}");
-    let v = field_after(&String::from_utf8_lossy(&virt_out.stdout), "getaddrinfo:");
-    let h = field_after(&String::from_utf8_lossy(&host_out.stdout), "getaddrinfo:");
-    assert_ne!(v, "<error>", "TC must Fail Open, not error out:\n{v}");
+    assert!(out.status.success(), "{out:?}");
+    let value = field_after(&String::from_utf8_lossy(&out.stdout), "getaddrinfo:");
     assert_eq!(
-        parse_ip_set(&v),
-        parse_ip_set(&h),
-        "TC truncated must Fail Open to Host resolve (virt={v} host={h})"
+        value, "<error 11002>",
+        "incomplete Profile resolution must return WSATRY_AGAIN: {value}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Review Worst: CNAME-only (NOERROR, no A/AAAA) must not fake NXDOMAIN.
-/// Follow CNAME; if still no address, Fail Open -- match Host resolve.
+/// An incomplete CNAME chain returns a retryable error, not NXDOMAIN.
 #[test]
-fn cname_only_fails_open_like_host() {
+fn cname_only_returns_retryable_profile_error() {
     let dll = test_runtime_dll().expect("runtime DLL required");
-    let _probe = probe_exe().expect("envbox-probe.exe required");
     let _guard = lock_fixture();
-    let Some(sock) = try_bind_fixture_dns() else {
-        return;
-    };
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
     let stop = spawn_fixture_dns(sock, FixtureMode::CnameOnly);
-
     let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
-    let virt = make_profile(&root, &["127.0.0.1"], true);
-    let host = make_profile(&root, &[], false);
-
-    let virt_out = run_probe_resolve(&root, &dll, &virt, "localhost");
-    let host_out = run_probe_resolve(&root, &dll, &host, "localhost");
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let out = run_probe_resolve(&root, &dll, &profile, "cname-only.test");
     stop.store(true, Ordering::SeqCst);
-
-    assert!(virt_out.status.success(), "virt run: {virt_out:?}");
-    assert!(host_out.status.success(), "host run: {host_out:?}");
-    let v = field_after(&String::from_utf8_lossy(&virt_out.stdout), "getaddrinfo:");
-    let h = field_after(&String::from_utf8_lossy(&host_out.stdout), "getaddrinfo:");
-    // Must not return fabricated empty/NXDOMAIN for a name Host can resolve.
-    assert_ne!(v, "<error>", "CNAME-only must Fail Open, not fake NXDOMAIN:\n{v}");
-    assert_ne!(v, "<empty>", "CNAME-only must Fail Open, not empty:\n{v}");
+    assert!(out.status.success(), "{out:?}");
+    let value = field_after(&String::from_utf8_lossy(&out.stdout), "getaddrinfo:");
     assert_eq!(
-        parse_ip_set(&v),
-        parse_ip_set(&h),
-        "CNAME-only must Fail Open to Host resolve (virt={v} host={h})"
+        value, "<error 11002>",
+        "incomplete Profile resolution must return WSATRY_AGAIN: {value}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -735,25 +1383,18 @@ fn cname_chain_resolves_target_address() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Review: unreachable Profile server Fail Open outcome matches Host resolve.
+/// An unreachable Profile server returns a retryable error.
 #[test]
-fn unreachable_matches_host_outcome() {
+fn unreachable_returns_retryable_profile_error() {
     let dll = test_runtime_dll().expect("runtime DLL required");
-    let _probe = probe_exe().expect("envbox-probe.exe required");
     let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
-    let virt = make_profile(&root, &["192.0.2.1"], true);
-    let host = make_profile(&root, &[], false);
-
-    let virt_out = run_probe_resolve(&root, &dll, &virt, "localhost");
-    let host_out = run_probe_resolve(&root, &dll, &host, "localhost");
-    assert!(virt_out.status.success(), "virt run: {virt_out:?}");
-    assert!(host_out.status.success(), "host run: {host_out:?}");
-    let v = field_after(&String::from_utf8_lossy(&virt_out.stdout), "getaddrinfo:");
-    let h = field_after(&String::from_utf8_lossy(&host_out.stdout), "getaddrinfo:");
+    let profile = make_profile(&root, &["192.0.2.1"], true);
+    let out = run_probe_resolve(&root, &dll, &profile, "unreachable.fixture.test");
+    assert!(out.status.success(), "{out:?}");
+    let value = field_after(&String::from_utf8_lossy(&out.stdout), "getaddrinfo:");
     assert_eq!(
-        parse_ip_set(&v),
-        parse_ip_set(&h),
-        "unreachable Profile DNS must Fail Open to Host outcome (virt={v} host={h})"
+        value, "<error 11002>",
+        "unreachable Profile resolution must return WSATRY_AGAIN: {value}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -908,19 +1549,20 @@ fn dnsquery_ex_local_name_keeps_native_synchronous_completion() {
     let _probe = probe_exe().expect("envbox-probe.exe required");
     let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
     let profile_id = make_profile(&root, &["127.0.0.1"], true);
-    let out = run_probe_dnsquery_ex_async(
-        &root,
-        &dll,
-        &profile_id,
-        "localhost",
-        false,
-        false,
-        false,
-    );
+    let out =
+        run_probe_dnsquery_ex_async(&root, &dll, &profile_id, "localhost", false, false, false);
     assert!(out.status.success(), "run failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(field_after(&stdout, "DnsQueryEx_A_Async_ReturnStatus:"), "0", "{stdout}");
-    assert_eq!(field_after(&stdout, "DnsQueryEx_A_Async_Callbacks:"), "0", "{stdout}");
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_ReturnStatus:"),
+        "0",
+        "{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_Callbacks:"),
+        "0",
+        "{stdout}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1074,68 +1716,42 @@ fn getaddrinfo_authoritative_nodata_returns_eai_noname() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// An NS-only authority response is a referral. It has no definitive
-/// negative answer, so the route must retain the existing Fail Open behavior.
+/// DnsQueryEx preserves a Profile referral error without consulting Host DNS.
 #[test]
-fn dnsquery_ex_referral_fails_open() {
+fn dnsquery_ex_referral_does_not_fall_back() {
     let dll = test_runtime_dll().expect("runtime DLL required");
-    let _probe = probe_exe().expect("envbox-probe.exe required");
     let _guard = lock_fixture();
-    let Some(sock) = try_bind_fixture_dns() else {
-        return;
-    };
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
     let stop = spawn_fixture_dns(sock, FixtureMode::Referral);
-
     let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
     let virtual_id = make_profile(&root, &["127.0.0.1"], true);
-    let host_id = make_profile(&root, &[], false);
-
-    let virtual_out = run_probe_dnsquery_ex(&root, &dll, &virtual_id, REFERRAL_NAME);
-    let host_out = run_probe_dnsquery_ex(&root, &dll, &host_id, REFERRAL_NAME);
+    let out = run_probe_dnsquery_ex(&root, &dll, &virtual_id, REFERRAL_NAME);
     stop.store(true, Ordering::SeqCst);
-    assert!(virtual_out.status.success(), "virtual run failed: {virtual_out:?}");
-    assert!(host_out.status.success(), "host run failed: {host_out:?}");
-    let virtual_value = field_after(
-        &String::from_utf8_lossy(&virtual_out.stdout),
-        "DnsQueryEx_A:",
-    );
-    let host_value = field_after(&String::from_utf8_lossy(&host_out.stdout), "DnsQueryEx_A:");
-    assert_eq!(
-        virtual_value, host_value,
-        "NS-only referral must Fail Open to the Host resolver (virtual={virtual_value} host={host_value})"
+    assert!(out.status.success(), "{out:?}");
+    let value = field_after(&String::from_utf8_lossy(&out.stdout), "DnsQueryEx_A:");
+    assert!(
+        value.starts_with("<error "),
+        "referral must return a Profile error: {value}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// An NS-only authority response is a referral for getaddrinfo as well. It
-/// must retain the existing Fail Open behavior and match the Host profile.
+/// An NS-only referral returns a retryable Profile error.
 #[test]
-fn getaddrinfo_referral_fails_open() {
+fn getaddrinfo_referral_returns_retryable_profile_error() {
     let dll = test_runtime_dll().expect("runtime DLL required");
-    let _probe = probe_exe().expect("envbox-probe.exe required");
     let _guard = lock_fixture();
-    let Some(sock) = try_bind_fixture_dns() else {
-        return;
-    };
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
     let stop = spawn_fixture_dns(sock, FixtureMode::Referral);
-
     let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
-    let virtual_id = make_profile(&root, &["127.0.0.1"], true);
-    let host_id = make_profile(&root, &[], false);
-
-    let virtual_out = run_probe_resolve(&root, &dll, &virtual_id, REFERRAL_NAME);
-    let host_out = run_probe_resolve(&root, &dll, &host_id, REFERRAL_NAME);
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let out = run_probe_resolve(&root, &dll, &profile, "referral.test");
     stop.store(true, Ordering::SeqCst);
-    assert!(virtual_out.status.success(), "virtual run failed: {virtual_out:?}");
-    assert!(host_out.status.success(), "host run failed: {host_out:?}");
-    let virtual_value = field_after(
-        &String::from_utf8_lossy(&virtual_out.stdout),
-        "getaddrinfo:",
-    );
-    let host_value = field_after(&String::from_utf8_lossy(&host_out.stdout), "getaddrinfo:");
+    assert!(out.status.success(), "{out:?}");
+    let value = field_after(&String::from_utf8_lossy(&out.stdout), "getaddrinfo:");
     assert_eq!(
-        virtual_value, host_value,
-        "NS-only referral must Fail Open to the Host resolver (virtual={virtual_value} host={host_value})"
+        value, "<error 11002>",
+        "incomplete Profile resolution must return WSATRY_AGAIN: {value}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1152,7 +1768,10 @@ fn virtual_view_hides_chromium_host_dns_policy() {
     let root = std::env::temp_dir().join(format!("envbox-dns-policy-test-{}", Uuid::new_v4()));
     let virtual_id = make_profile(&root, &["127.0.0.1"], true);
     let virtual_out = run_probe_dns_system_settings(&root, &dll, &virtual_id);
-    assert!(virtual_out.status.success(), "virtual run failed: {virtual_out:?}");
+    assert!(
+        virtual_out.status.success(),
+        "virtual run failed: {virtual_out:?}"
+    );
     let virtual_stdout = String::from_utf8_lossy(&virtual_out.stdout);
     let virtual_domain = field_after(&virtual_stdout, "Domain:");
     assert_eq!(
@@ -1162,32 +1781,22 @@ fn virtual_view_hides_chromium_host_dns_policy() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Optional smoke: DnsQuery_A under TC must Fail Open (not invent NXDOMAIN).
+/// DnsQuery_A under TC must report the Profile transport error.
 #[test]
-fn dnsquery_a_truncated_fails_open() {
+fn dnsquery_a_truncated_does_not_fall_back() {
     let dll = test_runtime_dll().expect("runtime DLL required");
-    let _probe = probe_exe().expect("envbox-probe.exe required");
     let _guard = lock_fixture();
-    let Some(sock) = try_bind_fixture_dns() else {
-        return;
-    };
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
     let stop = spawn_fixture_dns(sock, FixtureMode::Truncated);
-
     let root = std::env::temp_dir().join(format!("envbox-dns-test-{}", Uuid::new_v4()));
-    let virt = make_profile(&root, &["127.0.0.1"], true);
-    let host = make_profile(&root, &[], false);
-
-    let virt_out = run_probe_dnsquery(&root, &dll, &virt, "localhost");
-    let host_out = run_probe_dnsquery(&root, &dll, &host, "localhost");
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let out = run_probe_dnsquery(&root, &dll, &profile, "rr.truncated.test");
     stop.store(true, Ordering::SeqCst);
-    assert!(virt_out.status.success(), "virt run: {virt_out:?}");
-    assert!(host_out.status.success(), "host run: {host_out:?}");
-    let v = field_after(&String::from_utf8_lossy(&virt_out.stdout), "DnsQuery_A:");
-    let h = field_after(&String::from_utf8_lossy(&host_out.stdout), "DnsQuery_A:");
-    assert_eq!(
-        parse_ip_set(&v),
-        parse_ip_set(&h),
-        "DnsQuery_A TC must Fail Open to Host (virt={v} host={h})"
+    assert!(out.status.success(), "{out:?}");
+    let value = field_after(&String::from_utf8_lossy(&out.stdout), "DnsQuery_A:");
+    assert!(
+        value.starts_with("<error "),
+        "TC must return a Profile error: {value}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

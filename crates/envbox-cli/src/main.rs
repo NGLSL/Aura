@@ -10,6 +10,8 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use uuid::Uuid;
+mod containers;
+mod profile_dns;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,7 +19,9 @@ fn main() -> ExitCode {
         ConfigStore::new(terminal_store_root(&args).unwrap_or_else(ConfigStore::default_root));
 
     match args.first().map(String::as_str) {
+        Some("container") => containers::command(&store, &args[1..]),
         Some("profile") => match args.get(1).map(String::as_str) {
+            Some("dns") => profile_dns::command(&store, &args[2..]),
             Some("list") => cmd_profile_list(&store),
             Some("add") => cmd_profile_add(&store, &args[2..]),
             _ => usage(),
@@ -62,7 +66,23 @@ fn usage() -> ExitCode {
     eprintln!("envbox — process-scoped Windows environment virtualization");
     eprintln!();
     eprintln!("usage:");
+    eprintln!("  envbox container list | create --name N --profile UUID [--mode compatibility]");
+    eprintln!("  envbox container edit UUID [--name N] [--profile UUID]");
+    eprintln!(
+        "  envbox container prepare UUID [--instance UUID]  (configuration only; does not launch)"
+    );
+    eprintln!("  envbox container show-snapshot CONTAINER_UUID INSTANCE_UUID");
+    eprintln!("  envbox container run UUID --application UUID [--instance UUID] [--request UUID]");
+    eprintln!("  envbox container instances UUID");
+    eprintln!("  envbox container stop UUID --instance UUID --application UUID [--request UUID]");
+    eprintln!("  envbox container stop-all UUID [--request UUID]");
+    eprintln!("  envbox container policy show UUID");
+    eprintln!("  envbox container policy add UUID --target file|registry --path P --action isolated_write|shared_read_only|shared_read_write|deny");
+    eprintln!("  envbox container policy remove UUID --index N");
+    eprintln!("  envbox container policy preview UUID --target file|registry --path P");
     eprintln!("  envbox profile list");
+    eprintln!("  envbox profile dns show UUID | add UUID --type udp|tcp|dot|doh [--address IP] [--port N] [--server-name NAME] [--url HTTPS_URL] [--bootstrap IP]...");
+    eprintln!("  envbox profile dns move UUID --from INDEX --to INDEX | remove UUID --index INDEX | set UUID [--mode host|virtual_view] [--strict true|false]");
     eprintln!("  envbox profile add --name N --locale L --ui-language U --region R \\");
     eprintln!("     --tz-windows W --tz-iana I [--dns-mode host|virtual_view] \\");
     eprintln!(
@@ -694,6 +714,7 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
     let mut tz_windows = String::new();
     let mut tz_iana = String::new();
     let mut dns_mode = DnsMode::Host;
+    let mut dns_strict = true;
     let mut servers: Vec<IpAddr> = Vec::new();
     let mut environment = HashMap::new();
     let mut webrtc = WebRtcPolicy::Host;
@@ -746,6 +767,16 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
                     }
                 }
             }
+            "--dns-strict" => {
+                let raw = take(&mut i).unwrap_or_default();
+                match raw.parse::<bool>() {
+                    Ok(strict) => dns_strict = strict,
+                    Err(_) => {
+                        eprintln!("error: --dns-strict must be true|false");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--env" => {
                 let raw = take(&mut i).unwrap_or_default();
                 match raw.split_once('=') {
@@ -781,6 +812,8 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         dns: DnsProfile {
             mode: dns_mode,
             servers,
+            strict: dns_strict,
+            ..Default::default()
         },
         environment,
         registry: RegistryProfile::default(),

@@ -20,6 +20,29 @@ use uuid::Uuid;
 /// Default pipe name. Override with `ENVBOX_IPC_PIPE`.
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\envbox-runtime";
 pub const IPC_MAX_LINE_BYTES: usize = 8192;
+pub const IPC_IDENTITY_MAX_LINE_BYTES: usize = 32768;
+pub const RUNTIME_IDENTITY_PROTOCOL: u32 = 1;
+
+/// Facts observed after the Runtime's hook transaction committed. Counts
+/// describe attached APIs, never complete Windows/process-tree coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeIdentity {
+    pub pid: u32,
+    pub creation_time: u64,
+    pub protocol: u32,
+    pub runtime_version: String,
+    pub module_path: String,
+    pub actual_profile: String,
+    pub config_complete: bool,
+    pub hooks: Vec<(String, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedRuntimeIdentity {
+    pub identity: RuntimeIdentity,
+    pub module_sha256: String,
+    pub config_sha256: String,
+}
 pub const RUNTIME_ENVIRONMENT_MAX: usize = 32;
 pub const RUNTIME_ENVIRONMENT_ENTRY_MAX_BYTES: usize = 512;
 
@@ -38,6 +61,55 @@ pub enum IpcError {
 /// One protocol message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcMessage {
+    RegisterChild {
+        pid: u32,
+        creation_time: u64,
+        instance_id: String,
+        profile_id: String,
+        child_pid: u32,
+        child_creation_time: u64,
+    },
+    ChildBound {
+        pid: u32,
+        creation_time: u64,
+    },
+    RuntimeIdentity(RuntimeIdentity),
+    RuntimeReconnect(RuntimeIdentity),
+    RuntimeIdentityConfirm(RuntimeIdentity),
+    RuntimeIdentityConfirmed {
+        pid: u32,
+        creation_time: u64,
+    },
+    RuntimeReconnected {
+        pid: u32,
+        creation_time: u64,
+    },
+    RuntimeReconnectChallenge {
+        pid: u32,
+        creation_time: u64,
+        nonce: String,
+    },
+    RuntimeReconnectProof {
+        pid: u32,
+        creation_time: u64,
+        nonce: String,
+    },
+    StartupGateReady {
+        pid: u32,
+        creation_time: u64,
+    },
+    StartupRelease {
+        pid: u32,
+        creation_time: u64,
+    },
+    StartupGateReleased {
+        pid: u32,
+        creation_time: u64,
+    },
+    StartupGateConfirmed {
+        pid: u32,
+        creation_time: u64,
+    },
     Hello {
         pid: u32,
         instance_id: String,
@@ -58,6 +130,7 @@ pub enum IpcMessage {
         audit: bool,
         dns_mode: bool,
         dns_servers: Vec<String>,
+        dns_config: Option<envbox_core::DnsProfile>,
         registry_paths: Vec<String>,
         /// Profile environment overrides encoded as ordered key/value pairs.
         environment: Vec<(String, String)>,
@@ -96,6 +169,7 @@ pub enum IpcMessage {
         audit: bool,
         dns_mode: bool,
         dns_servers: Vec<String>,
+        dns_config: Option<envbox_core::DnsProfile>,
         registry_paths: Vec<String>,
         environment: Vec<(String, String)>,
         /// See `IpcMessage::Profile::webrtc`.
@@ -117,6 +191,19 @@ pub enum IpcMessage {
 impl IpcMessage {
     pub fn name(&self) -> &'static str {
         match self {
+            IpcMessage::RegisterChild { .. } => "REGISTER_CHILD",
+            IpcMessage::ChildBound { .. } => "CHILD_BOUND",
+            IpcMessage::RuntimeIdentity(_) => "RUNTIME_IDENTITY",
+            IpcMessage::RuntimeReconnect(_) => "RUNTIME_RECONNECT",
+            IpcMessage::RuntimeIdentityConfirm(_) => "RUNTIME_IDENTITY_CONFIRM",
+            IpcMessage::RuntimeIdentityConfirmed { .. } => "RUNTIME_IDENTITY_CONFIRMED",
+            IpcMessage::RuntimeReconnected { .. } => "RUNTIME_RECONNECTED",
+            IpcMessage::RuntimeReconnectChallenge { .. } => "RUNTIME_RECONNECT_CHALLENGE",
+            IpcMessage::RuntimeReconnectProof { .. } => "RUNTIME_RECONNECT_PROOF",
+            IpcMessage::StartupGateReady { .. } => "STARTUP_GATE_READY",
+            IpcMessage::StartupRelease { .. } => "STARTUP_RELEASE",
+            IpcMessage::StartupGateReleased { .. } => "STARTUP_GATE_RELEASED",
+            IpcMessage::StartupGateConfirmed { .. } => "STARTUP_GATE_CONFIRMED",
             IpcMessage::Hello { .. } => "HELLO",
             IpcMessage::GetProfile { .. } => "GET_PROFILE",
             IpcMessage::Profile { .. } => "PROFILE",
@@ -133,6 +220,28 @@ impl IpcMessage {
     /// Encode as one line (no trailing newline).
     pub fn encode_line(&self) -> String {
         match self {
+            IpcMessage::RuntimeReconnectChallenge { pid, creation_time, nonce }
+            | IpcMessage::RuntimeReconnectProof { pid, creation_time, nonce } => format!("{} pid={pid} creation_time={creation_time} nonce={}", self.name(), quote_value(nonce)),
+            IpcMessage::RegisterChild { pid, creation_time, instance_id, profile_id, child_pid, child_creation_time } => format!("REGISTER_CHILD pid={pid} creation_time={creation_time} instance_id={} profile_id={} child_pid={child_pid} child_creation_time={child_creation_time}", quote_value(instance_id), quote_value(profile_id)),
+            IpcMessage::ChildBound { pid, creation_time } => format!("CHILD_BOUND pid={pid} creation_time={creation_time}"),
+            IpcMessage::StartupGateReady { pid, creation_time }
+            | IpcMessage::StartupRelease { pid, creation_time }
+            | IpcMessage::StartupGateReleased { pid, creation_time }
+            | IpcMessage::StartupGateConfirmed { pid, creation_time }
+            | IpcMessage::RuntimeReconnected { pid, creation_time } => {
+                format!("{} pid={pid} creation_time={creation_time}", self.name())
+            }
+            IpcMessage::RuntimeIdentityConfirmed { pid, creation_time } => format!("{} pid={pid} creation_time={creation_time}",self.name()),
+            IpcMessage::RuntimeIdentity(id) | IpcMessage::RuntimeReconnect(id) | IpcMessage::RuntimeIdentityConfirm(id) => {
+                let mut line = format!("{} pid={} creation_time={} protocol={} version={} module_path={} actual_profile={} config_complete={}", self.name(), id.pid, id.creation_time, id.protocol, quote_value(&id.runtime_version), quote_value(&id.module_path), quote_value(&id.actual_profile), u8::from(id.config_complete));
+                for (group, count) in &id.hooks {
+                    line.push_str(&format!(
+                        " hook={}",
+                        quote_value(&format!("{group}:{count}"))
+                    ));
+                }
+                line
+            }
             IpcMessage::Hello { pid, instance_id } => {
                 format!("HELLO pid={pid} instance_id={}", quote_value(instance_id))
             }
@@ -152,6 +261,7 @@ impl IpcMessage {
                 audit,
                 dns_mode,
                 dns_servers,
+                dns_config,
                 registry_paths,
                 environment,
                 webrtc,
@@ -173,6 +283,7 @@ impl IpcMessage {
                 for d in dns_servers {
                     s.push_str(&format!(" dns_server={}", quote_value(d)));
                 }
+                append_dns_fields(&mut s, dns_config.as_ref());
                 for p in registry_paths {
                     s.push_str(&format!(" registry_path={}", quote_value(p)));
                 }
@@ -223,6 +334,7 @@ impl IpcMessage {
                 audit,
                 dns_mode,
                 dns_servers,
+                dns_config,
                 registry_paths,
                 environment,
                 webrtc,
@@ -244,6 +356,7 @@ impl IpcMessage {
                 for d in dns_servers {
                     s.push_str(&format!(" dns_server={}", quote_value(d)));
                 }
+                append_dns_fields(&mut s, dns_config.as_ref());
                 for p in registry_paths {
                     s.push_str(&format!(" registry_path={}", quote_value(p)));
                 }
@@ -284,17 +397,36 @@ impl IpcMessage {
         if line.is_empty() {
             return Err(IpcError::Protocol("empty message".into()));
         }
-        let tokens = tokenize_line(line);
+        let tokens = tokenize_line(line)?;
         if tokens.is_empty() {
             return Err(IpcError::Protocol("empty message".into()));
         }
         let name = tokens[0].clone();
+        let maximum = if name == "RUNTIME_IDENTITY"
+            || name == "RUNTIME_RECONNECT"
+            || name == "RUNTIME_IDENTITY_CONFIRM"
+        {
+            IPC_IDENTITY_MAX_LINE_BYTES
+        } else {
+            IPC_MAX_LINE_BYTES
+        };
+        if line.len() >= maximum {
+            return Err(IpcError::Protocol("IPC message exceeds wire limit".into()));
+        }
         let mut map: Vec<(String, String)> = Vec::new();
         let mut lists: HashMap<String, Vec<String>> = HashMap::new();
         for tok in &tokens[1..] {
             if let Some((k, v)) = tok.split_once('=') {
+                if k.is_empty()
+                    || (!matches!(k, "dns_server" | "registry_path" | "environment" | "hook")
+                        && lists.contains_key(k))
+                {
+                    return Err(IpcError::Protocol(format!("empty or duplicated field {k}")));
+                }
                 lists.entry(k.to_string()).or_default().push(v.to_string());
                 map.push((k.to_string(), v.to_string()));
+            } else {
+                return Err(IpcError::Protocol("field missing '='".into()));
             }
         }
         let first = |k: &str| {
@@ -312,6 +444,107 @@ impl IpcMessage {
         let list = |k: &str| lists.get(k).cloned().unwrap_or_default();
 
         Ok(match name.as_str() {
+            "REGISTER_CHILD" => IpcMessage::RegisterChild {
+                pid: get_u32("pid")?,
+                creation_time: first("creation_time")
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid creation_time".into()))?,
+                instance_id: first("instance_id"),
+                profile_id: first("profile_id"),
+                child_pid: get_u32("child_pid")?,
+                child_creation_time: first("child_creation_time")
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid child_creation_time".into()))?,
+            },
+            "CHILD_BOUND" => IpcMessage::ChildBound {
+                pid: get_u32("pid")?,
+                creation_time: first("creation_time")
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid creation_time".into()))?,
+            },
+            "STARTUP_GATE_READY"
+            | "STARTUP_RELEASE"
+            | "STARTUP_GATE_RELEASED"
+            | "STARTUP_GATE_CONFIRMED" => {
+                let pid = get_u32("pid")?;
+                let creation_time = first("creation_time")
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid gate creation_time".into()))?;
+                match name.as_str() {
+                    "STARTUP_GATE_READY" => IpcMessage::StartupGateReady { pid, creation_time },
+                    "STARTUP_RELEASE" => IpcMessage::StartupRelease { pid, creation_time },
+                    "STARTUP_GATE_RELEASED" => {
+                        IpcMessage::StartupGateReleased { pid, creation_time }
+                    }
+                    _ => IpcMessage::StartupGateConfirmed { pid, creation_time },
+                }
+            }
+            "RUNTIME_RECONNECT_CHALLENGE" | "RUNTIME_RECONNECT_PROOF" => {
+                let pid = get_u32("pid")?;
+                let creation_time = first("creation_time")
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid creation_time".into()))?;
+                let nonce = first("nonce");
+                if name == "RUNTIME_RECONNECT_CHALLENGE" {
+                    IpcMessage::RuntimeReconnectChallenge {
+                        pid,
+                        creation_time,
+                        nonce,
+                    }
+                } else {
+                    IpcMessage::RuntimeReconnectProof {
+                        pid,
+                        creation_time,
+                        nonce,
+                    }
+                }
+            }
+            "RUNTIME_RECONNECTED" => IpcMessage::RuntimeReconnected {
+                pid: get_u32("pid")?,
+                creation_time: first("creation_time")
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid creation_time".into()))?,
+            },
+            "RUNTIME_IDENTITY_CONFIRMED" => IpcMessage::RuntimeIdentityConfirmed {
+                pid: get_u32("pid")?,
+                creation_time: first("creation_time")
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid creation_time".into()))?,
+            },
+            "RUNTIME_IDENTITY" | "RUNTIME_RECONNECT" | "RUNTIME_IDENTITY_CONFIRM" => {
+                let id = RuntimeIdentity {
+                    pid: get_u32("pid")?,
+                    creation_time: first("creation_time")
+                        .parse()
+                        .map_err(|_| IpcError::Protocol("invalid creation_time".into()))?,
+                    protocol: get_u32("protocol")?,
+                    runtime_version: first("version"),
+                    module_path: first("module_path"),
+                    actual_profile: first("actual_profile"),
+                    config_complete: get_flag("config_complete"),
+                    hooks: list("hook")
+                        .into_iter()
+                        .map(|entry| {
+                            let (key, count) = entry
+                                .split_once(':')
+                                .ok_or_else(|| IpcError::Protocol("invalid hook count".into()))?;
+                            Ok((
+                                key.to_string(),
+                                count
+                                    .parse()
+                                    .map_err(|_| IpcError::Protocol("invalid hook count".into()))?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, IpcError>>()?,
+                };
+                if name == "RUNTIME_IDENTITY_CONFIRM" {
+                    IpcMessage::RuntimeIdentityConfirm(id)
+                } else if name == "RUNTIME_RECONNECT" {
+                    IpcMessage::RuntimeReconnect(id)
+                } else {
+                    IpcMessage::RuntimeIdentity(id)
+                }
+            }
             "HELLO" => IpcMessage::Hello {
                 pid: get_u32("pid")?,
                 instance_id: first("instance_id"),
@@ -332,6 +565,7 @@ impl IpcMessage {
                 audit: get_flag("audit"),
                 dns_mode: get_flag("dns_mode"),
                 dns_servers: list("dns_server"),
+                dns_config: decode_dns_fields(&map)?,
                 registry_paths: list("registry_path"),
                 environment: list("environment")
                     .into_iter()
@@ -373,6 +607,7 @@ impl IpcMessage {
                 audit: get_flag("audit"),
                 dns_mode: get_flag("dns_mode"),
                 dns_servers: list("dns_server"),
+                dns_config: decode_dns_fields(&map)?,
                 registry_paths: list("registry_path"),
                 environment: list("environment")
                     .into_iter()
@@ -426,7 +661,12 @@ pub fn profile_to_message_with_flags(
         inherit_children,
         audit,
         dns_mode: matches!(profile.dns.mode, DnsMode::VirtualView),
-        dns_servers: profile.dns.servers.iter().map(|s| s.to_string()).collect(),
+        dns_servers: Vec::new(),
+        dns_config: Some(envbox_core::DnsProfile::typed(
+            profile.dns.mode.clone(),
+            profile.dns.strict,
+            profile.dns.effective_upstreams(),
+        )),
         registry_paths: profile.registry.whitelist_paths.clone(),
         environment,
         webrtc: profile.browser.webrtc.as_str().to_string(),
@@ -443,6 +683,7 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
         tz_iana,
         dns_mode,
         dns_servers,
+        dns_config,
         registry_paths,
         environment,
         webrtc,
@@ -485,14 +726,16 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
             windows_id: tz_windows.clone(),
             iana_id: tz_iana.clone(),
         },
-        dns: envbox_core::DnsProfile {
-            mode: if *dns_mode {
-                DnsMode::VirtualView
-            } else {
-                DnsMode::Host
-            },
-            servers,
-        },
+        dns: dns_config.clone().unwrap_or_else(|| {
+            envbox_core::DnsProfile::from_servers(
+                if *dns_mode {
+                    DnsMode::VirtualView
+                } else {
+                    DnsMode::Host
+                },
+                servers,
+            )
+        }),
         environment: environment.iter().cloned().collect(),
         registry: RegistryProfile {
             whitelist_paths: registry_paths.clone(),
@@ -504,6 +747,139 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
 }
 
 /// Quote a value if it may contain spaces / quotes / be empty.
+fn append_dns_fields(line: &mut String, config: Option<&envbox_core::DnsProfile>) {
+    if let Some(config) = config {
+        match config.flat_fields() {
+            Ok(fields) => {
+                for (key, value) in fields {
+                    line.push_str(&format!(" {key}={}", quote_value(&value)));
+                }
+            }
+            Err(_) => line.push_str(" dns_config_version=invalid"),
+        }
+    }
+}
+
+fn decode_dns_fields(
+    fields: &[(String, String)],
+) -> Result<Option<envbox_core::DnsProfile>, IpcError> {
+    use envbox_core::{DnsProfile, DnsUpstream};
+    let value = |key: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let required =
+        |key: &str| value(key).ok_or_else(|| IpcError::Protocol(format!("missing {key}")));
+    let typed = fields
+        .iter()
+        .any(|(key, _)| key == "dns_strict" || key.starts_with("dns_upstream"));
+    let Some(version) = value("dns_config_version") else {
+        if typed {
+            return Err(IpcError::Protocol(
+                "typed DNS fields missing version".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    if version != "1"
+        || fields
+            .iter()
+            .any(|(key, _)| key == "dns_server" || key == "dns_servers")
+    {
+        return Err(IpcError::Protocol(
+            "unsupported or mixed DNS configuration".into(),
+        ));
+    }
+    let mode = match required("dns_mode")? {
+        "0" => DnsMode::Host,
+        "1" => DnsMode::VirtualView,
+        _ => return Err(IpcError::Protocol("invalid DNS mode".into())),
+    };
+    let strict = match required("dns_strict")? {
+        "0" => false,
+        "1" => true,
+        _ => return Err(IpcError::Protocol("invalid DNS strict flag".into())),
+    };
+    let count: usize = required("dns_upstream_count")?
+        .parse()
+        .map_err(|_| IpcError::Protocol("invalid upstream count".into()))?;
+    if count > 8 {
+        return Err(IpcError::Protocol("too many DNS upstreams".into()));
+    }
+    let mut upstreams = Vec::new();
+    for i in 0..count {
+        let field = |name: &str| required(&format!("dns_upstream_{i}_{name}"));
+        let endpoint = || -> Result<_, IpcError> {
+            Ok((
+                field("address")?
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid DNS literal address".into()))?,
+                field("port")?
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid DNS port".into()))?,
+            ))
+        };
+        upstreams.push(match field("type")? {
+            "udp" => {
+                let (address, port) = endpoint()?;
+                DnsUpstream::Udp { address, port }
+            }
+            "tcp" => {
+                let (address, port) = endpoint()?;
+                DnsUpstream::Tcp { address, port }
+            }
+            "dot" => {
+                let (address, port) = endpoint()?;
+                DnsUpstream::Dot {
+                    address,
+                    port,
+                    server_name: field("server_name")?.into(),
+                }
+            }
+            "doh" => {
+                let count: usize = field("bootstrap_count")?
+                    .parse()
+                    .map_err(|_| IpcError::Protocol("invalid bootstrap count".into()))?;
+                if count > 8 {
+                    return Err(IpcError::Protocol("too many bootstrap IPs".into()));
+                }
+                let mut bootstrap_ips = Vec::new();
+                for b in 0..count {
+                    bootstrap_ips.push(
+                        field(&format!("bootstrap_{b}"))?
+                            .parse()
+                            .map_err(|_| IpcError::Protocol("invalid bootstrap IP".into()))?,
+                    );
+                }
+                DnsUpstream::Doh {
+                    url: field("url")?.into(),
+                    bootstrap_ips,
+                }
+            }
+            _ => return Err(IpcError::Protocol("unknown DNS upstream protocol".into())),
+        });
+    }
+    let config = DnsProfile::typed(mode, strict, upstreams);
+    config
+        .validate()
+        .map_err(|e| IpcError::Protocol(e.to_string()))?;
+    let canonical = config
+        .flat_fields()
+        .map_err(|e| IpcError::Protocol(e.to_string()))?;
+    if fields
+        .iter()
+        .filter(|(key, _)| key.starts_with("dns_") && key != "dns_mode")
+        .any(|entry| !canonical.contains(entry))
+    {
+        return Err(IpcError::Protocol(
+            "unexpected or noncanonical typed DNS field".into(),
+        ));
+    }
+    Ok(Some(config))
+}
+
 fn quote_value(v: &str) -> String {
     let needs = v.is_empty()
         || v.contains(' ')
@@ -531,7 +907,7 @@ fn quote_value(v: &str) -> String {
 }
 
 /// Tokenize `MSG key=value key="quoted value"`.
-fn tokenize_line(line: &str) -> Vec<String> {
+fn tokenize_line(line: &str) -> Result<Vec<String>, IpcError> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
@@ -560,10 +936,13 @@ fn tokenize_line(line: &str) -> Vec<String> {
             _ => cur.push(c),
         }
     }
+    if in_quotes || esc {
+        return Err(IpcError::Protocol("unterminated quoted field".into()));
+    }
     if !cur.is_empty() {
         out.push(cur);
     }
-    out
+    Ok(out)
 }
 
 /// Host-side Session Registry used by the IPC / Broker server.
@@ -576,6 +955,14 @@ pub struct SessionTable {
     profiles: HashMap<String, IpcMessage>,
     /// pid → profile_id
     bindings: HashMap<u32, String>,
+    generations: HashMap<u32, u64>,
+    expected_runtimes: HashMap<u32, (std::path::PathBuf, String)>,
+    runtime_bundles: HashMap<u32, HashMap<String, (std::path::PathBuf, String)>>,
+    identities: HashMap<u32, ObservedRuntimeIdentity>,
+    // Only root observations survive exit, bounded by the session's roots.
+    exited_root_identities: HashMap<(u32, u64), ObservedRuntimeIdentity>,
+    reconnect_challenges: HashMap<u32, String>,
+    reconfirmed: HashMap<u32, u64>,
     /// pid → parent pid (session membership / Process Tracker)
     parents: HashMap<u32, u32>,
     /// live pids per profile_id
@@ -611,6 +998,25 @@ impl SessionTable {
     }
 
     pub fn bind_pid(&mut self, pid: u32, profile_id: &str) {
+        // Immutable binding: a repeated LoadLibrary or management retry cannot
+        // turn an existing process into another Profile/Instance.
+        if self
+            .bindings
+            .get(&pid)
+            .is_some_and(|bound| bound != profile_id)
+        {
+            return;
+        }
+        if let Some(created) = crate::ipc_server::process_creation_time(pid) {
+            if self
+                .generations
+                .get(&pid)
+                .is_some_and(|old| *old != created)
+            {
+                return;
+            }
+            self.generations.insert(pid, created);
+        }
         self.bindings.insert(pid, profile_id.to_string());
         self.live
             .entry(profile_id.to_string())
@@ -634,6 +1040,7 @@ impl SessionTable {
                     audit,
                     dns_mode,
                     dns_servers,
+                    dns_config,
                     registry_paths,
                     environment,
                     webrtc,
@@ -649,6 +1056,7 @@ impl SessionTable {
                     audit,
                     dns_mode,
                     dns_servers,
+                    dns_config,
                     registry_paths,
                     environment,
                     webrtc,
@@ -673,6 +1081,468 @@ impl SessionTable {
 
     pub fn profile_of(&self, pid: u32) -> Option<&str> {
         self.bindings.get(&pid).map(String::as_str)
+    }
+
+    /// Capture the immutable expected bundle before attaching. The host must
+    /// retain this bundle while a running process can still depend on it.
+    pub fn expect_runtime(&mut self, pid: u32, path: &std::path::Path) -> Result<(), IpcError> {
+        let generation = crate::ipc_server::process_creation_time(pid)
+            .ok_or_else(|| IpcError::Protocol("cannot query target generation".into()))?;
+        if self.generations.get(&pid) != Some(&generation) || !self.bindings.contains_key(&pid) {
+            return Err(IpcError::Protocol(
+                "target is not bound to this generation".into(),
+            ));
+        }
+        let path = std::fs::canonicalize(path).map_err(|e| IpcError::Io(e.to_string()))?;
+        let hash = crate::ipc_server::file_sha256(&path)?;
+        if self
+            .expected_runtimes
+            .get(&pid)
+            .is_some_and(|old| old != &(path.clone(), hash.clone()))
+        {
+            return Err(IpcError::Protocol(
+                "Runtime bundle identity conflict".into(),
+            ));
+        }
+        self.expected_runtimes.insert(pid, (path, hash));
+        let (path, hash) = self.expected_runtimes[&pid].clone();
+        let mut bundle = HashMap::new();
+        let architecture = match crate::injection::pe_arch(&path) {
+            Ok(crate::injection::PeArch::X64) => "x64",
+            Ok(crate::injection::PeArch::X86) => "x86",
+            _ => {
+                return Err(IpcError::Protocol(
+                    "unsupported Runtime bundle architecture".into(),
+                ))
+            }
+        };
+        bundle.insert(architecture.to_string(), (path.clone(), hash));
+        for (name, architecture, expected_arch) in [
+            ("envbox-runtime64.dll", "x64", crate::injection::PeArch::X64),
+            ("envbox-runtime32.dll", "x86", crate::injection::PeArch::X86),
+        ] {
+            let sibling = path.parent().unwrap().join(name);
+            if sibling.is_file() && crate::injection::pe_arch(&sibling).ok() == Some(expected_arch)
+            {
+                let sibling =
+                    std::fs::canonicalize(sibling).map_err(|e| IpcError::Io(e.to_string()))?;
+                let hash = crate::ipc_server::file_sha256(&sibling)?;
+                bundle
+                    .entry(architecture.to_string())
+                    .or_insert((sibling, hash));
+            }
+        }
+        if self
+            .runtime_bundles
+            .get(&pid)
+            .is_some_and(|old| old != &bundle)
+        {
+            return Err(IpcError::Protocol(
+                "immutable sibling Runtime bundle conflict".into(),
+            ));
+        }
+        self.runtime_bundles.insert(pid, bundle);
+        Ok(())
+    }
+
+    pub fn runtime_identity(&self, pid: u32) -> Option<&ObservedRuntimeIdentity> {
+        if self.generations.get(&pid).copied() != crate::ipc_server::process_creation_time(pid) {
+            return None;
+        }
+        self.identities.get(&pid)
+    }
+
+    /// Verify only the declared installed API set. This does not grant whole
+    /// process-tree coverage or an application-entry timing guarantee.
+    pub fn validate_runtime(&self, pid: u32) -> Result<&ObservedRuntimeIdentity, IpcError> {
+        let observed = self
+            .runtime_identity(pid)
+            .ok_or_else(|| IpcError::Timeout("RUNTIME_IDENTITY".into()))?;
+        Self::validate_observation(observed)
+    }
+
+    /// Caller must obtain this generation from its original owned process
+    /// handle. This reads a previously authenticated observation after exit;
+    /// it grants no PID binding, entry approval, or recovery authority.
+    pub fn validate_runtime_generation(
+        &self,
+        pid: u32,
+        generation: u64,
+    ) -> Result<&ObservedRuntimeIdentity, IpcError> {
+        if crate::ipc_server::process_creation_time(pid).is_some_and(|now| now != generation) {
+            return Err(IpcError::Protocol("PID generation changed".into()));
+        }
+        let observed = self
+            .identities
+            .get(&pid)
+            .filter(|id| id.identity.creation_time == generation)
+            .or_else(|| self.exited_root_identities.get(&(pid, generation)))
+            .ok_or_else(|| IpcError::Timeout("RUNTIME_IDENTITY".into()))?;
+        Self::validate_observation(observed)
+    }
+
+    fn validate_observation(
+        observed: &ObservedRuntimeIdentity,
+    ) -> Result<&ObservedRuntimeIdentity, IpcError> {
+        let id = &observed.identity;
+        if !id.config_complete {
+            return Err(IpcError::Protocol(
+                "Runtime used incomplete ENV fallback".into(),
+            ));
+        }
+        let config = IpcMessage::decode_line(&id.actual_profile)?;
+        let IpcMessage::Profile { dns_mode, .. } = config else {
+            return Err(IpcError::Protocol("invalid actual Profile".into()));
+        };
+        for (group, required) in [
+            ("time", 8),
+            ("geo", 2),
+            ("locale", 14),
+            ("language", 6),
+            ("registry", 7),
+            ("dns", if dns_mode { 15 } else { 2 }),
+            ("process", 3),
+            ("network_policy", 1),
+        ] {
+            let counts: Vec<_> = id.hooks.iter().filter(|(name, _)| name == group).collect();
+            let complete = counts.len() == 1
+                && (counts[0].1 == required || (group == "dns" && dns_mode && counts[0].1 == 16));
+            if !complete {
+                return Err(IpcError::Protocol(format!(
+                    "required hook set incomplete: {group}"
+                )));
+            }
+        }
+        Ok(observed)
+    }
+
+    /// A fresh Host challenge was answered by this authenticated generation.
+    pub fn runtime_reconfirmed(&self, pid: u32) -> bool {
+        self.reconfirmed.get(&pid).copied() == crate::ipc_server::process_creation_time(pid)
+            && self.reconfirmed.contains_key(&pid)
+            && self.validate_runtime(pid).is_ok()
+    }
+
+    /// The client acknowledged receiving release outside loader lock. This
+    /// proves an EXE entry gate only, not imported-DLL/TLS initialization.
+    pub fn startup_gate_released(&self, pid: u32) -> bool {
+        self.runtime_identity(pid).is_some_and(|observed| {
+            self.events.iter().any(|event| {
+                matches!(event, IpcMessage::StartupGateReleased { pid: p, creation_time }
+                if *p == pid && *creation_time == observed.identity.creation_time)
+            })
+        })
+    }
+
+    pub(crate) fn handle_client(
+        &mut self,
+        client: &crate::ipc_server::AuthenticatedProcess,
+        msg: &IpcMessage,
+    ) -> Option<IpcMessage> {
+        use crate::ipc_server::{process_creation_time, process_parent, protocol_denied};
+        let denied = |reason: &str| Some(protocol_denied(reason));
+        if matches!(
+            msg,
+            IpcMessage::RegisterProfile { .. } | IpcMessage::BindPid { .. }
+        ) {
+            return denied("management_command_on_bootstrap_pipe");
+        }
+        let target = match msg {
+            IpcMessage::Hello { pid, .. }
+            | IpcMessage::GetProfile { pid, .. }
+            | IpcMessage::RuntimeReady { pid }
+            | IpcMessage::HookError { pid, .. }
+            | IpcMessage::ProcessCreated { pid, .. }
+            | IpcMessage::ProcessExited { pid, .. } => *pid,
+            IpcMessage::RegisterChild { pid, .. } => *pid,
+            IpcMessage::StartupGateReady { pid, .. }
+            | IpcMessage::StartupGateReleased { pid, .. }
+            | IpcMessage::RuntimeReconnectProof { pid, .. } => *pid,
+            IpcMessage::RuntimeIdentity(id)
+            | IpcMessage::RuntimeReconnect(id)
+            | IpcMessage::RuntimeIdentityConfirm(id) => id.pid,
+            _ => return denied("unsupported_bootstrap_message"),
+        };
+        if target != client.pid && !matches!(msg, IpcMessage::ProcessExited { .. }) {
+            return denied("sender_pid_mismatch");
+        }
+        // Child bootstrap may race the parent's best-effort notice. Resolve
+        // inheritance from the OS, with the parent's original generation.
+        if !self.bindings.contains_key(&client.pid) {
+            if let Some(parent) = process_parent(client.pid) {
+                if let (Some(bound_generation), Some(current), Some(profile)) = (
+                    self.generations.get(&parent).copied(),
+                    process_creation_time(parent),
+                    self.bindings.get(&parent).cloned(),
+                ) {
+                    let inherits = matches!(
+                        self.profiles.get(&profile),
+                        Some(IpcMessage::Profile {
+                            inherit_children: true,
+                            ..
+                        })
+                    );
+                    if self.runtime_bundles.contains_key(&parent) {
+                        return denied("explicit_child_registration_required");
+                    }
+                    if inherits && bound_generation == current && current <= client.creation_time {
+                        self.bind_pid(client.pid, &profile);
+                        self.parents.insert(client.pid, parent);
+                    }
+                }
+            }
+        }
+        if self.generations.get(&client.pid) != Some(&client.creation_time)
+            || !self.bindings.contains_key(&client.pid)
+        {
+            return denied("unbound_client_generation");
+        }
+        match msg {
+            IpcMessage::RegisterChild {
+                creation_time,
+                instance_id,
+                profile_id,
+                child_pid,
+                child_creation_time,
+                ..
+            } => {
+                if *creation_time != client.creation_time
+                    || self.validate_runtime(client.pid).is_err()
+                {
+                    return denied("parent_identity_unverified");
+                }
+                let bound = &self.bindings[&client.pid];
+                let Some(IpcMessage::Profile {
+                    instance_id: expected_instance,
+                    inherit_children: true,
+                    ..
+                }) = self.profiles.get(bound)
+                else {
+                    return denied("child_inheritance_disabled");
+                };
+                if profile_id != bound
+                    || instance_id != expected_instance
+                    || process_parent(*child_pid) != Some(client.pid)
+                    || process_creation_time(*child_pid) != Some(*child_creation_time)
+                    || *child_creation_time < client.creation_time
+                {
+                    return denied("child_or_parent_snapshot_mismatch");
+                }
+                if self.bindings.get(child_pid).is_some_and(|old| old != bound)
+                    || self
+                        .generations
+                        .get(child_pid)
+                        .is_some_and(|old| old != child_creation_time)
+                    || self
+                        .parents
+                        .get(child_pid)
+                        .is_some_and(|old| *old != client.pid)
+                {
+                    return denied("child_binding_conflict");
+                }
+                let architecture = crate::capability::probe_pid(*child_pid).architecture;
+                let Some(bundle) = self.runtime_bundles.get(&client.pid).cloned() else {
+                    return denied("parent_runtime_bundle_missing");
+                };
+                let Some(expected) = bundle.get(architecture).cloned() else {
+                    return denied("child_arch_runtime_missing");
+                };
+                if crate::ipc_server::file_sha256(&expected.0).ok().as_ref() != Some(&expected.1) {
+                    return denied("child_runtime_bundle_changed");
+                }
+                if self
+                    .expected_runtimes
+                    .get(child_pid)
+                    .is_some_and(|old| old != &expected)
+                {
+                    return denied("child_runtime_identity_conflict");
+                }
+                let profile_id = bound.clone();
+                self.bind_pid(*child_pid, &profile_id);
+                self.parents.insert(*child_pid, client.pid);
+                self.expected_runtimes.insert(*child_pid, expected);
+                self.runtime_bundles.insert(*child_pid, bundle);
+                if !self.events.contains(msg) {
+                    self.events.push(msg.clone());
+                }
+                Some(IpcMessage::ChildBound {
+                    pid: *child_pid,
+                    creation_time: *child_creation_time,
+                })
+            }
+            IpcMessage::StartupGateReady { pid, creation_time } => {
+                if *creation_time != client.creation_time || self.validate_runtime(*pid).is_err() {
+                    return denied("startup_gate_identity_or_capability_mismatch");
+                }
+                self.events.push(msg.clone());
+                Some(IpcMessage::StartupRelease {
+                    pid: *pid,
+                    creation_time: *creation_time,
+                })
+            }
+            IpcMessage::StartupGateReleased { pid, creation_time } => {
+                if *creation_time != client.creation_time
+                    || self.validate_runtime(*pid).is_err()
+                    || !self.events.iter().any(|event| {
+                        matches!(event,
+                        IpcMessage::StartupGateReady { pid: p, creation_time: c }
+                        if p == pid && c == creation_time)
+                    })
+                {
+                    return denied("startup_gate_release_without_approval");
+                }
+                self.events.push(msg.clone());
+                Some(IpcMessage::StartupGateConfirmed {
+                    pid: *pid,
+                    creation_time: *creation_time,
+                })
+            }
+            IpcMessage::GetProfile { profile_id, .. } => {
+                let bound = &self.bindings[&client.pid];
+                if !profile_id.is_empty() && profile_id != bound {
+                    return denied("profile_hint_mismatch");
+                }
+                match self.profiles.get(bound) {
+                    Some(profile) if profile.encode_line().len() < IPC_MAX_LINE_BYTES => {
+                        Some(profile.clone())
+                    }
+                    Some(_) => denied("profile_exceeds_wire_limit"),
+                    None => denied("profile_missing"),
+                }
+            }
+            IpcMessage::Hello { instance_id, .. } => {
+                let Some(IpcMessage::Profile {
+                    instance_id: expected,
+                    ..
+                }) = self.profiles.get(&self.bindings[&client.pid])
+                else {
+                    return denied("profile_missing");
+                };
+                if !instance_id.is_empty() && instance_id != expected {
+                    return denied("instance_hint_mismatch");
+                }
+                self.events.push(msg.clone());
+                None
+            }
+            IpcMessage::ProcessCreated { child_pid, .. } => {
+                let inherits = matches!(
+                    self.profiles.get(&self.bindings[&client.pid]),
+                    Some(IpcMessage::Profile {
+                        inherit_children: true,
+                        ..
+                    })
+                );
+                let child_created = process_creation_time(*child_pid);
+                if !inherits
+                    || process_parent(*child_pid) != Some(client.pid)
+                    || child_created.is_none_or(|created| created < client.creation_time)
+                {
+                    return denied("child_identity_mismatch");
+                }
+                self.handle(msg)
+            }
+            IpcMessage::ProcessExited { pid, .. } => {
+                if *pid != client.pid && self.parents.get(pid) != Some(&client.pid) {
+                    return denied("exit_membership_mismatch");
+                }
+                if let Some(current) = process_creation_time(*pid) {
+                    if self.generations.get(pid) != Some(&current) {
+                        return denied("exit_generation_mismatch");
+                    }
+                }
+                self.handle(msg)
+            }
+            IpcMessage::RuntimeReconnectProof {
+                pid,
+                creation_time,
+                nonce,
+            } => {
+                if *creation_time != client.creation_time
+                    || self.validate_runtime(*pid).is_err()
+                    || self.reconnect_challenges.remove(pid).as_ref() != Some(nonce)
+                {
+                    return denied("reconnect_challenge_mismatch");
+                }
+                self.reconfirmed.insert(*pid, *creation_time);
+                self.events.push(msg.clone());
+                Some(IpcMessage::RuntimeReconnected {
+                    pid: *pid,
+                    creation_time: *creation_time,
+                })
+            }
+            IpcMessage::RuntimeIdentity(id)
+            | IpcMessage::RuntimeReconnect(id)
+            | IpcMessage::RuntimeIdentityConfirm(id) => {
+                if id.creation_time != client.creation_time
+                    || id.protocol != RUNTIME_IDENTITY_PROTOCOL
+                    || id.runtime_version != env!("CARGO_PKG_VERSION")
+                {
+                    return denied("runtime_protocol_or_generation_mismatch");
+                }
+                let Ok(actual) = IpcMessage::decode_line(&id.actual_profile) else {
+                    return denied("invalid_actual_profile");
+                };
+                let expected = self.profiles.get(&self.bindings[&client.pid]);
+                if expected != Some(&actual) {
+                    return denied("actual_profile_mismatch");
+                }
+                let Some((path, hash)) = self.expected_runtimes.get(&client.pid) else {
+                    return denied("expected_runtime_missing");
+                };
+                let actual_path = std::fs::canonicalize(&id.module_path).ok();
+                if actual_path.as_ref() != Some(path)
+                    || !crate::ipc_server::process_has_module(client.pid, path)
+                    || crate::ipc_server::file_sha256(path).ok().as_ref() != Some(hash)
+                {
+                    return denied("actual_runtime_module_mismatch");
+                }
+                if self
+                    .identities
+                    .get(&client.pid)
+                    .is_some_and(|old| &old.identity != id)
+                {
+                    return denied("immutable_runtime_identity_conflict");
+                }
+                use sha2::{Digest, Sha256};
+                let config_sha256 =
+                    format!("{:x}", Sha256::digest(actual.encode_line().as_bytes()));
+                self.identities.insert(
+                    client.pid,
+                    ObservedRuntimeIdentity {
+                        identity: id.clone(),
+                        module_sha256: hash.clone(),
+                        config_sha256,
+                    },
+                );
+                self.events.push(msg.clone());
+                if matches!(msg, IpcMessage::RuntimeReconnect(_)) {
+                    if self.validate_runtime(client.pid).is_err() {
+                        self.identities.remove(&client.pid);
+                        return denied("reconnect_capability_incomplete");
+                    }
+                    self.reconfirmed.remove(&client.pid);
+                    let nonce = uuid::Uuid::new_v4().to_string();
+                    self.reconnect_challenges.insert(client.pid, nonce.clone());
+                    Some(IpcMessage::RuntimeReconnectChallenge {
+                        pid: client.pid,
+                        creation_time: client.creation_time,
+                        nonce,
+                    })
+                } else if matches!(msg, IpcMessage::RuntimeIdentityConfirm(_)) {
+                    if self.validate_runtime(client.pid).is_err() {
+                        self.identities.remove(&client.pid);
+                        return denied("identity_capability_incomplete");
+                    }
+                    Some(IpcMessage::RuntimeIdentityConfirmed {
+                        pid: client.pid,
+                        creation_time: client.creation_time,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => self.handle(msg),
+        }
     }
 
     pub fn handle(&mut self, msg: &IpcMessage) -> Option<IpcMessage> {
@@ -714,6 +1584,7 @@ impl SessionTable {
                         audit: false,
                         dns_mode: false,
                         dns_servers: vec![],
+                        dns_config: None,
                         registry_paths: vec![],
                         environment: vec![],
                         webrtc: "host".into(),
@@ -760,6 +1631,18 @@ impl SessionTable {
                     }
                 }
                 self.bindings.remove(pid);
+                if !self.parents.contains_key(pid) {
+                    if let Some(identity) = self.identities.get(pid) {
+                        self.exited_root_identities
+                            .insert((*pid, identity.identity.creation_time), identity.clone());
+                    }
+                }
+                self.generations.remove(pid);
+                self.identities.remove(pid);
+                self.reconnect_challenges.remove(pid);
+                self.reconfirmed.remove(pid);
+                self.expected_runtimes.remove(pid);
+                self.runtime_bundles.remove(pid);
                 self.parents.remove(pid);
                 self.events.push(msg.clone());
                 None
@@ -849,6 +1732,7 @@ mod tests {
                 audit: false,
                 dns_mode: true,
                 dns_servers: vec!["1.1.1.1".into()],
+                dns_config: None,
                 registry_paths: vec!["HKCU\\Software\\EnvBox".into()],
                 environment: vec![("LANG".into(), "en_US.UTF-8".into())],
                 webrtc: "proxy_only".into(),
@@ -903,6 +1787,7 @@ mod tests {
             dns: envbox_core::DnsProfile {
                 mode: DnsMode::VirtualView,
                 servers: vec!["1.1.1.1".parse().unwrap()],
+                ..Default::default()
             },
             environment: HashMap::from([
                 ("LANG".into(), "en_US.UTF-8".into()),
@@ -944,6 +1829,7 @@ mod tests {
             dns: envbox_core::DnsProfile {
                 mode: DnsMode::Host,
                 servers: vec![],
+                ..Default::default()
             },
             environment: HashMap::new(),
             registry: RegistryProfile::default(),
@@ -989,6 +1875,7 @@ mod tests {
             dns: envbox_core::DnsProfile {
                 mode: DnsMode::Host,
                 servers: vec![],
+                ..Default::default()
             },
             environment: HashMap::new(),
             registry: RegistryProfile::default(),
@@ -1024,6 +1911,7 @@ mod tests {
             audit: false,
             dns_mode: false,
             dns_servers: vec![],
+            dns_config: None,
             registry_paths: vec![],
             environment: vec![],
             webrtc: "host".into(),
@@ -1045,6 +1933,7 @@ mod tests {
             audit: false,
             dns_mode: false,
             dns_servers: vec![],
+            dns_config: None,
             registry_paths: vec![],
             environment: vec![("LANG".into(), "en_US.UTF-8".into())],
             webrtc: "strict".into(),
@@ -1073,6 +1962,7 @@ mod tests {
             audit: false,
             dns_mode: false,
             dns_servers: vec![],
+            dns_config: None,
             registry_paths: vec![],
             environment: vec![("LANG".into(), "en_US.UTF-8".into())],
             webrtc: "host".into(),

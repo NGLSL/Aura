@@ -14,6 +14,7 @@ pub mod job;
 pub mod launcher;
 pub mod package_discovery;
 pub mod process_tracker;
+pub mod recovery;
 pub mod session;
 
 pub use activation::{
@@ -44,8 +45,12 @@ pub use package_discovery::{
     normalize_launch_target, parse_aumid, resolve_package_identity, PackageAppInfo,
 };
 pub use process_tracker::{ProcessTracker, TrackMode};
+pub use recovery::{
+    read_runtime_capabilities, request_runtime_reconnect, validate_runtime_for_profile,
+    RecoveryError, RuntimeCapabilities,
+};
 pub use session::{
-    belongs, register_child, start_session, start_session_in_named_job,
-    start_session_in_new_console, terminal_cancel_marker_path, terminal_root_marker_path,
-    SessionError, SessionHandle, SessionStartRequest,
+    belongs, register_child, start_session, start_session_gated, start_session_in_named_job,
+    start_session_in_named_job_gated, start_session_in_new_console, terminal_cancel_marker_path,
+    terminal_root_marker_path, SessionError, SessionHandle, SessionStartRequest,
 };

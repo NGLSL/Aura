@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox_doh_prototype LANGUAGES CXX)
+add_executable(envbox-doh-prototype main.cpp)
+target_compile_features(envbox-doh-prototype PRIVATE cxx_std_17)
+target_compile_definitions(envbox-doh-prototype PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+target_link_libraries(envbox-doh-prototype PRIVATE winhttp ws2_32 crypt32)

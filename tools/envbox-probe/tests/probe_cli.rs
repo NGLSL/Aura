@@ -8,6 +8,19 @@ fn probe_exe() -> Command {
 }
 
 #[test]
+fn dns_rr_rejects_invalid_query_type_or_api() {
+    for args in [
+        vec!["--dns-rr"],
+        vec!["--dns-rr", "localhost", "65536", "a"],
+        vec!["--dns-rr", "localhost", "65", "bad"],
+    ] {
+        let output = probe_exe().args(args).output().expect("run RR probe");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("usage: --dns-rr"));
+    }
+}
+
+#[test]
 fn host_snapshot_prints_all_ticket01_sections() {
     let output = probe_exe().output().expect("run probe");
     assert!(output.status.success(), "probe failed: {output:?}");
@@ -91,7 +104,10 @@ fn resolve_flag_prints_getaddrinfo_section() {
         .expect("run probe --resolve");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("=== RESOLVE ==="), "missing RESOLVE:\n{stdout}");
+    assert!(
+        stdout.contains("=== RESOLVE ==="),
+        "missing RESOLVE:\n{stdout}"
+    );
     assert!(stdout.contains("getaddrinfo:"), "missing key:\n{stdout}");
     // localhost must resolve to a loopback address on Host.
     let value = stdout

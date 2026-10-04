@@ -1,0 +1,17 @@
+[package]
+name = "envbox-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+sha2 = "0.10"
+envbox-core.workspace = true
+envbox-storage.workspace = true
+envbox-launcher.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp"] }

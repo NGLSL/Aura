@@ -2,8 +2,8 @@
 //! UI workflows are split into child modules; injection logic never lives here.
 
 use envbox_core::{
-    Application, AuditEvent, BrowserPrivacyProfile, DnsProfile, EnvironmentProfile,
-    ConsoleHost, InstanceStatus, LaunchTarget, LocaleProfile, RegistryProfile, TimezoneProfile,
+    Application, AuditEvent, BrowserPrivacyProfile, ConsoleHost, EnvironmentProfile,
+    InstanceStatus, LaunchTarget, LocaleProfile, RegistryProfile, TimezoneProfile,
 };
 use envbox_launcher::{format_args, parse_args, InstanceManager, RunTarget};
 use envbox_storage::{
@@ -15,9 +15,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub mod dns_editor;
 mod picker;
 mod update;
 mod window;
+pub mod workspace_management;
+mod workspaces;
 
 use crate::close_behavior::{self, CloseBehavior};
 use crate::message::{ComboField, DnsChoice, LaunchKind, Message, Nav, StatusKind, WebRtcChoice};
@@ -70,7 +73,7 @@ pub struct ProfileDraft {
     pub tz: String,
     pub tz_iana: String,
     pub dns_mode: DnsChoice,
-    pub dns_servers: String,
+    pub dns_editor: dns_editor::DnsEditor,
     pub webrtc: WebRtcChoice,
     pub env: String,
 }
@@ -84,6 +87,8 @@ pub enum RunSelection {
 
 #[derive(Clone, Copy)]
 enum PendingNavigation {
+    Workspace(Option<Uuid>),
+    WorkspaceRefresh,
     Nav(Nav),
     App(Uuid),
     Profile(Uuid),
@@ -99,6 +104,8 @@ pub struct EnvBoxApp {
     pub search: String,
     pub applications: Vec<Application>,
     pub profiles: Vec<EnvironmentProfile>,
+    pub workspaces: workspaces::WorkspaceState,
+    pub workspace_management: workspace_management::ManagementState,
     pub timezones: Vec<String>,
     pub instances: InstanceManager,
     pub app_draft: AppDraft,
@@ -159,7 +166,10 @@ impl EnvBoxApp {
             .load_applications()
             .map(|d| d.applications)
             .unwrap_or_default();
-        let profiles = store.load_profiles().map(|d| d.profiles).unwrap_or_default();
+        let profiles = store
+            .load_profiles()
+            .map(|d| d.profiles)
+            .unwrap_or_default();
         let timezones = enumerate_dynamic_timezone_ids();
         let app_draft = AppDraft::blank(profiles.first().map(|p| p.id).unwrap_or_default());
         let tz = timezones
@@ -178,11 +188,18 @@ impl EnvBoxApp {
             tz,
             tz_iana,
             dns_mode: DnsChoice::Host,
-            dns_servers: String::new(),
+            dns_editor: Default::default(),
             webrtc: WebRtcChoice::Host,
             env: String::new(),
         };
         let close_behavior = close_behavior::load(store.root());
+        let workspaces = workspaces::WorkspaceState::load(
+            &store,
+            profiles
+                .first()
+                .map(|profile| profile.id)
+                .unwrap_or_default(),
+        );
         let app_capabilities = applications
             .iter()
             .map(|a| (a.id, capability_for_app(a)))
@@ -193,6 +210,8 @@ impl EnvBoxApp {
             search: String::new(),
             applications,
             profiles,
+            workspaces,
+            workspace_management: Default::default(),
             timezones,
             instances: InstanceManager::new(),
             app_saved_draft: app_draft.clone(),
@@ -233,7 +252,8 @@ impl EnvBoxApp {
             let id = first.id;
             app.select_app(id);
         }
-        (app, icons_task)
+        let management_task = app.workspace_list();
+        (app, Task::batch([icons_task, management_task]))
     }
 
     pub fn select_app(&mut self, id: Uuid) {
@@ -292,12 +312,15 @@ impl EnvBoxApp {
 
     fn has_unsaved_edits(&self) -> bool {
         match self.nav {
+            Nav::Workspaces => self.workspaces.dirty(),
             Nav::Apps => {
                 self.app_edit_mode
                     && (self.app_draft != self.app_saved_draft
                         || (self.app_draft.id.is_none() && !self.app_draft.name.is_empty()))
             }
-            Nav::Profiles => self.profile_edit_mode && self.profile_draft != self.profile_saved_draft,
+            Nav::Profiles => {
+                self.profile_edit_mode && self.profile_draft != self.profile_saved_draft
+            }
             _ => false,
         }
     }
@@ -314,6 +337,52 @@ impl EnvBoxApp {
 
     fn perform_navigation(&mut self, action: PendingNavigation) -> Task<Message> {
         match action {
+            PendingNavigation::Workspace(id) => {
+                self.workspace_management.selection_changed();
+                self.workspaces.select(
+                    id,
+                    self.profiles
+                        .first()
+                        .map(|profile| profile.id)
+                        .unwrap_or_default(),
+                );
+                self.workspace_list()
+            }
+            PendingNavigation::WorkspaceRefresh => {
+                self.workspace_management.selection_changed();
+                let selected = self.workspaces.selected;
+                self.workspaces = workspaces::WorkspaceState::load(
+                    &self.store,
+                    self.profiles
+                        .first()
+                        .map(|profile| profile.id)
+                        .unwrap_or_default(),
+                );
+                match self.store.load_profiles() {
+                    Ok(doc) => self.profiles = doc.profiles,
+                    Err(err) => self.workspaces.error = Some(err.to_string()),
+                }
+                if let Some(id) = selected.filter(|id| {
+                    self.workspaces
+                        .document
+                        .containers
+                        .iter()
+                        .any(|value| value.id == *id)
+                }) {
+                    self.workspaces.select(
+                        Some(id),
+                        self.profiles
+                            .first()
+                            .map(|profile| profile.id)
+                            .unwrap_or_default(),
+                    );
+                }
+                match self.store.load_applications() {
+                    Ok(doc) => self.applications = doc.applications,
+                    Err(err) => self.workspaces.error = Some(err.to_string()),
+                }
+                self.workspace_list()
+            }
             PendingNavigation::Nav(nav) => {
                 let previous_nav = self.nav;
                 self.nav = nav;
@@ -332,6 +401,9 @@ impl EnvBoxApp {
                     if let Some(id) = self.applications.first().map(|app| app.id) {
                         self.select_app(id);
                     }
+                }
+                if nav == Nav::Workspaces {
+                    return self.workspace_list();
                 }
                 Task::none()
             }
@@ -388,7 +460,7 @@ impl EnvBoxApp {
             tz,
             tz_iana,
             dns_mode: DnsChoice::Host,
-            dns_servers: String::new(),
+            dns_editor: Default::default(),
             webrtc: WebRtcChoice::Host,
             env: String::new(),
         }
@@ -448,7 +520,12 @@ impl EnvBoxApp {
 
     /// Display label for an audit row: configured app name if image matches, else image, else PID.
     pub fn audit_software_label(&self, ev: &AuditEvent) -> String {
-        if let Some(img) = ev.image.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(img) = ev
+            .image
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             for a in &self.applications {
                 let matches = match &a.launch {
                     envbox_core::LaunchTarget::Executable { path } => path
@@ -631,6 +708,43 @@ impl EnvBoxApp {
                 }
             }
             Message::Search(v) => self.search = v,
+            Message::WorkspaceNew => {
+                return self.request_navigation(PendingNavigation::Workspace(None));
+            }
+            Message::WorkspaceSelect(id) => {
+                return self.request_navigation(PendingNavigation::Workspace(Some(id)));
+            }
+            Message::WorkspaceRefresh => {
+                return self.request_navigation(PendingNavigation::WorkspaceRefresh);
+            }
+            Message::WorkspaceName(value) => self.workspaces.draft.name = value,
+            Message::WorkspaceProfile(id) => self.workspaces.draft.profile_id = id,
+            Message::WorkspaceCancel => self.workspaces.discard(),
+            Message::WorkspaceSave => return self.save_workspace(),
+            Message::WorkspaceApplication(id) => {
+                self.workspace_management.application_id = Some(id)
+            }
+            Message::WorkspaceRun => return self.workspace_run(),
+            Message::WorkspaceList => return self.workspace_list(),
+            Message::WorkspaceStop(id) => return self.workspace_stop(Some(id)),
+            Message::WorkspaceStopAll => return self.workspace_stop(None),
+            Message::WorkspaceRunStatus => return self.workspace_run_status(),
+            Message::WorkspaceManagementResult(value) => {
+                return self.finish_workspace_management(value)
+            }
+            Message::WorkspaceRuleTarget(value) => self.workspaces.rule_draft.target = value,
+            Message::WorkspaceRuleAction(value) => self.workspaces.rule_draft.action = value,
+            Message::WorkspaceRulePath(value) => self.workspaces.rule_draft.path = value,
+            Message::WorkspaceRuleAdd => {
+                if let Err(err) = self.workspaces.add_rule(&self.store) {
+                    self.workspaces.error = Some(err);
+                }
+            }
+            Message::WorkspaceRuleRemove(index) => {
+                if index < self.workspaces.draft.storage_policy.rules.len() {
+                    self.workspaces.draft.storage_policy.rules.remove(index);
+                }
+            }
             Message::AppNew => return self.request_navigation(PendingNavigation::NewApp),
             Message::AppPickerQuery(q) => {
                 if let Some(p) = self.app_picker.as_mut() {
@@ -740,7 +854,9 @@ impl EnvBoxApp {
             Message::AppDelete => return self.delete_app(),
             Message::AppRunId(id) => return self.run_app(id, RunSelection::Default),
             Message::AppRunWithId(id, profile_id) => {
-                let selection = profile_id.map(RunSelection::Profile).unwrap_or(RunSelection::Host);
+                let selection = profile_id
+                    .map(RunSelection::Profile)
+                    .unwrap_or(RunSelection::Host);
                 return self.run_app(id, selection);
             }
             Message::ProfileName(v) => self.profile_draft.name = v,
@@ -748,13 +864,43 @@ impl EnvBoxApp {
             Message::ProfileUi(v) => self.profile_draft.ui = v,
             Message::ProfileRegion(v) => self.profile_draft.region = v,
             Message::ProfileTz(v) => {
-                self.profile_draft.tz_iana =
-                    windows_id_to_iana(&v).unwrap_or_default().to_string();
+                self.profile_draft.tz_iana = windows_id_to_iana(&v).unwrap_or_default().to_string();
                 self.profile_draft.tz = v;
             }
             Message::ProfileTzIana(v) => self.profile_draft.tz_iana = v,
             Message::ProfileDnsMode(m) => self.profile_draft.dns_mode = m,
-            Message::ProfileDnsServers(v) => self.profile_draft.dns_servers = v,
+            Message::ProfileDnsStrict(value) => self.profile_draft.dns_editor.strict = value,
+            Message::ProfileDnsTransport(value) => {
+                self.profile_draft.dns_editor.draft = dns_editor::UpstreamDraft::default();
+                self.profile_draft.dns_editor.draft.transport = value;
+                if value == dns_editor::TransportChoice::Dot {
+                    self.profile_draft.dns_editor.draft.port = "853".into();
+                }
+            }
+            Message::ProfileDnsAddress(value) => {
+                self.profile_draft.dns_editor.draft.address = value
+            }
+            Message::ProfileDnsPort(value) => self.profile_draft.dns_editor.draft.port = value,
+            Message::ProfileDnsServerName(value) => {
+                self.profile_draft.dns_editor.draft.server_name = value
+            }
+            Message::ProfileDnsUrl(value) => self.profile_draft.dns_editor.draft.url = value,
+            Message::ProfileDnsBootstrap(value) => {
+                self.profile_draft.dns_editor.draft.bootstrap = value
+            }
+            Message::ProfileDnsAdd => {
+                if let Err(err) = self.profile_draft.dns_editor.add() {
+                    self.set_status(StatusKind::Error, format!("上游配置失败：{err}"));
+                }
+            }
+            Message::ProfileDnsRemove(index) => {
+                if index < self.profile_draft.dns_editor.upstreams.len() {
+                    self.profile_draft.dns_editor.upstreams.remove(index);
+                }
+            }
+            Message::ProfileDnsMove(index, upward) => {
+                self.profile_draft.dns_editor.move_upstream(index, upward)
+            }
             Message::ProfileWebRtc(c) => self.profile_draft.webrtc = c,
             Message::ProfileEnv(v) => self.profile_draft.env = v,
             Message::ComboToggle(field) => self.open_combo(field),
@@ -857,7 +1003,14 @@ impl EnvBoxApp {
                 if let Some(p) = probe_path {
                     let probe_str = p.display().to_string();
                     let spawn_res = std::process::Command::new("cmd.exe")
-                        .args(["/C", "start", "Aura · EnvBox Probe", "cmd.exe", "/K", &probe_str])
+                        .args([
+                            "/C",
+                            "start",
+                            "Aura · EnvBox Probe",
+                            "cmd.exe",
+                            "/K",
+                            &probe_str,
+                        ])
                         .spawn();
                     if spawn_res.is_ok() {
                         self.set_status(StatusKind::Success, "已在独立控制台中运行环境探针");
@@ -865,15 +1018,16 @@ impl EnvBoxApp {
                         self.set_status(StatusKind::Error, "运行环境探针启动失败");
                     }
                 } else {
-                    self.set_status(StatusKind::Error, "未找到 envbox-probe.exe，请先通过 cargo build 构建探针");
+                    self.set_status(
+                        StatusKind::Error,
+                        "未找到 envbox-probe.exe，请先通过 cargo build 构建探针",
+                    );
                 }
             }
             Message::CheckUpdate => return self.start_update_check(),
             Message::UpdateResult(result) => return self.finish_update_check(result),
             Message::InstallUpdate => return self.start_update_install(),
-            Message::UpdateDownloadResult(result) => {
-                return self.finish_update_download(result)
-            }
+            Message::UpdateDownloadResult(result) => return self.finish_update_download(result),
             Message::UpdateInstallResult(result) => return self.finish_update_install(result),
             Message::OpenReleases => return self.open_releases(),
             Message::OpenRepository => return self.open_repository(),
@@ -888,6 +1042,7 @@ impl EnvBoxApp {
                 };
                 self.unsaved_error = None;
                 match self.nav {
+                    Nav::Workspaces => self.workspaces.discard(),
                     Nav::Apps => {
                         self.app_draft = self.app_saved_draft.clone();
                         self.app_edit_mode = false;
@@ -908,6 +1063,7 @@ impl EnvBoxApp {
                 // "create a Profile, then add an app" continuation.
                 self.resume_new_app = false;
                 let save_task = match self.nav {
+                    Nav::Workspaces => self.save_workspace(),
                     Nav::Apps => self.save_app(),
                     Nav::Profiles => self.save_profile(),
                     _ => Task::none(),
@@ -921,9 +1077,8 @@ impl EnvBoxApp {
                 return Task::batch([save_task, self.perform_navigation(action)]);
             }
             Message::WindowDrag => {
-                return iced::window::get_latest().then(|id| {
-                    id.map(iced::window::drag).unwrap_or_else(Task::none)
-                })
+                return iced::window::get_latest()
+                    .then(|id| id.map(iced::window::drag).unwrap_or_else(Task::none))
             }
             Message::WindowMinimize => {
                 return iced::window::get_latest().then(|id| {
@@ -953,10 +1108,13 @@ impl EnvBoxApp {
                         self.remember_close_choice = false;
                         self.set_status(StatusKind::Success, "下次关闭 Aura 时将重新询问");
                     }
-                    Err(err) => self.set_status(StatusKind::Error, format!("保存关闭设置失败：{err}")),
+                    Err(err) => {
+                        self.set_status(StatusKind::Error, format!("保存关闭设置失败：{err}"))
+                    }
                 }
             }
-            Message::WindowTrayPoll => {
+            Message::WindowTrayPoll =>
+            {
                 #[cfg(windows)]
                 if let Some(tray) = &self.tray {
                     match tray.poll() {
@@ -1053,7 +1211,8 @@ impl EnvBoxApp {
                 self.app_draft.id = Some(app.id);
                 self.app_saved_draft = self.app_draft.clone();
                 self.app_edit_mode = false;
-                self.app_capabilities.insert(app.id, capability_for_app(&app));
+                self.app_capabilities
+                    .insert(app.id, capability_for_app(&app));
                 self.set_status(StatusKind::Success, "应用已保存");
                 return self.refresh_app_icons();
             }
@@ -1077,7 +1236,10 @@ impl EnvBoxApp {
                     self.select_app(next_id);
                 } else {
                     self.app_draft = AppDraft::blank(
-                        self.profiles.first().map(|profile| profile.id).unwrap_or_default(),
+                        self.profiles
+                            .first()
+                            .map(|profile| profile.id)
+                            .unwrap_or_default(),
                     );
                     self.app_saved_draft = self.app_draft.clone();
                     self.app_edit_mode = false;
@@ -1099,7 +1261,11 @@ impl EnvBoxApp {
                 if capability.injection == crate::package::InjectionSupport::Unsupported {
                     self.set_status(
                         StatusKind::Error,
-                        format!("「{}」无法使用环境配置启动。{}", app.name, capability.user_explanation()),
+                        format!(
+                            "「{}」无法使用环境配置启动。{}",
+                            app.name,
+                            capability.user_explanation()
+                        ),
                     );
                     return Task::none();
                 }
@@ -1151,27 +1317,26 @@ impl EnvBoxApp {
             self.set_status(StatusKind::Error, "程序所在目录不存在");
             return;
         };
-        if let Err(err) = std::process::Command::new("explorer.exe").arg(folder).spawn() {
+        if let Err(err) = std::process::Command::new("explorer.exe")
+            .arg(folder)
+            .spawn()
+        {
             self.set_status(StatusKind::Error, format!("打开程序位置失败：{err}"));
         }
     }
 
     fn save_profile(&mut self) -> Task<Message> {
-        let mut servers = Vec::new();
-        for tok in self
+        let dns = match self
             .profile_draft
-            .dns_servers
-            .split(|c| c == ',' || c == ' ' || c == ';')
-            .filter(|s| !s.is_empty())
+            .dns_editor
+            .to_profile(self.profile_draft.dns_mode.to_mode())
         {
-            match tok.parse() {
-                Ok(ip) => servers.push(ip),
-                Err(_) => {
-                    self.set_status(StatusKind::Error, format!("保存失败：无效 DNS 服务器 {tok:?}"));
-                    return Task::none();
-                }
+            Ok(dns) => dns,
+            Err(err) => {
+                self.set_status(StatusKind::Error, format!("保存失败：{err}"));
+                return Task::none();
             }
-        }
+        };
         let mut environment = HashMap::new();
         for line in self
             .profile_draft
@@ -1211,10 +1376,7 @@ impl EnvBoxApp {
                 windows_id: self.profile_draft.tz.clone(),
                 iana_id: self.profile_draft.tz_iana.trim().to_string(),
             },
-            dns: DnsProfile {
-                mode: self.profile_draft.dns_mode.to_mode(),
-                servers,
-            },
+            dns,
             environment,
             registry: RegistryProfile::default(),
             browser: BrowserPrivacyProfile {
@@ -1225,7 +1387,13 @@ impl EnvBoxApp {
             self.set_status(StatusKind::Error, format!("保存失败: {err}"));
             return Task::none();
         }
-        let mut doc = self.store.load_profiles().unwrap_or_default();
+        let mut doc = match self.store.load_profiles() {
+            Ok(doc) => doc,
+            Err(err) => {
+                self.set_status(StatusKind::Error, format!("读取配置失败：{err}"));
+                return Task::none();
+            }
+        };
         if let Some(slot) = doc.profiles.iter_mut().find(|p| p.id == profile.id) {
             *slot = profile.clone();
         } else {
@@ -1304,13 +1472,7 @@ pub fn profile_to_draft(p: &EnvironmentProfile) -> ProfileDraft {
         tz: p.timezone.windows_id.clone(),
         tz_iana: p.timezone.iana_id.clone(),
         dns_mode: DnsChoice::from_mode(&p.dns.mode),
-        dns_servers: p
-            .dns
-            .servers
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
+        dns_editor: dns_editor::DnsEditor::from_profile(&p.dns),
         webrtc: WebRtcChoice::from_policy(&p.browser.webrtc),
         env: p
             .environment

@@ -5,6 +5,7 @@ members = [
     "crates/envbox-storage",
     "crates/envbox-launcher",
     "crates/envbox-broker",
+    "crates/envbox-supervisor",
     "crates/envbox-cli",
     "crates/envbox-app",
     "tools/envbox-probe",
@@ -23,6 +24,7 @@ envbox-core = { path = "crates/envbox-core" }
 envbox-storage = { path = "crates/envbox-storage" }
 envbox-launcher = { path = "crates/envbox-launcher" }
 envbox-broker = { path = "crates/envbox-broker" }
+envbox-supervisor = { path = "crates/envbox-supervisor" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

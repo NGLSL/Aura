@@ -149,6 +149,7 @@ pub fn icon<'a>(name: Icon, color: Color, size: f32) -> svg::Svg<'a, iced::Theme
 pub fn nav_icon_for(nav: Nav) -> Icon {
     match nav {
         Nav::Apps => Icon::Apps,
+        Nav::Workspaces => Icon::Profiles,
         Nav::Profiles => Icon::Profiles,
         Nav::Instances => Icon::Instances,
         Nav::Audit => Icon::Audit,

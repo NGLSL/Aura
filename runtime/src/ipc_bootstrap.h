@@ -35,6 +35,17 @@
 //                                   [registry_path=<string>]*
 //                                   [environment=<NAME=value>]*
 //   RUNTIME_READY   Client -> Host  pid=<u32>
+//                   Legacy notice only; never proves installed capabilities.
+//   RUNTIME_IDENTITY Client -> Host pid=<u32> creation_time=<u64> protocol=1
+//                   version=<product version> module_path=<actual DLL path>
+//                   actual_profile=<encoded actual PROFILE> config_complete=0|1
+//                   [hook=<group:attached_count>]* (up to 32 KiB).
+//   STARTUP_GATE_READY Client -> Host pid= creation_time=
+//   STARTUP_RELEASE Host -> Client pid= creation_time= (identity validated)
+//   STARTUP_GATE_RELEASED Client -> Host pid= creation_time= (receipt ACK)
+//   STARTUP_GATE_CONFIRMED Host -> Client pid= creation_time=
+//                   All four run outside loader lock on one connection.
+//                   This guards EXE entry, not imported DLL initializers.
 //   HOOK_ERROR      Client -> Host  pid=<u32> api=<string> code=<u32>
 //                                   [detail=<string>]
 //   PROCESS_CREATED Client -> Host  pid=<u32> child_pid=<u32> [image=<string>]
@@ -64,7 +75,17 @@
 int EnvBoxIpcFetchProfile(RuntimeProfile* out);
 
 // Best-effort RUNTIME_READY {pid}. No-op on any failure.
-void EnvBoxIpcNotifyRuntimeReady(void);
+void EnvBoxIpcNotifyRuntimeReady(void);  // Legacy, deliberately unverified.
+// Outside loader lock only: the authenticated Host must approve the actual
+// runtime identity before EXE entry. Failure is fatal to an enabled gate.
+int EnvBoxIpcAwaitStartupRelease();
+extern "C" DWORD WINAPI EnvBoxRuntimeReconnect(void* parameter);
+// Query-only ownership escrow preserves a named Job across Host restarts.
+int EnvBoxRecoveryJobOpen();
+void EnvBoxRecoveryJobClose();
+// Actual installed facts, emitted only after a successful hook commit.
+int EnvBoxIpcNotifyRuntimeIdentity(HINSTANCE module, const int* counts,
+                                    size_t count);
 
 // Best-effort HOOK_ERROR for hooks (Fail Open; never fatal).
 void EnvBoxIpcNotifyHookError(const char* api_utf8, unsigned long code,
@@ -75,6 +96,9 @@ void EnvBoxIpcNotifyHookError(const char* api_utf8, unsigned long code,
 // the Profile before the injected Runtime asks for it during DllMain.
 void EnvBoxIpcNotifyProcessCreated(unsigned long child_pid,
                                    const char* image_utf8);
+// Controlled startup: a successful notice is not enough. Require an ACK
+// binding the child's OS generation to the parent's immutable bundle.
+int EnvBoxIpcRegisterChild(HANDLE child, unsigned long child_pid);
 void EnvBoxIpcNotifyProcessExited(unsigned long exit_code);
 void EnvBoxIpcNotifyProcessExitedPid(unsigned long pid,
                                     unsigned long exit_code);

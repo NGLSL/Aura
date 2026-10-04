@@ -244,7 +244,12 @@ fn acceptance_tool_matrix_short_commands() {
     let profile_id = make_us_profile(&root);
 
     // cmd
-    let cmd_out = run_capture(&root, &profile_id, "cmd", &["/c", "echo %ENVBOX_ACCEPTANCE%"]);
+    let cmd_out = run_capture(
+        &root,
+        &profile_id,
+        "cmd",
+        &["/c", "echo %ENVBOX_ACCEPTANCE%"],
+    );
     assert!(cmd_out.contains("us-profile"), "cmd env: {cmd_out}");
 
     // powershell
@@ -278,7 +283,10 @@ fn acceptance_tool_matrix_short_commands() {
         &root,
         &profile_id,
         "python",
-        &["-c", "import os; print(os.environ.get('ENVBOX_ACCEPTANCE'))"],
+        &[
+            "-c",
+            "import os; print(os.environ.get('ENVBOX_ACCEPTANCE'))",
+        ],
     );
     assert!(py_out.contains("us-profile"), "python env: {py_out}");
 
@@ -287,9 +295,17 @@ fn acceptance_tool_matrix_short_commands() {
         &root,
         &profile_id,
         "cmd",
-        &["/c", "node", "-e", "console.log(process.env.ENVBOX_ACCEPTANCE)"],
+        &[
+            "/c",
+            "node",
+            "-e",
+            "console.log(process.env.ENVBOX_ACCEPTANCE)",
+        ],
     );
-    assert!(child_node.contains("us-profile"), "child node env: {child_node}");
+    assert!(
+        child_node.contains("us-profile"),
+        "child node env: {child_node}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -361,10 +377,11 @@ fn acceptance_notepad_launch_and_stop() {
         dns: DnsProfile {
             mode: DnsMode::Host,
             servers: vec![],
+            ..Default::default()
         },
         environment: HashMap::new(),
         registry: RegistryProfile::default(),
-            browser: Default::default(),
+        browser: Default::default(),
     };
     let app = Application {
         id: Uuid::new_v4(),
@@ -386,7 +403,10 @@ fn acceptance_notepad_launch_and_stop() {
         .expect("notepad launch under Profile");
     let st = mgr.refresh(id).expect("refresh");
     assert!(
-        matches!(st, InstanceStatus::Running | InstanceStatus::Starting | InstanceStatus::Exited),
+        matches!(
+            st,
+            InstanceStatus::Running | InstanceStatus::Starting | InstanceStatus::Exited
+        ),
         "unexpected status {st:?}"
     );
     mgr.stop(id).expect("stop notepad tree");
@@ -417,7 +437,17 @@ print("DONE")
     assert!(out.contains("DONE"), "{out}");
     // Git metadata readable when repo present
     if PathBuf::from(r"D:\Project\Aura\.git").exists() {
-        let git = run_capture(&root, &profile_id, "git", &["-C", r"D:\Project\Aura", "rev-parse", "--is-inside-work-tree"]);
+        let git = run_capture(
+            &root,
+            &profile_id,
+            "git",
+            &[
+                "-C",
+                r"D:\Project\Aura",
+                "rev-parse",
+                "--is-inside-work-tree",
+            ],
+        );
         assert!(git.contains("true"), "git repo access: {git}");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -442,7 +472,12 @@ fn acceptance_host_config_unchanged_after_matrix() {
     assert!(run.status.success());
 
     let _ = run_capture(&root, &profile_id, "cmd", &["/c", "exit", "0"]);
-    let _ = run_capture(&root, &profile_id, "powershell", &["-NoProfile", "-Command", "exit 0"]);
+    let _ = run_capture(
+        &root,
+        &profile_id,
+        "powershell",
+        &["-NoProfile", "-Command", "exit 0"],
+    );
     let _ = run_capture(&root, &profile_id, "git", &["--version"]);
     let _ = run_capture(&root, &profile_id, "node", &["-e", "process.exit(0)"]);
     let _ = run_capture(&root, &profile_id, "python", &["-c", "raise SystemExit(0)"]);

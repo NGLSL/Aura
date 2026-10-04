@@ -8,7 +8,9 @@ use crate::icons::{icon, Icon};
 use crate::message::{Message, StatusKind};
 use crate::theme::{self, win_button, win_close_button, MUTED, WINDOW};
 
-use super::{apps, audit, close_dialog, detail, instances, nav, picker, profiles, settings, unsaved_dialog};
+use super::{
+    apps, audit, close_dialog, detail, instances, nav, picker, profiles, settings, unsaved_dialog,
+};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::message::Nav;
@@ -17,7 +19,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         Nav::Apps | Nav::Profiles => {
             row![nav::view(app), center(app), detail::view(app)].spacing(0)
         }
-        Nav::Instances | Nav::Audit | Nav::Settings => {
+        Nav::Workspaces | Nav::Instances | Nav::Audit | Nav::Settings => {
             row![nav::view(app), center_full(app)].spacing(0)
         }
     };
@@ -70,10 +72,7 @@ fn status_banner(app: &EnvBoxApp) -> Element<'_, Message> {
     };
     container(
         row![
-            text(&app.status)
-                .size(12)
-                .color(foreground)
-                .width(Fill),
+            text(&app.status).size(12).color(foreground).width(Fill),
             button(icon(Icon::Close, foreground, 11.0))
                 .on_press(Message::StatusDismiss)
                 .style(win_button)
@@ -109,12 +108,9 @@ fn title_bar() -> Element<'static, Message> {
     ]
     .spacing(2);
 
-    let bar = row![
-        Space::with_width(Length::Fill),
-        controls,
-    ]
-    .align_y(iced::Alignment::Center)
-    .padding(Padding::from([6, 8]));
+    let bar = row![Space::with_width(Length::Fill), controls,]
+        .align_y(iced::Alignment::Center)
+        .padding(Padding::from([6, 8]));
 
     // Entire strip is draggable except the control buttons.
     mouse_area(
@@ -149,6 +145,7 @@ fn center_full(app: &EnvBoxApp) -> Element<'_, Message> {
         Nav::Instances => instances::view_full(app),
         Nav::Audit => audit::view_full(app),
         Nav::Settings => settings::view(app),
+        Nav::Workspaces => super::workspaces::view(app),
         _ => apps::view_center(app),
     };
 

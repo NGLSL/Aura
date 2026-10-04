@@ -34,6 +34,8 @@ Runtime injection is process-scoped and runs at EnvBox’s integrity level. A ta
 
 ## Quick start
 
+Install [rustup](https://rustup.rs/) with the Windows MSVC toolchain. This repository pins Rust 1.99.0 in `rust-toolchain.toml`; Cargo selects it automatically. CI and installer workflows use the same version.
+
 ```powershell
 # Rust development build
 cargo build
@@ -74,9 +76,17 @@ Extra launch latency target: ideal &lt; 100 ms, acceptable &lt; 300 ms. Runtime 
 ## Scope notes
 
 - Virtual timezone, real timeline (never hook `GetSystemTime` / QPC / TickCount)
-- DNS View only — no packet redirection
+- DNS configuration view and process-scoped Windows resolver routing — no packet redirection
 - Registry Virtual View is whitelist-only — not a registry sandbox
 - No anti-stealth / anti-detection goals
+
+### DNS routing
+
+With `VirtualView` and working DNS hooks, supported `DnsQuery_A/W/UTF8` and version-1 `DnsQueryEx` queries send every resource-record type to the Profile DNS servers, including HTTPS (65), SVCB (64), TXT, PTR, SRV and unknown types. Responses are decoded by Windows' DNS message parser; record formats depend on the installed Windows version. Profile timeouts, DNS errors and unsupported query inputs return an error instead of retrying through host DNS. Query names currently require ASCII (including pre-encoded IDN punycode); Unicode names return an error. `Host` mode keeps Windows resolution unchanged.
+
+Profile DNS uses an explicit ordered list of UDP, TCP or DoT upstreams and requires `strict = true`. UDP truncation retries over TCP to the same endpoint. DoT connects to a literal IP, verifies the configured certificate identity and fails closed when local certificate or revocation checks cannot establish trust. A plaintext fallback occurs only when you configure a later UDP/TCP upstream. DoH configuration can be saved, but starting a Profile with DoH is rejected while its bootstrap isolation remains unverified. See [.scratch/dns-transports/spec.md](.scratch/dns-transports/spec.md).
+
+Supported Profile lookups through address-resolution hooks (`getaddrinfo` / `GetAddrInfo*`) return a resolution error when Profile DNS fails. Unsupported asynchronous resolver inputs are rejected without calling Windows resolution; `DnsQueryRaw`, when present and hooked, is explicitly rejected in strict Profile mode. Required DNS hook failures reject Runtime initialization. Local-machine passthrough, uninjected processes and application-owned UDP/TCP DNS, DoH, DoT or DoQ remain outside this resolver guarantee. Aura does not provide a network security boundary or change the host DNS configuration.
 
 ## Community
 

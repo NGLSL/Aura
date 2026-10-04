@@ -16,6 +16,8 @@ pub enum JobError {
     Open(u32),
     #[error("invalid named Job Object name")]
     InvalidName,
+    #[error("tracking Job has unexpected limit flags: {0:#x}")]
+    UnexpectedLimits(u32),
 }
 
 #[cfg(windows)]
@@ -64,7 +66,48 @@ pub struct InstanceJob {
     pub assigned_pids: Vec<u32>,
 }
 
+/// A creation-time Job attribute capability, constructible only by its owner.
+/// The borrowed lifetime prevents closing the Job during CreateProcess.
+#[derive(Debug, Clone, Copy)]
+pub struct JobAssignment<'a> {
+    #[cfg(windows)]
+    pub(crate) handle: windows::Win32::Foundation::HANDLE,
+    _owner: std::marker::PhantomData<&'a InstanceJob>,
+}
+
 impl InstanceJob {
+    /// Recovery accepts only the unmodified tracking Job policy used by this launcher.
+    pub fn verify_tracking_limits(&self) -> Result<(), JobError> {
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::JobObjects::{
+                JobObjectExtendedLimitInformation, QueryInformationJobObject,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            };
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            QueryInformationJobObject(
+                self.handle.0,
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of_val(&limits) as u32,
+                None,
+            )
+            .map_err(|_| JobError::Query(last_error()))?;
+            if limits.BasicLimitInformation.LimitFlags.0 != 0 {
+                return Err(JobError::UnexpectedLimits(
+                    limits.BasicLimitInformation.LimitFlags.0,
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub fn creation_assignment(&self) -> JobAssignment<'_> {
+        JobAssignment {
+            #[cfg(windows)]
+            handle: self.handle.0,
+            _owner: std::marker::PhantomData,
+        }
+    }
     pub fn create() -> Result<Self, JobError> {
         Self::create_with_name(None)
     }
@@ -75,6 +118,36 @@ impl InstanceJob {
     /// starts the actual CLI.
     pub fn create_named(name: &str) -> Result<Self, JobError> {
         Self::create_with_name(Some(name))
+    }
+
+    /// Create a new ownership object. A name collision must never authorize
+    /// cleanup or termination of another Run's Job.
+    pub fn create_named_exclusive(name: &str) -> Result<Self, JobError> {
+        #[cfg(windows)]
+        {
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+            use windows::Win32::System::JobObjects::CreateJobObjectW;
+            let name = wide_name(name)?;
+            unsafe {
+                let handle = CreateJobObjectW(None, PCWSTR(name.as_ptr()))
+                    .map_err(|_| JobError::Create(last_error()))?;
+                let error = GetLastError();
+                let owned = win::SafeHandle(handle);
+                if error == ERROR_ALREADY_EXISTS {
+                    return Err(JobError::Create(error.0));
+                }
+                Ok(Self {
+                    handle: owned,
+                    assigned_pids: Vec::new(),
+                })
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            Err(JobError::Create(0))
+        }
     }
 
     /// Open a Job created by another process in this Windows session.
@@ -286,6 +359,19 @@ impl Drop for InstanceJob {
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn exclusive_job_collision_leaves_existing_job_owned() {
+        let name = format!("Local\\AuraExclusiveJobTest-{}", uuid::Uuid::new_v4());
+        let original = super::InstanceJob::create_named_exclusive(&name).unwrap();
+        assert!(matches!(
+            super::InstanceJob::create_named_exclusive(&name),
+            Err(super::JobError::Create(183))
+        ));
+        assert_eq!(original.stats().unwrap().active_processes, 0);
+        let reopened = super::InstanceJob::open_named(&name).unwrap();
+        assert_eq!(reopened.stats().unwrap().active_processes, 0);
+    }
     use super::*;
     use std::os::windows::process::CommandExt;
 

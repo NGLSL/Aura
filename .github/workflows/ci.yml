@@ -20,10 +20,10 @@ jobs:
       - name: Check out Aura
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
+      - name: Install Rust 1.99.0
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+          rustup default 1.99.0-x86_64-pc-windows-msvc
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@v2

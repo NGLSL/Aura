@@ -12,4 +12,6 @@ path = "src/main.rs"
 envbox-core = { workspace = true }
 envbox-launcher = { workspace = true }
 envbox-storage = { workspace = true }
+envbox-supervisor = { workspace = true }
 uuid = { workspace = true }
+toml = { workspace = true }

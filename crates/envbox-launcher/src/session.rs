@@ -35,6 +35,88 @@ pub enum SessionError {
     InvalidProfile(String),
     #[error("injection failed — Startup Fail Policy (no silent unvirtualized launch)")]
     InjectionFailed,
+    #[error("{source}; cleanup of newly created root failed (GetLastError={code})")]
+    Cleanup {
+        #[source]
+        source: Box<SessionError>,
+        code: u32,
+    },
+}
+
+/// Only ordinary Win32 activation proves that this Run created the process.
+/// AUMID activation can return an existing host/application PID, so errors must
+/// never terminate that PID or an entire shared handoff Job.
+struct ActivationCleanup<'a> {
+    target: &'a ActivatedTarget,
+    armed: bool,
+}
+
+fn startup_diagnostic(shared: &crate::ipc_server::SharedTable, pid: u32) -> String {
+    let Ok(table) = shared.lock() else {
+        return "bootstrap registry unavailable".into();
+    };
+    let identity = match table.validate_runtime(pid) {
+        Ok(_) => "Runtime identity verified".into(),
+        Err(error) => format!("Runtime identity: {error}"),
+    };
+    let hook = table
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            crate::ipc::IpcMessage::HookError {
+                pid: owner,
+                api,
+                code,
+                ..
+            } if *owner == pid => Some(format!("; Runtime error api={api} code={code}")),
+            _ => None,
+        })
+        .unwrap_or_default();
+    format!("{identity}{hook}")
+}
+
+impl ActivationCleanup<'_> {
+    fn fail(&mut self, error: SessionError) -> SessionError {
+        if !self.armed {
+            return error;
+        }
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+            if WaitForSingleObject(self.target.process.0, 0).0 == 0 {
+                self.armed = false;
+                return error;
+            }
+            if TerminateProcess(self.target.process.0, 1).is_err() {
+                let code = crate::launcher::win::last_error();
+                // The target can exit between our wait and termination call.
+                if WaitForSingleObject(self.target.process.0, 0).0 == 0 {
+                    self.armed = false;
+                    return error;
+                }
+                return SessionError::Cleanup {
+                    source: Box::new(error),
+                    code,
+                };
+            }
+        }
+        self.armed = false;
+        error
+    }
+}
+
+impl Drop for ActivationCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::Threading::TerminateProcess;
+            let _ = TerminateProcess(self.target.process.0, 1);
+        }
+    }
 }
 
 /// One Environment Session (control-plane aggregate + runtime handles).
@@ -59,6 +141,18 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Runtime facts independently observed by the broker. Absence means
+    /// pending/unverified, never a successful identity handshake.
+    pub fn runtime_identity(&self) -> Option<crate::ipc::ObservedRuntimeIdentity> {
+        let table = self.broker.as_ref()?.table();
+        let identity = table
+            .lock()
+            .ok()?
+            .runtime_identity(self.instance.root_pid)?
+            .clone();
+        Some(identity)
+    }
+
     /// Wait for the root process and return its exit code.
     pub fn wait_root(&mut self) -> Result<i32, SessionError> {
         if let Some(child) = &mut self.child {
@@ -127,10 +221,16 @@ pub fn terminal_cancel_marker_path(instance_id: Uuid) -> PathBuf {
 
 /// Start an Environment Session.
 ///
-/// Host (no profile): plain create, no Runtime injection.
+/// Host (no profile): suspended plain create → Job → resume, no Runtime injection.
 /// Profile: activate → attach → resume (Win32) or activate → attach (Packaged).
 pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionError> {
-    start_session_with_options(req, None, None, false)
+    start_session_with_options(req, None, None, false, false)
+}
+
+/// Explicit verified-entry startup. Unsupported executables fail closed in the
+/// Runtime; legacy Compatibility startup does not opt into this guarantee.
+pub fn start_session_gated(req: SessionStartRequest) -> Result<SessionHandle, SessionError> {
+    start_session_with_options(req, None, None, false, true)
 }
 
 /// Start a GUI-selected shell with its own interactive console. This is only
@@ -139,7 +239,7 @@ pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionE
 pub fn start_session_in_new_console(
     req: SessionStartRequest,
 ) -> Result<SessionHandle, SessionError> {
-    start_session_with_options(req, None, None, true)
+    start_session_with_options(req, None, None, true, false)
 }
 
 /// Start a session in a Job Object that was created by another process.
@@ -158,6 +258,22 @@ pub fn start_session_in_named_job(
         Some(instance_id),
         Some(job_name.as_ref().to_string()),
         false,
+        false,
+    )
+}
+
+/// Supervisor handoff with a fixed snapshot instance and pre-created Job.
+pub fn start_session_in_named_job_gated(
+    req: SessionStartRequest,
+    instance_id: Uuid,
+    job_name: impl AsRef<str>,
+) -> Result<SessionHandle, SessionError> {
+    start_session_with_options(
+        req,
+        Some(instance_id),
+        Some(job_name.as_ref().to_string()),
+        false,
+        true,
     )
 }
 
@@ -166,6 +282,7 @@ fn start_session_with_options(
     requested_instance_id: Option<Uuid>,
     requested_job_name: Option<String>,
     create_new_console: bool,
+    entry_gate: bool,
 ) -> Result<SessionHandle, SessionError> {
     // Safety net: every caller (GUI/CLI/tests) gets Packaged for AUMID /
     // WindowsApps targets. Never CreateProcess a WindowsApps exe (package
@@ -177,11 +294,34 @@ fn start_session_with_options(
     let instance_id = requested_instance_id.unwrap_or_else(Uuid::new_v4);
     let profile_id = req.profile.as_ref().map(|p| p.id).unwrap_or_default();
     let host_mode = req.profile.is_none();
+    if entry_gate && (host_mode || matches!(req.launch, LaunchTarget::Packaged { .. })) {
+        return Err(SessionError::Unsupported(
+            "verified entry requires a Profile and an ordinary Win32 executable".into(),
+        ));
+    }
 
     if let Some(profile) = &req.profile {
         profile
             .validate()
             .map_err(|e| SessionError::InvalidProfile(e.to_string()))?;
+        profile
+            .dns
+            .validate_runtime_support()
+            .map_err(|error| SessionError::Unsupported(error.to_string()))?;
+        if crate::ipc::profile_to_message_with_flags(
+            profile,
+            &instance_id.to_string(),
+            req.inherit_children,
+            req.audit,
+        )
+        .encode_line()
+        .len()
+            > crate::ipc::IPC_MAX_LINE_BYTES
+        {
+            return Err(SessionError::InvalidProfile(
+                "complete Runtime Profile payload exceeds the IPC limit".into(),
+            ));
+        }
         if profile.environment.len() > crate::ipc::RUNTIME_ENVIRONMENT_MAX {
             return Err(SessionError::InvalidProfile(format!(
                 "environment has {} entries; Runtime supports at most {}",
@@ -219,7 +359,11 @@ fn start_session_with_options(
             .map_err(SessionError::Unsupported)?;
     }
 
-    let host_env: HashMap<String, String> = std::env::vars().collect();
+    let mut host_env: HashMap<String, String> = std::env::vars().collect();
+    host_env.retain(|key, _| {
+        !key.eq_ignore_ascii_case("ENVBOX_STARTUP_GATE")
+            && !key.eq_ignore_ascii_case("ENVBOX_RECOVERY_JOB_NAME")
+    });
     let is_packaged = matches!(req.launch, LaunchTarget::Packaged { .. });
     // Win32 receives a per-session pipe through its Environment Block.
     // Packaged roots derive a pipe from their PID after activation.
@@ -241,7 +385,11 @@ fn start_session_with_options(
             pipe_path.clone().expect("Win32 pipe path"),
         ) {
             Ok(b) => Some(b),
-            Err(_) => None, // Win32 keeps its ENVBOX_* fallback.
+            Err(error) => {
+                return Err(SessionError::Unsupported(format!(
+                    "Runtime identity requires an available bootstrap Broker: {error}"
+                )))
+            }
         }
     };
 
@@ -259,6 +407,12 @@ fn start_session_with_options(
         // Point Runtime IPC Bootstrap at this session's Host pipe (Win32 only).
         if let Some(pipe_path) = &pipe_path {
             env.insert("ENVBOX_IPC_PIPE".into(), pipe_path.clone());
+        }
+        if entry_gate {
+            env.insert("ENVBOX_STARTUP_GATE".into(), "1".into());
+            if let Some(name) = &requested_job_name {
+                env.insert("ENVBOX_RECOVERY_JOB_NAME".into(), name.clone());
+            }
         }
         env
     };
@@ -312,15 +466,31 @@ fn start_session_with_options(
     let runtime_dll = if host_mode {
         None
     } else {
-        let source = crate::injection::resolve_runtime_dll()
-            .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?;
+        let source = if is_packaged {
+            crate::injection::resolve_runtime_dll()
+        } else {
+            let program = crate::launcher::activation_program(&req.launch, &req.arguments, &env)?;
+            crate::injection::resolve_runtime_dll_for_target(&program)
+        }
+        .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?;
         Some(
             crate::injection::stage_runtime_dll(&source, instance_id)
                 .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?,
         )
     };
 
+    if let (Some(runtime), Some(profile)) = (&runtime_dll, &req.profile) {
+        crate::recovery::validate_runtime_for_profile(runtime, &profile.dns, entry_gate).map_err(
+            |error| SessionError::Unsupported(format!("Runtime capability preflight: {error}")),
+        )?;
+    }
+
     let activation_req = ActivationRequest {
+        creation_job: if is_packaged {
+            None
+        } else {
+            Some(job.creation_assignment())
+        },
         arguments: req.arguments.clone(),
         working_directory: req.working_directory.clone(),
         environment: env.clone(),
@@ -333,15 +503,32 @@ fn start_session_with_options(
 
     let backend = backend_for(&req.launch);
     let activated: ActivatedTarget = backend.activate(&req.launch, &activation_req)?;
+    let mut startup_cleanup = ActivationCleanup {
+        target: &activated,
+        armed: !is_packaged,
+    };
+    // Capture this activation's generation while retaining its process handle.
+    // A completed short-lived target may disappear from PID-based enumeration.
+    let activated_generation = if host_mode {
+        None
+    } else {
+        Some(
+            crate::ipc_server::process_creation_time(activated.pid).ok_or_else(|| {
+                startup_cleanup.fail(SessionError::Unsupported(
+                    "target generation unavailable".into(),
+                ))
+            })?,
+        )
+    };
 
     // Fail closed when Runtime is required but injection is unsupported.
     if !host_mode && !activated.injection_supported {
-        return Err(SessionError::Unsupported(
+        return Err(startup_cleanup.fail(SessionError::Unsupported(
             activated
                 .injection_reason
                 .clone()
                 .unwrap_or_else(|| "runtime injection unsupported".into()),
-        ));
+        )));
     }
 
     // No custom Environment Block reaches an AUMID target. The Runtime can
@@ -365,10 +552,15 @@ fn start_session_with_options(
 
     // Bind root PID BEFORE attach: DllMain GET_PROFILE runs during LoadLibrary.
     if req.profile.is_some() {
-        shared
-            .lock()
-            .unwrap()
-            .bind_pid(activated.pid, &profile_id.to_string());
+        let mut registry = shared.lock().unwrap();
+        registry.bind_pid(activated.pid, &profile_id.to_string());
+        if let Some(dll) = &runtime_dll {
+            if let Err(error) = registry.expect_runtime(activated.pid, dll) {
+                return Err(startup_cleanup.fail(SessionError::Unsupported(format!(
+                    "Runtime identity preparation failed: {error}"
+                ))));
+            }
+        }
     }
 
     // Process Tracker: Job for Win32, Package/PID for Packaged.
@@ -385,24 +577,36 @@ fn start_session_with_options(
     tracker.register_root(activated.pid);
     tracker.mark(SessionState::Activated);
 
-    // Job (lifecycle only; best-effort for packaged). A named handoff Job is
-    // required: silently proceeding without assignment would defeat GUI Stop.
-    if let Err(err) = job.assign_pid(activated.pid) {
-        if requested_job_name.is_some() {
-            #[cfg(windows)]
-            unsafe {
-                use windows::Win32::System::Threading::TerminateProcess;
-                let _ = TerminateProcess(activated.process.0, 1);
+    // Ordinary Win32 roots require Job assignment; packaged activation remains
+    // best effort because it can return a previously running application.
+    if is_packaged {
+        if let Err(err) = job.assign_pid(activated.pid) {
+            if !is_packaged || requested_job_name.is_some() {
+                return Err(startup_cleanup.fail(err.into()));
             }
-            return Err(err.into());
         }
+    } else {
+        // No second AssignProcessToJobObject: creation already assigned it.
+        if !job
+            .stats()
+            .map_err(|error| startup_cleanup.fail(error.into()))?
+            .process_ids
+            .contains(&activated.pid)
+        {
+            return Err(startup_cleanup.fail(SessionError::Unsupported(
+                "creation-time Job membership missing".into(),
+            )));
+        }
+        job.assigned_pids.push(activated.pid);
     }
 
     // Attach
-    let attached = if host_mode {
+    let mut attached = if host_mode {
         None
     } else {
-        let dll = runtime_dll.clone().ok_or(SessionError::InjectionFailed)?;
+        let dll = runtime_dll
+            .clone()
+            .ok_or_else(|| startup_cleanup.fail(SessionError::InjectionFailed))?;
         let injector = RuntimeInjector::new(dll);
         let already = activated.suspended && !is_packaged; // Detours at create
         match injector.attach(activated.pid, strategy, already) {
@@ -411,9 +615,8 @@ fn start_session_with_options(
                 Some(a)
             }
             Err(err) => {
-                // Startup Fail Policy: never leave unvirtualized process as success.
-                let _ = job.terminate();
-                return Err(err.into());
+                // The startup guard terminates only this Run's new Win32 root.
+                return Err(startup_cleanup.fail(err.into()));
             }
         }
     };
@@ -422,11 +625,81 @@ fn start_session_with_options(
     if activated.suspended {
         #[cfg(windows)]
         {
-            crate::launcher::resume_activated(&activated)?;
+            if let Err(err) = crate::launcher::resume_activated(&activated) {
+                return Err(startup_cleanup.fail(err.into()));
+            }
         }
     }
 
+    if !host_mode {
+        // Compatibility also requires a matching actual Runtime identity.
+        // Gated startup additionally waits for the entry release ACK.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            let released = {
+                let table = shared.lock().map_err(|_| {
+                    startup_cleanup.fail(SessionError::Unsupported(
+                        "bootstrap registry poisoned".into(),
+                    ))
+                })?;
+                if entry_gate {
+                    table.startup_gate_released(activated.pid)
+                } else {
+                    table.validate_runtime(activated.pid).is_ok()
+                }
+            };
+            if released {
+                if let Some(runtime) = &mut attached {
+                    runtime.handshake_ok = true;
+                }
+                break;
+            }
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+                if WaitForSingleObject(activated.process.0, 0).0 == 0 {
+                    // Check once more after observing exit: the Broker may
+                    // have recorded the ACK since the first poll.
+                    if shared.lock().is_ok_and(|table| {
+                        if entry_gate {
+                            table.startup_gate_released(activated.pid)
+                        } else {
+                            table
+                                .validate_runtime_generation(
+                                    activated.pid,
+                                    activated_generation.expect("Profile generation captured"),
+                                )
+                                .is_ok()
+                        }
+                    }) {
+                        if let Some(runtime) = &mut attached {
+                            runtime.handshake_ok = true;
+                        }
+                        break;
+                    }
+                    let mut code = 0u32;
+                    let exit = match GetExitCodeProcess(activated.process.0, &mut code) {
+                        Ok(()) => format!("exit_code={code} (0x{code:08X})"),
+                        Err(error) => format!("exit_code_unavailable={error}"),
+                    };
+                    return Err(startup_cleanup.fail(SessionError::Unsupported(format!(
+                        "target exited before Runtime startup confirmation; {exit}; {}",
+                        startup_diagnostic(&shared, activated.pid)
+                    ))));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(startup_cleanup.fail(SessionError::Unsupported(format!(
+                    "Runtime startup confirmation deadline exceeded; {}",
+                    startup_diagnostic(&shared, activated.pid)
+                ))));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     session.state = SessionState::Running;
+    startup_cleanup.armed = false;
+    drop(startup_cleanup);
 
     let profile_payload = req.profile.as_ref().map(|p| {
         crate::ipc::profile_to_message_with_flags(
@@ -446,14 +719,16 @@ fn start_session_with_options(
         .map(|p| p.package_family_name.clone());
     let aumid = session.package_identity.as_ref().map(|p| p.aumid.clone());
     let instance = RuntimeInstance {
+        container_id: None,
+        snapshot_id: None,
         id: instance_id,
         application_id: req.application_id,
         profile_id,
         root_pid: activated.pid,
         process_ids,
         started_at: std::time::SystemTime::now(),
-        // Job assign is lifecycle-only (not an isolation boundary). Record it
-        // on the handle; instance still starts if assign failed.
+        // Job assignment is required for Win32; packaged tracking can use its
+        // package/PID backend when best-effort Job assignment is unavailable.
         status: envbox_core::InstanceStatus::Running,
         package_family_name,
         aumid,
@@ -531,6 +806,7 @@ mod tests {
             dns: DnsProfile {
                 mode: DnsMode::Host,
                 servers: vec![],
+                ..Default::default()
             },
             environment: HashMap::new(),
             registry: RegistryProfile::default(),
@@ -555,6 +831,66 @@ mod tests {
         // We only assert request shape here.
         assert!(req.profile.is_none());
         assert!(!matches!(req.launch, LaunchTarget::Packaged { .. }));
+    }
+
+    #[test]
+    fn verified_entry_refuses_host_and_packaged_before_activation() {
+        for (launch, selected_profile) in [
+            (
+                LaunchTarget::Command {
+                    command: "must-not-be-created".into(),
+                },
+                None,
+            ),
+            (
+                LaunchTarget::Packaged {
+                    aumid: "must-not-be-activated!App".into(),
+                    package_full_name: "fixture".into(),
+                    package_family_name: "fixture".into(),
+                },
+                Some(profile()),
+            ),
+        ] {
+            let result = start_session_gated(SessionStartRequest {
+                application_id: Uuid::nil(),
+                launch,
+                arguments: vec![],
+                working_directory: None,
+                profile: selected_profile,
+                inherit_children: true,
+                audit: false,
+            });
+            assert!(
+                matches!(result, Err(SessionError::Unsupported(message)) if message.contains("verified entry requires"))
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_dns_transport_is_refused_before_process_creation() {
+        let mut selected = profile();
+        selected.dns = envbox_core::DnsProfile::typed(
+            envbox_core::DnsMode::VirtualView,
+            true,
+            vec![envbox_core::DnsUpstream::Doh {
+                url: "https://fixture.invalid/dns-query".into(),
+                bootstrap_ips: vec!["127.0.0.1".parse().unwrap()],
+            }],
+        );
+        let result = start_session(SessionStartRequest {
+            application_id: Uuid::nil(),
+            launch: LaunchTarget::Command {
+                command: "must-not-be-created".into(),
+            },
+            arguments: vec![],
+            working_directory: None,
+            profile: Some(selected),
+            inherit_children: true,
+            audit: false,
+        });
+        assert!(
+            matches!(result, Err(SessionError::Unsupported(message)) if message.contains("DNS"))
+        );
     }
 
     #[test]

@@ -16,6 +16,11 @@
 #include "audit.h"
 #include "ipc_bootstrap.h"
 
+static bool ControlledStartup() {
+  wchar_t value[8] = {};
+  return GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE", value, 8) == 1 && value[0] == L'1';
+}
+
 // --- Browser / Network Guard (ticket 54): Child Guard decision table ----------
 // Explicit engine image names only (never bare substring "chrome").
 enum BrowserEngineKind {
@@ -265,10 +270,10 @@ static std::vector<wchar_t> EnvToWide(LPVOID lpEnvironment, DWORD creation_flags
 }
 
 // Upsert Profile identity + store path into a Unicode MULTI_SZ env block.
-static void UpsertProfileKeys(std::vector<wchar_t>* block) {
+static bool UpsertProfileKeys(std::vector<wchar_t>* block) {
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl == nullptr) {
-    return;
+    return false;
   }
 
   std::vector<std::pair<std::wstring, std::wstring>> vars;
@@ -374,6 +379,22 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
   }
 
   wchar_t root[MAX_PATH] = {};
+  // Rebuild the full ordered DNS snapshot. Caller-supplied stale indexed
+  // fields must not survive alongside the immutable parent's configuration.
+  vars.erase(std::remove_if(vars.begin(), vars.end(), [](const auto& kv) {
+    return _wcsnicmp(kv.first.c_str(), L"ENVBOX_DNS_", 11) == 0;
+  }), vars.end());
+  auto dns_setter = [](void* context, const char* key, const char* value) -> int {
+    auto* values = static_cast<std::vector<std::pair<std::wstring, std::wstring>>*>(context);
+    std::wstring name = L"ENVBOX_";
+    for (const char* p = key; *p; ++p) name += static_cast<wchar_t>(*p >= 'a' && *p <= 'z' ? *p - 'a' + 'A' : *p);
+    int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
+    if (size <= 0) return 0;
+    std::wstring text(static_cast<size_t>(size), L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, text.data(), size)) return 0;
+    text.pop_back(); values->emplace_back(name, text); return 1;
+  };
+  if (!EnvBoxEmitDnsConfiguration(pfl, dns_setter, &vars)) return false;
   if (GetEnvironmentVariableW(L"ENVBOX_CONFIG_ROOT", root, MAX_PATH) > 0) {
     upsert(L"ENVBOX_CONFIG_ROOT", root);
   }
@@ -384,6 +405,22 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
   wchar_t pipe[MAX_PATH] = {};
   if (GetEnvironmentVariableW(L"ENVBOX_IPC_PIPE", pipe, MAX_PATH) > 0) {
     upsert(L"ENVBOX_IPC_PIPE", pipe);
+  }
+  // Carry only the owning parent's escrow identity. Remove caller spoofing,
+  // including duplicates, before inserting the verified parent value.
+  vars.erase(std::remove_if(vars.begin(), vars.end(), [](const auto& kv) {
+      return _wcsicmp(kv.first.c_str(), L"ENVBOX_RECOVERY_JOB_NAME") == 0;
+    }), vars.end());
+  wchar_t recovery_job[256] = {};
+  SetLastError(ERROR_SUCCESS);
+  DWORD recovery_length = GetEnvironmentVariableW(L"ENVBOX_RECOVERY_JOB_NAME", recovery_job, 256);
+  if (recovery_length >= 256 || (recovery_length == 0 && GetLastError() != ERROR_ENVVAR_NOT_FOUND)) return false;
+  if (recovery_length > 0) upsert(L"ENVBOX_RECOVERY_JOB_NAME", recovery_job);
+  // A caller-supplied environment cannot silently remove a controlled
+  // parent's entry gate from its child.
+  wchar_t gate[8] = {};
+  if (GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE", gate, 8) == 1 && gate[0] == L'1') {
+    upsert(L"ENVBOX_STARTUP_GATE", L"1");
   }
 
   // Browser / Network Guard: always carry the policy token + WebView2 args.
@@ -405,6 +442,7 @@ static void UpsertProfileKeys(std::vector<wchar_t>* block) {
     block->push_back(L'\0');
   }
   block->push_back(L'\0');
+  return true;
 }
 
 // Copy the current process Unicode environment (GetEnvironmentStringsW) as MULTI_SZ.
@@ -426,6 +464,28 @@ static std::vector<wchar_t> CurrentProcessEnvBlock() {
   return out;
 }
 
+// Only report exit after OS evidence. A failed kill/wait leaves the suspended
+// member visible to its owning Job/Registry and reports cleanup uncertainty.
+static DWORD CleanupFailedChild(LPPROCESS_INFORMATION child, const char* api) {
+  DWORD failure = ERROR_SUCCESS;
+  if (!TerminateProcess(child->hProcess, 1)) failure = GetLastError();
+  DWORD wait = WaitForSingleObject(child->hProcess, 3000);
+  if (wait == WAIT_OBJECT_0) {
+    EnvBoxIpcNotifyProcessExitedPid(child->dwProcessId, 1);
+    failure = ERROR_SUCCESS;
+  } else {
+    if (failure == ERROR_SUCCESS) failure = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+    char detail[96];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "child-cleanup-unconfirmed pid=%lu error=%lu", child->dwProcessId, failure);
+    EnvBoxIpcNotifyHookError(api, failure, detail);
+    EnvBoxAuditEvent(api, 0, detail);
+  }
+  CloseHandle(child->hThread);
+  CloseHandle(child->hProcess);
+  ZeroMemory(child, sizeof(*child));
+  return failure;
+}
+
 // Returns 0 on failure and sets last_error. On success the child is running
 // (or still suspended if the caller asked for that).
 // Use DetourCreateProcessWithDllExW (same as Root launch) with TrueCreateProcessW
@@ -441,8 +501,8 @@ static BOOL SpawnInjected(
   const char* dll = EnvBoxRuntimeDllPathA();
   if (dll == nullptr) {
     // Startup Fail Policy: never create an unvirtualized child.
-    SetLastError(ERROR_MOD_NOT_FOUND);
     EnvBoxAuditEvent(audit_api, 0, "no-runtime-dll");
+    SetLastError(ERROR_MOD_NOT_FOUND);
     return FALSE;
   }
 
@@ -454,7 +514,7 @@ static BOOL SpawnInjected(
     // lpEnvironment == nullptr means "inherit"; never replace with ENVBOX-only.
     env = CurrentProcessEnvBlock();
   }
-  UpsertProfileKeys(&env);
+  if (!UpsertProfileKeys(&env)) { EnvBoxAuditEvent(audit_api, 0, "child-dns-snapshot-invalid"); SetLastError(ERROR_INVALID_DATA); return FALSE; }
   LPVOID env_ptr = env.empty() ? lpEnvironment : static_cast<LPVOID>(env.data());
 
   // Browser Child Guard (ticket 54): apply WebRTC policy to browser engines.
@@ -487,17 +547,11 @@ static BOOL SpawnInjected(
           create_process)) {
     DWORD err = GetLastError();
     if (lpProcessInformation != nullptr) {
-      if (lpProcessInformation->hThread != nullptr) {
-        CloseHandle(lpProcessInformation->hThread);
-        lpProcessInformation->hThread = nullptr;
-      }
-      if (lpProcessInformation->hProcess != nullptr) {
-        CloseHandle(lpProcessInformation->hProcess);
-        lpProcessInformation->hProcess = nullptr;
-      }
-      lpProcessInformation->dwProcessId = 0;
+      // Detours owns failed creation: its injection-failure path terminates
+      // the new process and closes both handles before returning FALSE.
+      // Never close these stale values (a concurrent open can reuse them).
+      ZeroMemory(lpProcessInformation, sizeof(*lpProcessInformation));
     }
-    SetLastError(err);
     // Ticket 30: surface elevation/integrity vs generic inject failure (audit only).
     if (err == ERROR_ELEVATION_REQUIRED || err == ERROR_ACCESS_DENIED ||
         err == ERROR_PRIVILEGE_NOT_HELD) {
@@ -505,6 +559,7 @@ static BOOL SpawnInjected(
     } else {
       EnvBoxAuditEvent(audit_api, 0, "inject-failed");
     }
+    SetLastError(err);
     return FALSE;
   }
 
@@ -512,21 +567,27 @@ static BOOL SpawnInjected(
   // for its Profile during DllMain, so notifying after ResumeThread races and
   // can return an empty Profile.
   if (lpProcessInformation != nullptr) {
-    EnvBoxIpcNotifyProcessCreated(lpProcessInformation->dwProcessId, nullptr);
+    wchar_t gate[8] = {};
+    bool controlled = GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE", gate, 8) == 1 && gate[0] == L'1';
+    // A complete broker Profile requires a sealed child DLL expectation even
+    // without an entry gate: its loader must receive a real identity ACK.
+    bool requires_binding = controlled || EnvBoxProfileEnvironmentComplete();
+    if (requires_binding && !EnvBoxIpcRegisterChild(lpProcessInformation->hProcess, lpProcessInformation->dwProcessId)) {
+      DWORD error = GetLastError();
+      DWORD cleanup = CleanupFailedChild(lpProcessInformation, audit_api);
+      EnvBoxAuditEvent(audit_api, 0, "controlled-child-binding-failed");
+      SetLastError(cleanup != ERROR_SUCCESS ? cleanup : error);
+      return FALSE;
+    }
+    if (!requires_binding) EnvBoxIpcNotifyProcessCreated(lpProcessInformation->dwProcessId, nullptr);
   }
 
   if (!caller_requested_suspended) {
     if (ResumeThread(lpProcessInformation->hThread) == (DWORD)-1) {
       DWORD err = GetLastError();
-      TerminateProcess(lpProcessInformation->hProcess, 1);
-      EnvBoxIpcNotifyProcessExitedPid(lpProcessInformation->dwProcessId, 1);
-      CloseHandle(lpProcessInformation->hThread);
-      CloseHandle(lpProcessInformation->hProcess);
-      lpProcessInformation->dwProcessId = 0;
-      lpProcessInformation->hProcess = nullptr;
-      lpProcessInformation->hThread = nullptr;
-      SetLastError(err);
+      DWORD cleanup = CleanupFailedChild(lpProcessInformation, audit_api);
       EnvBoxAuditEvent(audit_api, 0, "inject-resume-failed");
+      SetLastError(cleanup != ERROR_SUCCESS ? cleanup : err);
       return FALSE;
     }
   }
@@ -549,11 +610,12 @@ static BOOL WINAPI HookCreateProcessW(
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl == nullptr) {
     // No profile: cannot virtualize; reject (Startup Fail Policy).
-    SetLastError(ERROR_INVALID_DATA);
     EnvBoxAuditEvent("CreateProcessW", 0, "no-profile");
+    SetLastError(ERROR_INVALID_DATA);
     return FALSE;
   }
   if (!pfl->inherit_children) {
+    if (ControlledStartup()) { EnvBoxAuditEvent("CreateProcessW", 0, "controlled-child-inherit-off-unsupported"); SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
     // Application opted out of child propagation: plain create (root-only view).
     EnvBoxAuditEvent("CreateProcessW", 0, "inherit-off-plain");
     return TrueCreateProcessW(lpApplicationName, lpCommandLine,
@@ -595,6 +657,7 @@ static BOOL WINAPI HookCreateProcessAsUserW(
     return FALSE;
   }
   if (!profile->inherit_children) {
+    if (ControlledStartup()) { EnvBoxAuditEvent("CreateProcessAsUserW", 0, "controlled-child-inherit-off-unsupported"); SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
     EnvBoxAuditEvent("CreateProcessAsUserW", 0, "inherit-off-plain");
     return TrueCreateProcessAsUserW(
         token, app, cmd, process_attributes, thread_attributes, inherit_handles,
@@ -608,6 +671,7 @@ static BOOL WINAPI HookCreateProcessAsUserW(
   BrowserEngineKind engine = ClassifyBrowserEngine(app);
   if ((engine == kEngineChromium || engine == kEngineEdge) &&
       HasCommandSwitch(cmd, L"--type=renderer")) {
+    if (ControlledStartup()) { EnvBoxAuditEvent("CreateProcessAsUserW", 0, "controlled-chromium-renderer-unsupported"); SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
     BOOL created = TrueCreateProcessAsUserW(
         token, app, cmd, process_attributes, thread_attributes, inherit_handles,
         flags, environment, current_directory, startup, process_info);

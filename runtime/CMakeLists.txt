@@ -32,6 +32,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/audit.cpp
   src/runtime_profile.cpp
   src/ipc_bootstrap.cpp
+  src/startup_gate.cpp
   src/hooks_time.cpp
   src/hooks_winrt_time.cpp
   src/hooks_geo.cpp
@@ -39,14 +40,21 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/hooks_crt_locale.cpp
   src/hooks_language.cpp
   src/hooks_dns.cpp
+  src/dns_transport.cpp
+  src/dns_dot.cpp
+  src/dns_profile_config.cpp
   src/hooks_registry.cpp
   src/hooks_process.cpp
   src/hooks_network.cpp
 )
 target_compile_features(${ENVBOX_RT_TARGET} PRIVATE cxx_std_17)
 target_compile_definitions(${ENVBOX_RT_TARGET} PRIVATE ENVBOX_RUNTIME=1 ENVBOX_ARCH=${ENVBOX_RT_ARCH})
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml" ENVBOX_VERSION_LINE REGEX "^version = \"[0-9]+\\.[0-9]+\\.[0-9]+[^\"]*\"$")
+list(GET ENVBOX_VERSION_LINE 0 ENVBOX_VERSION_LINE)
+string(REGEX REPLACE "^version = \"([^\"]+)\"$" "\\1" ENVBOX_RUNTIME_VERSION "${ENVBOX_VERSION_LINE}")
+target_compile_definitions(${ENVBOX_RT_TARGET} PRIVATE ENVBOX_RUNTIME_VERSION="${ENVBOX_RUNTIME_VERSION}")
 set_target_properties(${ENVBOX_RT_TARGET} PROPERTIES OUTPUT_NAME "${ENVBOX_RT_NAME}")
-target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE advapi32 iphlpapi ws2_32 runtimeobject)
+target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE advapi32 iphlpapi ws2_32 runtimeobject secur32 crypt32)
 
 if(ENVBOX_WITH_DETOURS)
   if(NOT DETOURS_ROOT)

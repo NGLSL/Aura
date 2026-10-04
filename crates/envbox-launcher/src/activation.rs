@@ -49,7 +49,9 @@ pub struct ActivatedTarget {
 
 /// What an activation backend needs to start a target.
 #[derive(Debug, Clone)]
-pub struct ActivationRequest {
+pub struct ActivationRequest<'a> {
+    /// Ordinary Win32 roots join this Job atomically at process creation.
+    pub creation_job: Option<crate::job::JobAssignment<'a>>,
     pub arguments: Vec<String>,
     pub working_directory: Option<std::path::PathBuf>,
     /// Merged environment (including ENVBOX_* for Win32 fallback).
@@ -83,10 +85,10 @@ pub struct Win32ActivationBackend;
 ///
 /// This helper runs after the target kind is known, which is necessary to
 /// distinguish a CLI `Command` from a GUI `Executable` before CreateProcess.
-fn effective_activation_request(
+fn effective_activation_request<'a>(
     target: &LaunchTarget,
-    req: &ActivationRequest,
-) -> Result<ActivationRequest, ActivateError> {
+    req: &ActivationRequest<'a>,
+) -> Result<ActivationRequest<'a>, ActivateError> {
     let working_directory =
         crate::launcher::effective_working_directory(target, req.working_directory.as_deref())
             .map_err(|error| match error {
@@ -218,10 +220,24 @@ impl ActivationBackend for PackagedActivationBackend {
             }
         };
 
-        let pid = activate_aumid(&aumid)?;
+        let (pid, activation_started) = activate_aumid(&aumid)?;
         if pid == 0 {
             return Err(ActivateError::EmptyPid);
         }
+
+        #[cfg(windows)]
+        if !fresh_activation_generation(
+            activation_started,
+            crate::ipc_server::process_creation_time(pid),
+        ) {
+            // ActivateApplication can deliver to an existing singleton. This
+            // rejection intentionally precedes attach, Job assignment or Stop.
+            return Err(ActivateError::UnsupportedTarget(
+                "packaged activation returned an existing or unverified process; refusing new-instance ownership".into(),
+            ));
+        }
+        #[cfg(not(windows))]
+        let _ = activation_started;
 
         let probe = probe_pid(pid);
         let injection = probe.to_injection_capability(true);
@@ -256,7 +272,11 @@ impl ActivationBackend for PackagedActivationBackend {
 }
 
 /// `IApplicationActivationManager::ActivateApplication(AUMID)` → PID.
-fn activate_aumid(aumid: &str) -> Result<u32, ActivateError> {
+fn fresh_activation_generation(started: u64, created: Option<u64>) -> bool {
+    started != 0 && created.is_some_and(|created| created >= started)
+}
+
+fn activate_aumid(aumid: &str) -> Result<(u32, u64), ActivateError> {
     #[cfg(windows)]
     {
         win_activate_aumid(aumid)
@@ -271,7 +291,7 @@ fn activate_aumid(aumid: &str) -> Result<u32, ActivateError> {
 }
 
 #[cfg(windows)]
-fn win_activate_aumid(aumid: &str) -> Result<u32, ActivateError> {
+fn win_activate_aumid(aumid: &str) -> Result<(u32, u64), ActivateError> {
     use windows::core::HSTRING;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
@@ -290,10 +310,12 @@ fn win_activate_aumid(aumid: &str) -> Result<u32, ActivateError> {
 
         let aumid_h = HSTRING::from(aumid);
         let args = HSTRING::new();
+        let now = windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime();
+        let started = (u64::from(now.dwHighDateTime) << 32) | u64::from(now.dwLowDateTime);
         let pid = manager
             .ActivateApplication(&aumid_h, &args, AO_NONE)
             .map_err(|e| ActivateError::AumidActivate(format!("ActivateApplication: {e}")))?;
-        Ok(pid)
+        Ok((pid, started))
     }
 }
 
@@ -311,10 +333,20 @@ pub fn backend_for(target: &LaunchTarget) -> Box<dyn ActivationBackend> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn packaged_freshness_rejects_existing_and_unknown_generation() {
+        assert!(!fresh_activation_generation(100, Some(99)));
+        assert!(!fresh_activation_generation(100, None));
+        assert!(!fresh_activation_generation(0, Some(100)));
+        assert!(fresh_activation_generation(100, Some(100)));
+        assert!(fresh_activation_generation(100, Some(101)));
+    }
     use std::path::PathBuf;
 
-    fn request(working_directory: Option<PathBuf>) -> ActivationRequest {
+    fn request(working_directory: Option<PathBuf>) -> ActivationRequest<'static> {
         ActivationRequest {
+            creation_job: None,
             arguments: Vec::new(),
             working_directory,
             environment: HashMap::new(),

@@ -13,6 +13,7 @@ path = "src/main.rs"
 envbox-core = { workspace = true }
 envbox-storage = { workspace = true }
 envbox-launcher = { workspace = true }
+envbox-supervisor = { workspace = true }
 uuid = { workspace = true }
 # CPU rendering avoids the GPU backend's device and driver overhead for this UI.
 # Keep the existing font/theme defaults while selecting only tiny-skia.

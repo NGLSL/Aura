@@ -5,6 +5,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+mod containers;
+mod run_snapshots;
+pub use containers::ContainerDocument;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -105,7 +108,7 @@ impl ConfigStore {
             profile.validate()?;
             validate_timezone_windows_id(&profile.timezone.windows_id)?;
         }
-        save_doc(self.profiles_path(), doc)
+        save_profile_doc_atomically(self.profiles_path(), doc)
     }
 
     pub fn load_applications(&self) -> Result<ApplicationDocument, StorageError> {
@@ -135,6 +138,31 @@ fn save_doc<T: serde::Serialize>(path: PathBuf, doc: &T) -> Result<(), StorageEr
     let text = toml::to_string_pretty(doc)?;
     fs::write(path, text)?;
     Ok(())
+}
+
+fn save_profile_doc_atomically(path: PathBuf, doc: &ProfileDocument) -> Result<(), StorageError> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing Profile directory"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".profiles-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<(), StorageError> {
+        let text = toml::to_string_pretty(doc)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        containers::atomic_replace(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Reject timezone Windows IDs that cannot exist on this host.
@@ -356,6 +384,7 @@ mod tests {
             dns: DnsProfile {
                 mode: DnsMode::VirtualView,
                 servers: vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()],
+                ..Default::default()
             },
             environment: HashMap::from([
                 ("LANG".into(), "en_US.UTF-8".into()),
@@ -496,6 +525,77 @@ mod tests {
             validate_profile(&profile),
             Err(StorageError::Domain(_))
         ));
+    }
+
+    #[test]
+    fn typed_dns_order_roundtrip_and_invalid_bootstrap_preserve_profile_bytes() {
+        use envbox_core::DnsUpstream;
+        let root = std::env::temp_dir().join(format!("aura-storage-dns14-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&root);
+        let mut profile = sample_profile();
+        profile.dns = DnsProfile::typed(
+            DnsMode::VirtualView,
+            true,
+            vec![
+                DnsUpstream::Doh {
+                    url: "https://dns.example/dns-query".into(),
+                    bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
+                },
+                DnsUpstream::Dot {
+                    address: "1.0.0.1".parse().unwrap(),
+                    port: 853,
+                    server_name: "dns.example".into(),
+                },
+                DnsUpstream::Tcp {
+                    address: "127.0.0.1".parse().unwrap(),
+                    port: 15353,
+                },
+                DnsUpstream::Udp {
+                    address: "127.0.0.1".parse().unwrap(),
+                    port: 15354,
+                },
+            ],
+        );
+        let mut doc = ProfileDocument {
+            profiles: vec![profile],
+        };
+        store.save_profiles(&doc).unwrap();
+        assert_eq!(store.load_profiles().unwrap(), doc);
+        let before = fs::read(store.profiles_path()).unwrap();
+        if let DnsUpstream::Doh { bootstrap_ips, .. } = &mut doc.profiles[0].dns.upstreams[0] {
+            bootstrap_ips.clear();
+        }
+        assert!(store.save_profiles(&doc).is_err());
+        assert_eq!(fs::read(store.profiles_path()).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dns_profile_atomic_replace_failure_retains_old_config() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("aura-profile-write14-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&root);
+        let mut doc = ProfileDocument {
+            profiles: vec![sample_profile()],
+        };
+        store.save_profiles(&doc).unwrap();
+        let before = fs::read(store.profiles_path()).unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(store.profiles_path())
+            .unwrap();
+        doc.profiles[0].name = "changed".into();
+        assert!(store.save_profiles(&doc).is_err());
+        assert_eq!(fs::read(store.profiles_path()).unwrap(), before);
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        drop(locked);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

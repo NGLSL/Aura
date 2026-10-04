@@ -1,14 +1,12 @@
 // DNS View hooks (ticket 08) + DNS routing (ticket 25).
 // DNS View: virtualize *read* of DNS config only (GetNetworkParams /
 // GetAdaptersAddresses). DNS routing: under VirtualView, resolve names through
-// Profile dns_servers via a minimal UDP/53 client. Host mode never hooks the
-// resolve path. Fail Open to the original API when every Profile server is
-// unreachable/timeout/truncated, or when NOERROR yields no A/AAAA after CNAME
-// follow (max 8 hops). Authoritative NXDOMAIN (rcode=3) is the only definitive
-// "name does not exist". Non-goals: WFP / LSP / DoH / port-53 redirect /
+// Profile dns_servers via a bounded UDP/TCP client. DnsQuery* uses the native
+// wire-record decoder for all QTYPEs and returns Profile errors without Host
+// DNS fallback. The synchronous getaddrinfo routes retain their address-only
+// client and return Profile lookup errors without Host fallback.
+// Non-goals: WFP / LSP / DoH / port-53 redirect /
 // system proxy. No new Process/Thread handles; sockets always closesocket.
-// Authoritative NXDOMAIN and RFC 2308 SOA NODATA are definitive negatives;
-// referrals and other incomplete NOERROR responses remain Fail Open.
 
 #pragma comment(lib, "dnsapi.lib")
 
@@ -28,6 +26,7 @@
 #include "runtime_profile.h"
 
 #include "audit.h"
+#include "dns_transport.h"
 
 static DWORD(WINAPI* TrueGetNetworkParams)(PFIXED_INFO, PULONG) =
     GetNetworkParams;
@@ -65,12 +64,15 @@ static DNS_STATUS(WINAPI* TrueDnsQueryEx)(PDNS_QUERY_REQUEST,
 static DNS_STATUS(WINAPI* TrueDnsCancelQuery)(PDNS_QUERY_CANCEL) =
     DnsCancelQuery;
 static void(WINAPI* TrueDnsFree)(PVOID, DNS_FREE_TYPE) = DnsFree;
+// Dynamic import keeps Windows versions without the Raw API loadable. Both
+// parameters are opaque here because strict rejects before reading them.
+static DNS_STATUS(WINAPI* TrueDnsQueryRaw)(void*, void*) = nullptr;
 
 // Process-immutable virtual DNS views (built once at hook install).
 static int g_view_active = 0;
 // A custom cancel token is safe only when its matching cancel hook attached.
 static int g_dns_cancel_hook_attached = 0;
-static int g_dns_free_hook_attached = 0;
+static int g_dns_hooks_ready = 0;
 static int g_net_count = 0;
 static int g_addr_v4_count = 0;
 static int g_addr_v6_count = 0;
@@ -132,12 +134,35 @@ static unsigned DnsUdpPort() {
   return 53;
 }
 
-// Owned-allocation registry so freeaddrinfo / DnsRecordListFree can release
-// our nodes even when the CRT heap differs from ws2_32/dnsapi.
+static int DnsUpstreamCount(const RuntimeProfile* profile) {
+  int count = profile->dns_config_version == 1 ? profile->dns_upstream_count : profile->dns_server_count;
+  return count > 0 && count <= ENVBOX_DNS_MAX ? count : 0;
+}
+
+static int DnsEndpoint(const RuntimeProfile* profile, int index, DnsTransportEndpoint* endpoint) {
+  if (profile->dns_config_version == 1) {
+    const RuntimeDnsUpstream& configured = profile->dns_upstreams[index];
+    if (configured.type == EnvBoxDnsDot) {
+      *endpoint = {DnsTransportKind::Dot, configured.address, configured.port,
+                   configured.server_name};
+      return 1;
+    }
+    // DoH remains unavailable until its bootstrap gate is proven. It is
+    // never silently substituted with an unconfigured plaintext transport.
+    if (configured.type != EnvBoxDnsUdp && configured.type != EnvBoxDnsTcp) return 0;
+    *endpoint = {configured.type == EnvBoxDnsTcp ? DnsTransportKind::Tcp : DnsTransportKind::Udp,
+                 configured.address, configured.port};
+  } else {
+    *endpoint = {DnsTransportKind::Udp, profile->dns_servers[index],
+                 static_cast<unsigned short>(DnsUdpPort())};
+  }
+  return 1;
+}
+
+// Owned-allocation registry so address-info free APIs can release our nodes
+// even when the CRT heap differs from ws2_32.
 #ifndef ENVBOX_OWNED_MAX
-// A QueryEx worker can own up to kDnsMaxAnswers records and one name
-// allocation per record.  Keep enough headroom for all 64 bounded workers
-// plus synchronous results that are being released concurrently.
+// Bound custom address-info allocations held by concurrent resolver calls.
 #define ENVBOX_OWNED_MAX 2048
 #endif
 static void* g_owned[ENVBOX_OWNED_MAX];
@@ -223,13 +248,11 @@ static void BuildDnsView() {
   g_net_count = 0;
   g_addr_v4_count = 0;
   g_addr_v6_count = 0;
-  if (pfl == nullptr || pfl->dns_mode != 1 || pfl->dns_server_count <= 0) {
+  if (pfl == nullptr || pfl->dns_mode != 1) {
     return;
   }
-  int n = pfl->dns_server_count;
-  if (n > ENVBOX_DNS_MAX) {
-    n = ENVBOX_DNS_MAX;
-  }
+  g_view_active = 1;
+  int n = pfl->dns_server_count > 0 && pfl->dns_server_count <= ENVBOX_DNS_MAX ? pfl->dns_server_count : 0;
   for (int i = 0; i < n; i++) {
     const char* text = pfl->dns_servers[i];
 
@@ -480,9 +503,8 @@ static unsigned long ReadU32(const unsigned char* p) {
 
 // Encode DNS wire QNAME. Returns encoded length or 0 on error.
 static int EncodeDnsName(const char* name, unsigned char* out, int cap) {
-  if (name == nullptr || name[0] == '\0') {
-    return 0;
-  }
+  if (name == nullptr || name[0] == '\0') return 0;
+  if (strcmp(name, ".") == 0 && cap > 0) { out[0] = 0; return 1; }
   int o = 0;
   const char* p = name;
   while (*p) {
@@ -609,11 +631,32 @@ static int DecodeDnsName(const unsigned char* buf, int len, int* off,
   return 0;
 }
 
-// One UDP query to a single server. timeout_ms is per-attempt (bounded).
-// Returns 1 when a DNS response was parsed into *out (any rcode), else 0.
-static int DnsQueryOne(const char* server_text, const char* qname,
-                       unsigned qtype, DWORD timeout_ms, HANDLE cancel_event,
-                       DnsAddrs* out) {
+// Every API validates the same wire identity and question before decoding.
+static int DnsResponseMatches(const unsigned char* packet, int length,
+                               unsigned id, const char* qname, unsigned qtype) {
+  if (length < 12 || ReadU16(packet) != (id & 0xffff) ||
+      (ReadU16(packet + 2) & 0xf800) != 0x8000 || ReadU16(packet + 4) != 1) return 0;
+  int offset = 12;
+  char name[256];
+  if (!DecodeDnsName(packet, length, &offset, name, sizeof(name)) ||
+      offset + 4 > length || ReadU16(packet + offset) != qtype ||
+      ReadU16(packet + offset + 2) != 1) return 0;
+  char expected[256];
+  strcpy_s(expected, qname);
+  size_t n = strlen(expected);
+  if (n > 1 && expected[n - 1] == '.') expected[n - 1] = '\0';
+  return _stricmp(expected, name) == 0;
+}
+
+static ULONGLONG DnsAttemptDeadline(ULONGLONG total) {
+  ULONGLONG bounded = GetTickCount64() + kDnsQueryTimeoutMs;
+  return bounded < total ? bounded : total;
+}
+
+static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname,
+                       unsigned qtype, ULONGLONG deadline, HANDLE cancel_event,
+                       DnsAddrs* out, PDNS_RECORD* records = nullptr,
+                       DNS_STATUS* record_status = nullptr, DWORD options = 0) {
   unsigned char qbuf[512];
   int namelen = EncodeDnsName(qname, qbuf + 12, (int)sizeof(qbuf) - 12);
   if (namelen <= 0) {
@@ -624,7 +667,7 @@ static int DnsQueryOne(const char* server_text, const char* qname,
   unsigned id = (unsigned)(GetCurrentProcessId() + InterlockedIncrement(&s_qid));
   memset(qbuf, 0, 12);
   WriteU16(qbuf + 0, id & 0xFFFF);
-  WriteU16(qbuf + 2, 0x0100);  // RD
+  WriteU16(qbuf + 2, options & DNS_QUERY_NO_RECURSION ? 0 : 0x0100);
   WriteU16(qbuf + 4, 1);       // QDCOUNT
   WriteU16(qbuf + 6, 0);
   WriteU16(qbuf + 8, 0);
@@ -634,99 +677,19 @@ static int DnsQueryOne(const char* server_text, const char* qname,
   WriteU16(qbuf + qoff + 2, 1);  // IN
   qoff += 4;
 
-  in_addr a4;
-  in6_addr a6;
-  int is_v4 = InetPtonA(AF_INET, server_text, &a4) == 1;
-  int is_v6 = InetPtonA(AF_INET6, server_text, &a6) == 1;
-  if (!is_v4 && !is_v6) {
-    return 0;
+  DnsTransportEndpoint endpoint = configured;
+  if ((options & DNS_QUERY_USE_TCP_ONLY) && endpoint.kind == DnsTransportKind::Udp) {
+    endpoint.kind = DnsTransportKind::Tcp;
   }
-
-  SOCKET s = socket(is_v4 ? AF_INET : AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-  if (s == INVALID_SOCKET) {
-    return 0;
-  }
-
-  DWORD tv = timeout_ms;
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-
-  int sent = 0;
-  unsigned short dport = htons((unsigned short)DnsUdpPort());
-  if (is_v4) {
-    sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port = dport;
-    dst.sin_addr = a4;
-    sent = sendto(s, (const char*)qbuf, qoff, 0, (const sockaddr*)&dst,
-                  sizeof(dst));
-  } else {
-    sockaddr_in6 dst6;
-    memset(&dst6, 0, sizeof(dst6));
-    dst6.sin6_family = AF_INET6;
-    dst6.sin6_port = dport;
-    dst6.sin6_addr = a6;
-    sent = sendto(s, (const char*)qbuf, qoff, 0, (const sockaddr*)&dst6,
-                  sizeof(dst6));
-  }
-  if (sent == SOCKET_ERROR) {
-    closesocket(s);
-    return 0;
-  }
-
-  unsigned char rbuf[1500];
-  DWORD wait_ms = timeout_ms;
-  ULONGLONG deadline = GetTickCount64() + timeout_ms;
-  int rlen = 0;
-  if (cancel_event == nullptr) {
-    // Keep the synchronous path's existing one-shot wait.  Only async
-    // requests need short select slices to observe DnsCancelQuery promptly.
-    rlen = recvfrom(s, (char*)rbuf, (int)sizeof(rbuf), 0, nullptr, nullptr);
-  } else {
-    for (;;) {
-      if (WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
-        closesocket(s);
-        return -1;
-      }
-      ULONGLONG now = GetTickCount64();
-      if (now >= deadline) {
-        closesocket(s);
-        return 0;
-      }
-      ULONGLONG left = deadline - now;
-      wait_ms = (DWORD)(left < 50ULL ? left : 50ULL);
-      if (wait_ms == 0) {
-        continue;
-      }
-      fd_set read_set;
-      FD_ZERO(&read_set);
-      FD_SET(s, &read_set);
-      timeval tv;
-      tv.tv_sec = (long)(wait_ms / 1000);
-      tv.tv_usec = (long)((wait_ms % 1000) * 1000);
-      int ready = select(0, &read_set, nullptr, nullptr, &tv);
-      if (ready == SOCKET_ERROR) {
-        closesocket(s);
-        return 0;
-      }
-      if (ready == 0) {
-        continue;
-      }
-      if (WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
-        closesocket(s);
-        return -1;
-      }
-      rlen = recvfrom(s, (char*)rbuf, (int)sizeof(rbuf), 0, nullptr, nullptr);
-      break;
-    }
-  }
-  closesocket(s);
-  if (rlen < 12) {
-    return 0;
-  }
-  if (ReadU16(rbuf) != (id & 0xFFFF)) {
-    return 0;
+  unsigned char rbuf[65535];
+  int rlen = DnsTransportExchange(endpoint, qbuf, qoff, rbuf, sizeof(rbuf), deadline, cancel_event);
+  if (rlen < 0) return -1;
+  if (!DnsResponseMatches(rbuf, rlen, id, qname, qtype)) return 0;
+  if (endpoint.kind == DnsTransportKind::Udp && (ReadU16(rbuf + 2) & 0x0200)) {
+    endpoint.kind = DnsTransportKind::Tcp;
+    rlen = DnsTransportExchange(endpoint, qbuf, qoff, rbuf, sizeof(rbuf), deadline, cancel_event);
+    if (rlen < 0) return -1;
+    if (!DnsResponseMatches(rbuf, rlen, id, qname, qtype)) return 0;
   }
   unsigned flags = ReadU16(rbuf + 2);
   if ((flags & 0x8000) == 0) {
@@ -737,6 +700,18 @@ static int DnsQueryOne(const char* server_text, const char* qname,
     return 0;
   }
   unsigned rcode = flags & 0x000F;
+  if (records != nullptr) {
+    if (rcode != 0) {
+      *record_status = DNS_ERROR_RCODE_FORMAT_ERROR + rcode - 1;
+      return 1;
+    }
+    DNS_BYTE_FLIP_HEADER_COUNTS(&reinterpret_cast<PDNS_MESSAGE_BUFFER>(rbuf)->MessageHead);
+    *record_status = DnsExtractRecordsFromMessage_W(
+        reinterpret_cast<PDNS_MESSAGE_BUFFER>(rbuf), (WORD)rlen, records);
+    if (*record_status == ERROR_SUCCESS && *records == nullptr)
+      *record_status = DNS_INFO_NO_RECORDS;
+    return 1;
+  }
   unsigned qd = ReadU16(rbuf + 4);
   unsigned an = ReadU16(rbuf + 6);
   unsigned ns = ReadU16(rbuf + 8);
@@ -804,7 +779,7 @@ static int DnsQueryOne(const char* server_text, const char* qname,
   // RFC 2308 NODATA is a successful response whose authority section carries
   // an SOA while the answer section has no address or CNAME. An NS-only
   // authority section is a referral, so leave it to the original resolver via
-  // the route's existing Fail Open path.
+  // the route's temporary-resolution-failure result.
   int has_soa = 0;
   for (unsigned i = 0; i < ns; i++) {
     if (!SkipDnsName(rbuf, rlen, &off)) {
@@ -834,17 +809,17 @@ static int DnsQueryOne(const char* server_text, const char* qname,
 // Route one name through Profile servers in order. Follows CNAME (max
 // kDnsMaxCnameHops). Returns:
 //   1 = definitive answer (addresses, authoritative NXDOMAIN, or NODATA)
-//   0 = no definitive answer (Fail Open) -- truncated, unreachable, or
+//   0 = no definitive answer (temporary resolution failure) -- truncated, unreachable, or
 //       NOERROR without A/AAAA even after CNAME follow (including referral)
 static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
-                        DnsAddrs* out, HANDLE cancel_event) {
+                        DnsAddrs* out, HANDLE cancel_event, ULONGLONG query_deadline = 0) {
   DnsAddrsClear(out);
   if (cancel_event != nullptr &&
       WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
     return -1;
   }
   const RuntimeProfile* pfl = EnvBoxProfile();
-  if (pfl == nullptr || pfl->dns_mode != 1 || pfl->dns_server_count <= 0) {
+  if (pfl == nullptr || pfl->dns_mode != 1 || DnsUpstreamCount(pfl) <= 0) {
     return 0;
   }
   if (qname == nullptr || qname[0] == '\0') {
@@ -871,40 +846,34 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
   memcpy(current, qname, qn + 1);
 
   ULONGLONG deadline = GetTickCount64() + kDnsTotalBudgetMs;
-  int n = pfl->dns_server_count;
-  if (n > ENVBOX_DNS_MAX) {
-    n = ENVBOX_DNS_MAX;
-  }
+  if (query_deadline != 0 && query_deadline < deadline) deadline = query_deadline;
+  int n = DnsUpstreamCount(pfl);
 
   for (int hop = 0; hop < kDnsMaxCnameHops; hop++) {
     int saw_nx = 0;
     int saw_ok = 0;
     int saw_nodata_a = 0;
     int saw_nodata_aaaa = 0;
+    int final_a = !want_a;
+    int final_aaaa = !want_aaaa;
     int has_cname = 0;
     char next_name[256];
     next_name[0] = '\0';
 
     for (int si = 0; si < n; si++) {
-      const char* server = pfl->dns_servers[si];
+      DnsTransportEndpoint endpoint;
+      if (!DnsEndpoint(pfl, si, &endpoint)) continue;
 
-      if (want_a) {
+      if (cancel_event && WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) return -1;
+      if (!final_a) {
         ULONGLONG now = GetTickCount64();
         if (now >= deadline) {
           break;
         }
-        DWORD t = kDnsQueryTimeoutMs;
-        ULONGLONG left = deadline - now;
-        if (left < (ULONGLONG)t) {
-          t = (DWORD)left;
-        }
-        if (t < 200) {
-          t = 200;
-        }
         DnsAddrs step;
         DnsAddrsClear(&step);
         int query_status =
-            DnsQueryOne(server, current, 1, t, cancel_event, &step);
+            DnsQueryOne(endpoint, current, 1, DnsAttemptDeadline(deadline), cancel_event, &step);
         if (query_status < 0) {
           return -1;
         }
@@ -912,9 +881,10 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
           if (step.nxdomain) {
             saw_nx = 1;
           } else if (step.noerror) {
+            final_a = step.nodata || step.n_v4 > 0 || step.has_cname;
             if (step.nodata) {
               saw_nodata_a = 1;
-            } else {
+            } else if (final_a) {
               saw_ok = 1;
             }
             for (int i = 0; i < step.n_v4 && out->n_v4 < kDnsMaxAnswers; i++) {
@@ -928,23 +898,15 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
         }
       }
 
-      if (want_aaaa && !saw_nx) {
+      if (!final_aaaa && !saw_nx) {
         ULONGLONG now = GetTickCount64();
         if (now >= deadline) {
           break;
         }
-        DWORD t = kDnsQueryTimeoutMs;
-        ULONGLONG left = deadline - now;
-        if (left < (ULONGLONG)t) {
-          t = (DWORD)left;
-        }
-        if (t < 200) {
-          t = 200;
-        }
         DnsAddrs step6;
         DnsAddrsClear(&step6);
         int query_status =
-            DnsQueryOne(server, current, 28, t, cancel_event, &step6);
+            DnsQueryOne(endpoint, current, 28, DnsAttemptDeadline(deadline), cancel_event, &step6);
         if (query_status < 0) {
           return -1;
         }
@@ -952,9 +914,10 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
           if (step6.nxdomain) {
             saw_nx = 1;
           } else if (step6.noerror) {
+            final_aaaa = step6.nodata || step6.n_v6 > 0 || step6.has_cname;
             if (step6.nodata) {
               saw_nodata_aaaa = 1;
-            } else {
+            } else if (final_aaaa) {
               saw_ok = 1;
             }
             for (int i = 0; i < step6.n_v6 && out->n_v6 < kDnsMaxAnswers; i++) {
@@ -969,9 +932,7 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
       }
 
       // First definitive reply for this name wins (do not leak to Host DNS).
-      int all_nodata = (want_a ? saw_nodata_a : 1) &&
-                       (want_aaaa ? saw_nodata_aaaa : 1);
-      if (saw_nx || saw_ok || all_nodata) {
+      if (saw_nx || (final_a && final_aaaa)) {
         break;
       }
     }
@@ -1010,11 +971,19 @@ static int DnsRouteName(const char* qname, int want_a, int want_aaaa,
       continue;
     }
     // NOERROR without A/AAAA and without usable CNAME, or no reply at all.
-    // Not a name error -- Fail Open to the original API.
+    // Not a name error -- report a temporary resolution failure.
     return 0;
   }
-  // CNAME hops exhausted without addresses: Fail Open.
+  // CNAME hops exhausted without addresses: temporary failure.
   return 0;
+}
+
+static int IsLocalMachineDnsNameW(const wchar_t* name);
+
+static int IsLocalMachineDnsNameA(const char* name) {
+  wchar_t wide[256];
+  return name && MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, ARRAYSIZE(wide)) &&
+         IsLocalMachineDnsNameW(wide);
 }
 
 static int IsNumericNodeA(const char* n) {
@@ -1326,7 +1295,8 @@ static TNode* BuildChain(const AddrPair* pairs, int np, unsigned short port,
 // Returns EAI_* or 0. On 0, *out_chain owns a chain (may be empty family-filtered).
 static int ResolveRoutedA(const char* qname_utf8, const char* service,
                           int ai_family, int ai_socktype, int ai_protocol,
-                          int ai_flags, DnsAddrs* addrs, unsigned short* port) {
+                          int ai_flags, DnsAddrs* addrs, unsigned short* port,
+                          ULONGLONG query_deadline = 0) {
   int want_a = (ai_family == AF_UNSPEC || ai_family == 0 || ai_family == AF_INET);
   int want_aaaa =
       (ai_family == AF_UNSPEC || ai_family == 0 || ai_family == AF_INET6);
@@ -1341,8 +1311,8 @@ static int ResolveRoutedA(const char* qname_utf8, const char* service,
   }
   *port = p;
 
-  if (DnsRouteName(qname_utf8, want_a, want_aaaa, addrs, nullptr) <= 0) {
-    return EAI_AGAIN;  // caller Fail Opens
+  if (DnsRouteName(qname_utf8, want_a, want_aaaa, addrs, nullptr, query_deadline) <= 0) {
+    return EAI_AGAIN;  // no Host fallback
   }
   if ((addrs->nxdomain || addrs->nodata) && addrs->n_v4 == 0 &&
       addrs->n_v6 == 0) {
@@ -1355,7 +1325,7 @@ static int ResolveRoutedA(const char* qname_utf8, const char* service,
       // Addresses exist but none match ai_family.
       return EAI_NONAME;
     }
-    // NOERROR without A/AAAA (CNAME-only / other type): Fail Open, never
+    // NOERROR without A/AAAA (CNAME-only / other type): temporary failure, never
     // fabricate NXDOMAIN.
     return EAI_AGAIN;
   }
@@ -1425,17 +1395,6 @@ static void FreeAddrInfoExWChain(PADDRINFOEXW ai) {
   }
 }
 
-static void FreeDnsRecordChain(PDNS_RECORD rec) {
-  while (rec != nullptr) {
-    PDNS_RECORD next = rec->pNext;
-    if (rec->pName != nullptr) {
-      OwnedFree(rec->pName);
-    }
-    OwnedFree(rec);
-    rec = next;
-  }
-}
-
 static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
                                   const ADDRINFOA* hints, PADDRINFOA* result,
                                   const char* api) {
@@ -1454,9 +1413,14 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
   int stype = hints ? hints->ai_socktype : 0;
   int proto = hints ? hints->ai_protocol : 0;
 
-  // Numeric node / AI_NUMERICHOST / service-only: pass through unchanged.
+  // Numeric, local-machine and service-only inputs do not need a DNS route.
+  if (node && !IsAsciiNameA(node) && !IsLocalMachineDnsNameA(node)) {
+    EnvBoxAuditEvent(api, 1, "dns-unsupported-name");
+    SetLastError(err);
+    return EAI_FAIL;
+  }
   if (node == nullptr || node[0] == '\0' || (flags & AI_NUMERICHOST) ||
-      IsNumericNodeA(node) || !IsAsciiNameA(node)) {
+      IsNumericNodeA(node) || IsLocalMachineDnsNameA(node)) {
     INT r = Truegetaddrinfo(node, service, hints, result);
     EnvBoxAuditEvent(api, 0, "numeric-or-passthrough");
     SetLastError(err);
@@ -1468,12 +1432,9 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
   int rc = ResolveRoutedA(node, service, family, stype, proto, flags, &addrs,
                           &port);
   if (rc == EAI_AGAIN) {
-    INT r = Truegetaddrinfo(node, service, hints, result);
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "fail-open node=%.64s", node);
-    EnvBoxAuditEvent(api, 0, note);
+    EnvBoxAuditEvent(api, 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_AGAIN;
   }
   if (rc == EAI_NONAME) {
     char note[128];
@@ -1484,10 +1445,9 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
     return EAI_NONAME;
   }
   if (rc != 0) {
-    INT r = Truegetaddrinfo(node, service, hints, result);
-    EnvBoxAuditEvent(api, 0, "fail-open");
+    EnvBoxAuditEvent(api, 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return rc;
   }
 
   AddrPair pairs[kDnsMaxAnswers * 2];
@@ -1495,10 +1455,9 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
   PADDRINFOA chain = BuildChain<ADDRINFOA, char, decltype(&AllocAddrInfoA)>(
       pairs, np, port, family, stype, proto, flags, node, &AllocAddrInfoA);
   if (chain == nullptr) {
-    INT r = Truegetaddrinfo(node, service, hints, result);
-    EnvBoxAuditEvent(api, 0, "fail-open");
+    EnvBoxAuditEvent(api, 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_MEMORY;
   }
   if (result != nullptr) {
     *result = chain;
@@ -1506,8 +1465,7 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
     FreeAddrInfoAChain(chain);
   }
   char note[128];
-  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route node=%.64s n=%d", node,
-              np);
+  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route n=%d", np);
   EnvBoxAuditEvent(api, 1, note);
   SetLastError(err);
   return 0;
@@ -1532,7 +1490,7 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
   int proto = hints ? hints->ai_protocol : 0;
 
   if (node == nullptr || node[0] == L'\0' || (flags & AI_NUMERICHOST) ||
-      IsNumericNodeW(node)) {
+      IsNumericNodeW(node) || IsLocalMachineDnsNameW(node)) {
     INT r = TrueGetAddrInfoW(node, service, hints, result);
     EnvBoxAuditEvent(api, 0, "numeric-or-passthrough");
     SetLastError(err);
@@ -1542,19 +1500,17 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
   char node_u8[256];
   if (!WideToUtf8(node, node_u8, (int)sizeof(node_u8)) ||
       !IsAsciiNameA(node_u8)) {
-    INT r = TrueGetAddrInfoW(node, service, hints, result);
-    EnvBoxAuditEvent(api, 0, "fail-open");
+    EnvBoxAuditEvent(api, 1, "dns-unsupported-name");
     SetLastError(err);
-    return r;
+    return EAI_FAIL;
   }
   char svc_u8[64];
   svc_u8[0] = '\0';
   if (service != nullptr && service[0] != L'\0') {
     if (!WideToUtf8(service, svc_u8, (int)sizeof(svc_u8))) {
-      INT r = TrueGetAddrInfoW(node, service, hints, result);
-      EnvBoxAuditEvent(api, 0, "fail-open");
+      EnvBoxAuditEvent(api, 1, "dns-unsupported-service");
       SetLastError(err);
-      return r;
+      return EAI_SERVICE;
     }
   }
 
@@ -1563,12 +1519,9 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
   int rc = ResolveRoutedA(node_u8, svc_u8, family, stype, proto, flags, &addrs,
                           &port);
   if (rc == EAI_AGAIN) {
-    INT r = TrueGetAddrInfoW(node, service, hints, result);
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "fail-open node=%.64s", node_u8);
-    EnvBoxAuditEvent(api, 0, note);
+    EnvBoxAuditEvent(api, 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_AGAIN;
   }
   if (rc == EAI_NONAME) {
     char note[128];
@@ -1580,10 +1533,9 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
     return EAI_NONAME;
   }
   if (rc != 0) {
-    INT r = TrueGetAddrInfoW(node, service, hints, result);
-    EnvBoxAuditEvent(api, 0, "fail-open");
+    EnvBoxAuditEvent(api, 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return rc;
   }
 
   AddrPair pairs[kDnsMaxAnswers * 2];
@@ -1591,10 +1543,9 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
   PADDRINFOW chain = BuildChain<ADDRINFOW, wchar_t, decltype(&AllocAddrInfoW)>(
       pairs, np, port, family, stype, proto, flags, node, &AllocAddrInfoW);
   if (chain == nullptr) {
-    INT r = TrueGetAddrInfoW(node, service, hints, result);
-    EnvBoxAuditEvent(api, 0, "fail-open");
+    EnvBoxAuditEvent(api, 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_MEMORY;
   }
   if (result != nullptr) {
     *result = chain;
@@ -1602,8 +1553,7 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
     FreeAddrInfoWChain(chain);
   }
   char note[128];
-  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route node=%.64s n=%d",
-              node_u8, np);
+  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route n=%d", np);
   EnvBoxAuditEvent(api, 1, note);
   SetLastError(err);
   return 0;
@@ -1670,6 +1620,14 @@ static INT WSAAPI HookGetAddrInfoExA(
     LPOVERLAPPED overlapped,
     LPLOOKUPSERVICE_COMPLETION_ROUTINE completion, LPHANDLE name_handle) {
   DWORD err = GetLastError();
+  if (g_view_active && (overlapped != nullptr || completion != nullptr ||
+      timeout != nullptr || name_handle != nullptr || nlp_id != nullptr ||
+      (dw_name_space != 0 && dw_name_space != NS_ALL && dw_name_space != NS_DNS))) {
+    if (result != nullptr) *result = nullptr;
+    EnvBoxAuditEvent("GetAddrInfoExA", 1, "dns-unsupported-provider-or-async");
+    SetLastError(err);
+    return WSAEOPNOTSUPP;
+  }
   // Async completion is out of scope: Fail Open to the original API.
   if (overlapped != nullptr || completion != nullptr) {
     INT r = TrueGetAddrInfoExA(name, service, dw_name_space, nlp_id, hints,
@@ -1702,8 +1660,13 @@ static INT WSAAPI HookGetAddrInfoExA(
   int stype = hints ? hints->ai_socktype : 0;
   int proto = hints ? hints->ai_protocol : 0;
 
+  if (name && !IsAsciiNameA(name) && !IsLocalMachineDnsNameA(name)) {
+    EnvBoxAuditEvent("GetAddrInfoExA", 1, "dns-unsupported-name");
+    SetLastError(err);
+    return EAI_FAIL;
+  }
   if (name == nullptr || name[0] == '\0' || (flags & AI_NUMERICHOST) ||
-      IsNumericNodeA(name) || !IsAsciiNameA(name)) {
+      IsNumericNodeA(name) || IsLocalMachineDnsNameA(name)) {
     INT r = TrueGetAddrInfoExA(name, service, dw_name_space, nlp_id, hints,
                                result, timeout, overlapped, completion,
                                name_handle);
@@ -1717,14 +1680,9 @@ static INT WSAAPI HookGetAddrInfoExA(
   int rc = ResolveRoutedA(name, service, family, stype, proto, flags, &addrs,
                           &port);
   if (rc == EAI_AGAIN) {
-    INT r = TrueGetAddrInfoExA(name, service, dw_name_space, nlp_id, hints,
-                               result, timeout, overlapped, completion,
-                               name_handle);
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "fail-open node=%.64s", name);
-    EnvBoxAuditEvent("GetAddrInfoExA", 0, note);
+    EnvBoxAuditEvent("GetAddrInfoExA", 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_AGAIN;
   }
   if (rc == EAI_NONAME) {
     char note[128];
@@ -1735,12 +1693,9 @@ static INT WSAAPI HookGetAddrInfoExA(
     return EAI_NONAME;
   }
   if (rc != 0) {
-    INT r = TrueGetAddrInfoExA(name, service, dw_name_space, nlp_id, hints,
-                               result, timeout, overlapped, completion,
-                               name_handle);
-    EnvBoxAuditEvent("GetAddrInfoExA", 0, "fail-open");
+    EnvBoxAuditEvent("GetAddrInfoExA", 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return rc;
   }
 
   AddrPair pairs[kDnsMaxAnswers * 2];
@@ -1750,12 +1705,9 @@ static INT WSAAPI HookGetAddrInfoExA(
           pairs, np, port, family, stype, proto, flags, name,
           &AllocAddrInfoExA);
   if (chain == nullptr) {
-    INT r = TrueGetAddrInfoExA(name, service, dw_name_space, nlp_id, hints,
-                               result, timeout, overlapped, completion,
-                               name_handle);
-    EnvBoxAuditEvent("GetAddrInfoExA", 0, "fail-open");
+    EnvBoxAuditEvent("GetAddrInfoExA", 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_MEMORY;
   }
   if (result != nullptr) {
     *result = chain;
@@ -1763,8 +1715,7 @@ static INT WSAAPI HookGetAddrInfoExA(
     FreeAddrInfoExAChain(chain);
   }
   char note[128];
-  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route node=%.64s n=%d", name,
-              np);
+  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route n=%d", np);
   EnvBoxAuditEvent("GetAddrInfoExA", 1, note);
   SetLastError(err);
   return 0;
@@ -1776,6 +1727,26 @@ static INT WSAAPI HookGetAddrInfoExW(
     LPOVERLAPPED overlapped,
     LPLOOKUPSERVICE_COMPLETION_ROUTINE completion, LPHANDLE name_handle) {
   DWORD err = GetLastError();
+  const ULONGLONG accepted_at = GetTickCount64();
+  ULONGLONG query_deadline = accepted_at + kDnsTotalBudgetMs;
+  if (g_view_active && (overlapped != nullptr || completion != nullptr ||
+      name_handle != nullptr || nlp_id != nullptr ||
+      (dw_name_space != 0 && dw_name_space != NS_ALL && dw_name_space != NS_DNS))) {
+    if (result != nullptr) *result = nullptr;
+    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-unsupported-provider-or-async");
+    SetLastError(err);
+    return WSAEOPNOTSUPP;
+  }
+  if (g_view_active && timeout != nullptr) {
+    if (timeout->tv_sec < 0 || timeout->tv_usec < 0 || timeout->tv_usec >= 1000000) {
+      if (result != nullptr) *result = nullptr;
+      SetLastError(err);
+      return WSAEINVAL;
+    }
+    const ULONGLONG requested_ms = static_cast<ULONGLONG>(timeout->tv_sec) * 1000 +
+        (static_cast<ULONGLONG>(timeout->tv_usec) + 999) / 1000;
+    if (requested_ms < kDnsTotalBudgetMs) query_deadline = accepted_at + requested_ms;
+  }
   if (overlapped != nullptr || completion != nullptr) {
     INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
                                result, timeout, overlapped, completion,
@@ -1808,7 +1779,7 @@ static INT WSAAPI HookGetAddrInfoExW(
   int proto = hints ? hints->ai_protocol : 0;
 
   if (name == nullptr || name[0] == L'\0' || (flags & AI_NUMERICHOST) ||
-      IsNumericNodeW(name)) {
+      IsNumericNodeW(name) || IsLocalMachineDnsNameW(name)) {
     INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
                                result, timeout, overlapped, completion,
                                name_handle);
@@ -1820,39 +1791,28 @@ static INT WSAAPI HookGetAddrInfoExW(
   char name_u8[256];
   if (!WideToUtf8(name, name_u8, (int)sizeof(name_u8)) ||
       !IsAsciiNameA(name_u8)) {
-    INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
-                               result, timeout, overlapped, completion,
-                               name_handle);
-    EnvBoxAuditEvent("GetAddrInfoExW", 0, "fail-open");
+    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-unsupported-name");
     SetLastError(err);
-    return r;
+    return EAI_FAIL;
   }
   char svc_u8[64];
   svc_u8[0] = '\0';
   if (service != nullptr && service[0] != L'\0') {
     if (!WideToUtf8(service, svc_u8, (int)sizeof(svc_u8))) {
-      INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
-                                 result, timeout, overlapped, completion,
-                                 name_handle);
-      EnvBoxAuditEvent("GetAddrInfoExW", 0, "fail-open");
+      EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-unsupported-service");
       SetLastError(err);
-      return r;
+      return EAI_SERVICE;
     }
   }
 
   DnsAddrs addrs;
   unsigned short port = 0;
   int rc = ResolveRoutedA(name_u8, svc_u8, family, stype, proto, flags, &addrs,
-                          &port);
+                          &port, query_deadline);
   if (rc == EAI_AGAIN) {
-    INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
-                               result, timeout, overlapped, completion,
-                               name_handle);
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "fail-open node=%.64s", name_u8);
-    EnvBoxAuditEvent("GetAddrInfoExW", 0, note);
+    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_AGAIN;
   }
   if (rc == EAI_NONAME) {
     char note[128];
@@ -1864,12 +1824,9 @@ static INT WSAAPI HookGetAddrInfoExW(
     return EAI_NONAME;
   }
   if (rc != 0) {
-    INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
-                               result, timeout, overlapped, completion,
-                               name_handle);
-    EnvBoxAuditEvent("GetAddrInfoExW", 0, "fail-open");
+    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return rc;
   }
 
   AddrPair pairs[kDnsMaxAnswers * 2];
@@ -1879,12 +1836,9 @@ static INT WSAAPI HookGetAddrInfoExW(
           pairs, np, port, family, stype, proto, flags, name,
           &AllocAddrInfoExW);
   if (chain == nullptr) {
-    INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
-                               result, timeout, overlapped, completion,
-                               name_handle);
-    EnvBoxAuditEvent("GetAddrInfoExW", 0, "fail-open");
+    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-profile-error");
     SetLastError(err);
-    return r;
+    return EAI_MEMORY;
   }
   if (result != nullptr) {
     *result = chain;
@@ -1892,16 +1846,21 @@ static INT WSAAPI HookGetAddrInfoExW(
     FreeAddrInfoExWChain(chain);
   }
   char note[128];
-  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route node=%.64s n=%d",
-              name_u8, np);
+  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route n=%d", np);
   EnvBoxAuditEvent("GetAddrInfoExW", 1, note);
   SetLastError(err);
   return 0;
 }
 
 // ---------------------------------------------------------------------------
-// DnsQueryEx and DnsQuery_A / W / UTF8 (A + AAAA).
+// DnsQueryEx and DnsQuery_A / W / UTF8 (all record types).
 // ---------------------------------------------------------------------------
+
+static const DWORD kDnsSupportedOptions = DNS_QUERY_USE_TCP_ONLY | DNS_QUERY_NO_RECURSION |
+      DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_LOCAL_NAME | DNS_QUERY_NO_HOSTS_FILE |
+      DNS_QUERY_NO_NETBT | DNS_QUERY_WIRE_ONLY | DNS_QUERY_NO_MULTICAST |
+      DNS_QUERY_TREAT_AS_FQDN | DNS_QUERY_DONT_RESET_TTL_VALUES |
+      DNS_QUERY_DISABLE_IDN_ENCODING;
 
 enum DnsQueryFlavor {
   kDnsFlavorA = 0,
@@ -1912,7 +1871,8 @@ enum DnsQueryFlavor {
 static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
                                 PDNS_RECORD* out, PVOID* reserved,
                                 DnsQueryFlavor flavor, const wchar_t* name_w,
-                                const char* api, HANDLE cancel_event = nullptr);
+                                const char* api, HANDLE cancel_event = nullptr,
+                                ULONGLONG accepted_deadline = 0);
 
 // DnsQueryEx's native asynchronous provider can ignore pDnsServerList on
 // machines with DNS Client policy/NRPT.  For VirtualView, own the complete
@@ -1926,6 +1886,8 @@ struct EnvBoxDnsAsyncContext {
   PDNS_QUERY_CANCEL cancel_handle;
   HANDLE cancel_event;
   WORD query_type;
+  DWORD query_options;
+  ULONGLONG query_deadline;
   ULONGLONG cancel_generation;
   unsigned char original_cancel[sizeof(DNS_QUERY_CANCEL)];
   int cancel_token_written;
@@ -2093,11 +2055,7 @@ static void FreeDnsAsyncRecords(PDNS_RECORD records) {
   if (records == nullptr) {
     return;
   }
-  if (OwnedHas(records)) {
-    FreeDnsRecordChain(records);
-  } else {
-    TrueDnsFree(records, DnsFreeRecordList);
-  }
+  TrueDnsFree(records, DnsFreeRecordList);
 }
 
 static void CompleteDnsAsync(EnvBoxDnsAsyncContext* context, DNS_STATUS status,
@@ -2116,7 +2074,7 @@ static void CompleteDnsAsync(EnvBoxDnsAsyncContext* context, DNS_STATUS status,
     InterlockedExchange(
         reinterpret_cast<volatile LONG*>(&context->results->QueryStatus),
         static_cast<LONG>(status));
-    context->results->QueryOptions = DNS_QUERY_STANDARD;
+    context->results->QueryOptions = context->query_options;
     context->results->pQueryRecords = records;
     context->results->Reserved = nullptr;
   }
@@ -2140,9 +2098,9 @@ static DWORD WINAPI DnsAsyncWorker(PVOID parameter) {
 
   PDNS_RECORD records = nullptr;
   DNS_STATUS status = RouteDnsQuery(
-      context->name_u8, context->query_type, DNS_QUERY_STANDARD, &records,
+      context->name_u8, context->query_type, context->query_options, &records,
       nullptr, kDnsFlavorW, context->query_name, "DnsQueryEx",
-      context->cancel_event);
+      context->cancel_event, context->query_deadline);
   CompleteDnsAsync(context, status, records);
   return 0;
 }
@@ -2210,29 +2168,40 @@ static int IsLocalMachineDnsNameW(const wchar_t* name) {
          DnsNameEqualsW(name, local);
 }
 
+static int IsLocalDnsQueryW(const wchar_t* name, WORD type, DWORD options) {
+  if (type != DNS_TYPE_A && type != DNS_TYPE_AAAA) return 0;
+  in_addr v4;
+  in6_addr v6;
+  if (name && ((type == DNS_TYPE_A && InetPtonW(AF_INET, name, &v4) == 1) ||
+               (type == DNS_TYPE_AAAA && InetPtonW(AF_INET6, name, &v6) == 1))) return 1;
+  return !(options & (DNS_QUERY_WIRE_ONLY | DNS_QUERY_NO_LOCAL_NAME)) &&
+         IsLocalMachineDnsNameW(name);
+}
+
 static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
                                         PDNS_QUERY_RESULT results,
                                         PDNS_QUERY_CANCEL cancel) {
   DWORD err = GetLastError();
-  if (!g_view_active || request == nullptr || results == nullptr) {
+  ULONGLONG query_deadline = GetTickCount64() + kDnsTotalBudgetMs;
+  if (!g_view_active) {
     DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
     EnvBoxAuditEvent("DnsQueryEx", 0,
-                     g_view_active ? "fail-open-invalid-input" : "dns-host");
+                     "dns-host");
     SetLastError(err);
     return st;
   }
-  if (!g_dns_free_hook_attached) {
-    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-dns-free-hook");
+  if (request == nullptr || results == nullptr) {
+    EnvBoxAuditEvent("DnsQueryEx", 1, "dns-invalid-input");
     SetLastError(err);
-    return st;
+    return ERROR_INVALID_PARAMETER;
   }
+
 
   // Only the v1 request/result layouts are handled. Later SDK versions may
   // append fields whose semantics this hook must not silently truncate.
   if (request->Version != DNS_QUERY_REQUEST_VERSION1) {
-    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-unsupported-version");
+    DNS_STATUS st = ERROR_NOT_SUPPORTED;
+    EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-unsupported-version");
     SetLastError(err);
     return st;
   }
@@ -2240,28 +2209,29 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
       results->QueryStatus != ERROR_SUCCESS ||
       results->QueryOptions != DNS_QUERY_STANDARD ||
       results->pQueryRecords != nullptr || results->Reserved != nullptr) {
-    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-invalid-result");
+    DNS_STATUS st = ERROR_INVALID_PARAMETER;
+    EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-invalid-result");
     SetLastError(err);
     return st;
   }
 
-  // The bounded wire client implements only standard A/AAAA lookups. Reject
+  // The bounded wire client implements a subset of query options. Reject
   // every input whose semantics would otherwise be lost, especially the
-  // 64-bit NO_WIRE_QUERY option and caller-selected server/interface paths.
-  if (request->QueryName == nullptr ||
-      request->QueryOptions != DNS_QUERY_STANDARD ||
+  // high query-option bits and caller-selected server/interface paths.
+  if ((request->QueryOptions & ~static_cast<ULONG64>(kDnsSupportedOptions)) != 0 ||
       request->pDnsServerList != nullptr || request->InterfaceIndex != 0 ||
       (request->pQueryCompletionCallback == nullptr && cancel != nullptr) ||
-      (request->QueryType != DNS_TYPE_A &&
-       request->QueryType != DNS_TYPE_AAAA)) {
-    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-unsupported-input");
+      request->QueryType == 0) {
+    DNS_STATUS st = ERROR_NOT_SUPPORTED;
+    EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-unsupported-input");
     SetLastError(err);
     return st;
   }
 
-  if (IsLocalMachineDnsNameW(request->QueryName)) {
+  if ((request->QueryName == nullptr &&
+       (request->QueryType == DNS_TYPE_A || request->QueryType == DNS_TYPE_AAAA) &&
+       !(request->QueryOptions & (DNS_QUERY_WIRE_ONLY | DNS_QUERY_NO_LOCAL_NAME))) ||
+      IsLocalDnsQueryW(request->QueryName, request->QueryType, (DWORD)request->QueryOptions)) {
     DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
     EnvBoxAuditEvent("DnsQueryEx", 0, "local-machine-passthrough");
     SetLastError(err);
@@ -2270,36 +2240,36 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
 
   char name_u8[256];
   if (!WideToUtf8(request->QueryName, name_u8, (int)sizeof(name_u8))) {
-    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-    EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-name-conversion");
+    DNS_STATUS st = ERROR_INVALID_PARAMETER;
+    EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-name-conversion");
     SetLastError(err);
     return st;
   }
 
   if (request->pQueryCompletionCallback != nullptr) {
     if (cancel != nullptr && !g_dns_cancel_hook_attached) {
-      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-cancel-hook");
+      DNS_STATUS st = ERROR_NOT_SUPPORTED;
+      EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-async-cancel-hook");
       SetLastError(err);
       return st;
     }
     const RuntimeProfile* profile = EnvBoxProfile();
     if (profile == nullptr || profile->dns_mode != 1 ||
-        profile->dns_server_count <= 0 || IsNumericNodeA(name_u8) ||
+        DnsUpstreamCount(profile) <= 0 ||
         !IsAsciiNameA(name_u8)) {
-      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+      DNS_STATUS st = ERROR_NOT_SUPPORTED;
       EnvBoxAuditEvent("DnsQueryEx", 0,
                        profile == nullptr || profile->dns_mode != 1
-                           ? "fail-open-async-no-profile-dns"
-                           : "fail-open-async-unsupported-name");
+                           ? "dns-rejected-async-no-profile-dns"
+                           : "dns-rejected-async-unsupported-name");
       SetLastError(err);
       return st;
     }
 
     size_t name_len = wcslen(request->QueryName);
     if (name_len >= 256) {
-      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-name-too-long");
+      DNS_STATUS st = ERROR_INVALID_PARAMETER;
+      EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-async-name-too-long");
       SetLastError(err);
       return st;
     }
@@ -2308,8 +2278,8 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
         static_cast<EnvBoxDnsAsyncContext*>(HeapAlloc(
             GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(EnvBoxDnsAsyncContext)));
     if (context == nullptr) {
-      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-allocation");
+      DNS_STATUS st = ERROR_NOT_ENOUGH_MEMORY;
+      EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-async-allocation");
       SetLastError(err);
       return st;
     }
@@ -2318,6 +2288,8 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
     context->results = results;
     context->cancel_handle = cancel;
     context->query_type = request->QueryType;
+    context->query_options = (DWORD)request->QueryOptions;
+    context->query_deadline = query_deadline;
     if (cancel != nullptr) {
       memcpy(context->original_cancel, cancel,
              sizeof(context->original_cancel));
@@ -2332,17 +2304,17 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
       context->cancel_event =
           CreateEventW(nullptr, TRUE, FALSE, nullptr);
       if (context->cancel_event == nullptr) {
-        async_fallback = "fail-open-async-cancel-event";
+        async_fallback = "dns-rejected-async-cancel-event";
       }
     }
     if (async_fallback == nullptr && !RegisterDnsAsync(context)) {
-      async_fallback = "fail-open-async-pending-limit";
+      async_fallback = "dns-rejected-async-pending-limit";
     }
     if (async_fallback != nullptr) {
       RestoreDnsAsyncCancelToken(context);
       FreeDnsAsync(context);
-      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-      EnvBoxAuditEvent("DnsQueryEx", 0, async_fallback);
+      DNS_STATUS st = ERROR_NOT_ENOUGH_MEMORY;
+      EnvBoxAuditEvent("DnsQueryEx", 1, async_fallback);
       SetLastError(err);
       return st;
     }
@@ -2362,8 +2334,8 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
           ERROR_SUCCESS);
       RestoreDnsAsyncCancelToken(context);
       FreeDnsAsync(context);
-      DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
-      EnvBoxAuditEvent("DnsQueryEx", 0, "fail-open-async-queue");
+      DNS_STATUS st = ERROR_NOT_ENOUGH_MEMORY;
+      EnvBoxAuditEvent("DnsQueryEx", 1, "dns-rejected-async-queue");
       SetLastError(err);
       return st;
     }
@@ -2375,17 +2347,19 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
 
   PDNS_RECORD records = nullptr;
   DNS_STATUS st = RouteDnsQuery(name_u8, request->QueryType,
-                                DNS_QUERY_STANDARD, &records, nullptr,
-                                kDnsFlavorW, request->QueryName, "DnsQueryEx");
+                                (DWORD)request->QueryOptions, &records, nullptr,
+                                kDnsFlavorW, request->QueryName, "DnsQueryEx", nullptr,
+                                query_deadline);
   results->QueryStatus = st;
-  results->QueryOptions = DNS_QUERY_STANDARD;
+  results->QueryOptions = request->QueryOptions;
   results->pQueryRecords = records;
   results->Reserved = nullptr;
   SetLastError(err);
   return st;
 }
 
-// Always Fail Open / pass through to the matching original API.
+// Matching native API used only for Host mode and purely local lookups.
+
 static DNS_STATUS CallTrueDnsQuery(DnsQueryFlavor flavor, const char* name_u8,
                                    const wchar_t* name_w, WORD wtype, DWORD opts,
                                    PDNS_RECORD* out, PVOID* reserved) {
@@ -2400,59 +2374,13 @@ static DNS_STATUS CallTrueDnsQuery(DnsQueryFlavor flavor, const char* name_u8,
   }
 }
 
-static PDNS_RECORD AllocDnsRecord(const char* name_a, const wchar_t* name_w,
-                                  int is_wide, WORD wtype, const void* rdata,
-                                  WORD rdlen) {
-  PDNS_RECORD rec = (PDNS_RECORD)OwnedAlloc(sizeof(DNS_RECORD));
-  if (rec == nullptr) {
-    return nullptr;
-  }
-  if (is_wide) {
-    if (name_w == nullptr) {
-      OwnedFree(rec);
-      return nullptr;
-    }
-    size_t n = wcslen(name_w) + 1;
-    rec->pName = (PSTR)OwnedAlloc(n * sizeof(wchar_t));
-    if (rec->pName == nullptr) {
-      OwnedFree(rec);
-      return nullptr;
-    }
-    memcpy(rec->pName, name_w, n * sizeof(wchar_t));
-  } else {
-    if (name_a == nullptr) {
-      OwnedFree(rec);
-      return nullptr;
-    }
-    size_t n = strlen(name_a) + 1;
-    rec->pName = (PSTR)OwnedAlloc(n);
-    if (rec->pName == nullptr) {
-      OwnedFree(rec);
-      return nullptr;
-    }
-    memcpy(rec->pName, name_a, n);
-  }
-  rec->wType = wtype;
-  rec->wDataLength = rdlen;
-  rec->Flags.DW = 0;
-  rec->Flags.S.Section = DnsSectionAnswer;
-  rec->Flags.S.CharSet = is_wide ? DnsCharSetUnicode : DnsCharSetUtf8;
-  rec->dwTtl = 60;
-  rec->dwReserved = 0;
-  rec->pNext = nullptr;
-  if (wtype == DNS_TYPE_A && rdlen == sizeof(DNS_A_DATA)) {
-    memcpy(&rec->Data.A, rdata, sizeof(DNS_A_DATA));
-  } else if (wtype == DNS_TYPE_AAAA && rdlen == sizeof(DNS_AAAA_DATA)) {
-    memcpy(&rec->Data.AAAA, rdata, sizeof(DNS_AAAA_DATA));
-  }
-  return rec;
-}
-
 static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
                                 PDNS_RECORD* out, PVOID* reserved,
                                 DnsQueryFlavor flavor, const wchar_t* name_w,
-                                const char* api, HANDLE cancel_event) {
+                                const char* api, HANDLE cancel_event,
+                                ULONGLONG accepted_deadline) {
   DWORD err = GetLastError();
+  ULONGLONG deadline = accepted_deadline ? accepted_deadline : GetTickCount64() + kDnsTotalBudgetMs;
   if (out != nullptr) {
     *out = nullptr;
   }
@@ -2463,136 +2391,108 @@ static DNS_STATUS RouteDnsQuery(const char* name_u8, WORD wtype, DWORD opts,
     SetLastError(err);
     return st;
   }
-  if (!g_dns_free_hook_attached) {
-    DNS_STATUS st =
-        CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
-    EnvBoxAuditEvent(api, 0, "fail-open-dns-free-hook");
-    SetLastError(err);
-    return st;
-  }
-  // Numeric / empty / non-ASCII: pass through (same policy as getaddrinfo).
-  if (name_u8 == nullptr || name_u8[0] == '\0' || IsNumericNodeA(name_u8) ||
-      !IsAsciiNameA(name_u8)) {
-    DNS_STATUS st =
-        CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
-    EnvBoxAuditEvent(api, 0, "numeric-or-passthrough");
-    SetLastError(err);
-    return st;
-  }
-  if (wtype != DNS_TYPE_A && wtype != DNS_TYPE_AAAA) {
-    DNS_STATUS st =
-        CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
-    EnvBoxAuditEvent(api, 0, "fail-open-type");
-    SetLastError(err);
-    return st;
-  }
 
-  DnsAddrs addrs;
-  int want_a = (wtype == DNS_TYPE_A);
-  int want_aaaa = (wtype == DNS_TYPE_AAAA);
-  int route_status =
-      DnsRouteName(name_u8, want_a, want_aaaa, &addrs, cancel_event);
-  if (route_status < 0) {
-    SetLastError(ERROR_CANCELLED);
-    return ERROR_CANCELLED;
+  if (opts & ~kDnsSupportedOptions) {
+    EnvBoxAuditEvent(api, 1, "dns-unsupported-options");
+    SetLastError(err);
+    return ERROR_NOT_SUPPORTED;
   }
-  if (route_status == 0) {
-    DNS_STATUS st =
-        CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "fail-open node=%.64s", name_u8);
-    EnvBoxAuditEvent(api, 0, note);
+  if (name_u8 == nullptr || name_u8[0] == '\0' || !IsAsciiNameA(name_u8)) {
+    EnvBoxAuditEvent(api, 1, "dns-unsupported-name");
+    SetLastError(err);
+    return ERROR_INVALID_NAME;
+  }
+  wchar_t local_name[256] = {};
+  if (MultiByteToWideChar(CP_UTF8, 0, name_u8, -1, local_name, ARRAYSIZE(local_name)) &&
+      IsLocalDnsQueryW(local_name, wtype, opts)) {
+    DNS_STATUS st = CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
     SetLastError(err);
     return st;
   }
-  if (addrs.nxdomain && addrs.n_v4 == 0 && addrs.n_v6 == 0) {
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "nxdomain node=%.64s", name_u8);
-    EnvBoxAuditEvent(api, 1, note);
+  unsigned char encoded[256];
+  if (EncodeDnsName(name_u8, encoded, sizeof(encoded)) <= 0 || wtype == 0 || out == nullptr) {
     SetLastError(err);
-    return DNS_ERROR_RCODE_NAME_ERROR;
+    return ERROR_INVALID_PARAMETER;
   }
-  if (addrs.nodata && addrs.n_v4 == 0 && addrs.n_v6 == 0) {
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "nodata node=%.64s", name_u8);
-    EnvBoxAuditEvent(api, 1, note);
-    SetLastError(err);
-    return DNS_INFO_NO_RECORDS;
-  }
-  if (addrs.n_v4 == 0 && addrs.n_v6 == 0) {
-    // NOERROR without A/AAAA must not become NAME_ERROR.
-    DNS_STATUS st =
-        CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
-    char note[128];
-    _snprintf_s(note, sizeof(note), _TRUNCATE, "fail-open node=%.64s", name_u8);
-    EnvBoxAuditEvent(api, 0, note);
-    SetLastError(err);
-    return st;
-  }
-
-  PDNS_RECORD head = nullptr;
+  DnsWinsockScope winsock;
+  DNS_STATUS status = winsock.active ? ERROR_TIMEOUT : WSANOTINITIALISED;
+  PDNS_RECORD records = nullptr;
+  const RuntimeProfile* profile = EnvBoxProfile();
+  char current[256];
+  strcpy_s(current, name_u8);
   PDNS_RECORD tail = nullptr;
-  int n = 0;
-  int alloc_failed = 0;
-  for (int i = 0; i < addrs.n_v4; i++) {
-    DNS_A_DATA a;
-    memset(&a, 0, sizeof(a));
-    memcpy(&a.IpAddress, &addrs.v4[i], 4);
-    PDNS_RECORD rec = AllocDnsRecord(name_u8, name_w, flavor == kDnsFlavorW,
-                                     DNS_TYPE_A, &a, (WORD)sizeof(DNS_A_DATA));
-    if (rec == nullptr) {
-      alloc_failed = 1;
+  for (int hop = 0; hop <= kDnsMaxCnameHops && winsock.active && profile && profile->dns_mode == 1; ++hop) {
+    PDNS_RECORD step = nullptr;
+    int count = DnsUpstreamCount(profile);
+    for (int i = 0; i < count; ++i) {
+      if (cancel_event && WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
+        status = ERROR_CANCELLED;
+        break;
+      }
+      ULONGLONG now = GetTickCount64();
+      if (now >= deadline) break;
+      DnsTransportEndpoint endpoint;
+      if (!DnsEndpoint(profile, i, &endpoint)) continue;
+      DNS_STATUS response = ERROR_TIMEOUT;
+      int result = DnsQueryOne(endpoint, current, wtype, DnsAttemptDeadline(deadline),
+                              cancel_event, nullptr, &step, &response, opts);
+      if (result < 0) { status = ERROR_CANCELLED; break; }
+      if (result == 0) continue;
+      status = response;
+      if (status == ERROR_SUCCESS || status == DNS_INFO_NO_RECORDS ||
+          status == DNS_ERROR_RCODE_NAME_ERROR) break;
+      if (step) { TrueDnsFree(step, DnsFreeRecordList); step = nullptr; }
+    }
+    if (status != ERROR_SUCCESS) {
+      if (step) TrueDnsFree(step, DnsFreeRecordList);
       break;
     }
-    if (tail == nullptr) {
-      head = rec;
-    } else {
-      tail->pNext = rec;
+    int has_answer = 0;
+    wchar_t* alias = nullptr;
+    for (PDNS_RECORD rr = step; rr; rr = rr->pNext) {
+      if (rr->Flags.S.Section != DnsSectionAnswer) continue;
+      if (rr->wType == wtype || wtype == DNS_TYPE_ALL) has_answer = 1;
+      if (rr->wType == DNS_TYPE_CNAME)
+        alias = reinterpret_cast<wchar_t*>(rr->Data.PTR.pNameHost);
     }
-    tail = rec;
-    n++;
-  }
-  for (int i = 0; !alloc_failed && i < addrs.n_v6; i++) {
-    DNS_AAAA_DATA a;
-    memset(&a, 0, sizeof(a));
-    memcpy(&a.Ip6Address, &addrs.v6[i], 16);
-    PDNS_RECORD rec =
-        AllocDnsRecord(name_u8, name_w, flavor == kDnsFlavorW, DNS_TYPE_AAAA,
-                       &a, (WORD)sizeof(DNS_AAAA_DATA));
-    if (rec == nullptr) {
-      alloc_failed = 1;
+    if (!has_answer && !alias) {
+      if (step) TrueDnsFree(step, DnsFreeRecordList);
+      status = DNS_INFO_NO_RECORDS;
       break;
     }
-    if (tail == nullptr) {
-      head = rec;
-    } else {
-      tail->pNext = rec;
+    char target[256] = {};
+    if (!has_answer && (!WideToUtf8(alias, target, sizeof(target)) ||
+        !IsAsciiNameA(target) || hop == kDnsMaxCnameHops)) {
+      TrueDnsFree(step, DnsFreeRecordList);
+      status = DNS_ERROR_CNAME_LOOP;
+      break;
     }
-    tail = rec;
-    n++;
+    if (tail) tail->pNext = step;
+    else records = step;
+    tail = step;
+    while (tail && tail->pNext) tail = tail->pNext;
+    if (has_answer) break;
+    strcpy_s(current, target);
+    status = ERROR_TIMEOUT;
   }
-
-  if (alloc_failed || head == nullptr) {
-    FreeDnsRecordChain(head);
-    DNS_STATUS st =
-        CallTrueDnsQuery(flavor, name_u8, name_w, wtype, opts, out, reserved);
-    EnvBoxAuditEvent(api, 0, "fail-open");
-    SetLastError(err);
-    return st;
+  if (records && status == ERROR_SUCCESS && flavor != kDnsFlavorW) {
+    PDNS_RECORD converted = DnsRecordSetCopyEx(records, DnsCharSetUnicode,
+        flavor == kDnsFlavorUtf8 ? DnsCharSetUtf8 : DnsCharSetAnsi);
+    TrueDnsFree(records, DnsFreeRecordList);
+    records = converted;
+    if (!records) status = ERROR_NOT_ENOUGH_MEMORY;
   }
-
-  if (out != nullptr) {
-    *out = head;
-  } else {
-    FreeDnsRecordChain(head);
+  if (status != ERROR_SUCCESS && records) {
+    TrueDnsFree(records, DnsFreeRecordList);
+    records = nullptr;
   }
-
+  *out = records;
   char note[128];
-  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route node=%.64s n=%d",
-              name_u8, n);
+  _snprintf_s(note, sizeof(note), _TRUNCATE, "dns-route type=%u status=%ld",
+              (unsigned)wtype, status);
   EnvBoxAuditEvent(api, 1, note);
   SetLastError(err);
-  return 0;
+  return status;
 }
 
 static DNS_STATUS WINAPI HookDnsQuery_A(PCSTR name, WORD wtype, DWORD opts,
@@ -2618,8 +2518,9 @@ static DNS_STATUS WINAPI HookDnsQuery_W(PCWSTR name, WORD wtype, DWORD opts,
   DWORD err = GetLastError();
   char name_u8[256];
   if (name == nullptr || !WideToUtf8(name, name_u8, (int)sizeof(name_u8))) {
-    DNS_STATUS st = TrueDnsQuery_W(name, wtype, opts, nullptr, out, reserved);
-    EnvBoxAuditEvent("DnsQuery_W", 0, "fail-open");
+    DNS_STATUS st = g_view_active ? ERROR_INVALID_NAME :
+        TrueDnsQuery_W(name, wtype, opts, nullptr, out, reserved);
+    EnvBoxAuditEvent("DnsQuery_W", g_view_active, "invalid-name");
     SetLastError(err);
     return st;
   }
@@ -2629,30 +2530,27 @@ static DNS_STATUS WINAPI HookDnsQuery_W(PCWSTR name, WORD wtype, DWORD opts,
   return st;
 }
 
-// DnsRecordListFree is a macro over DnsFree(..., DnsFreeRecordList).
-static void WINAPI HookDnsFree(PVOID rec, DNS_FREE_TYPE type) {
-  DWORD err = GetLastError();
-  if (!OwnedHas(rec)) {
-    TrueDnsFree(rec, type);
-    SetLastError(err);
-    return;
-  }
-  if (type == DnsFreeRecordList) {
-    FreeDnsRecordChain((PDNS_RECORD)rec);
-  } else {
-    OwnedFree(rec);
-  }
-  SetLastError(err);
+static DNS_STATUS WINAPI HookDnsQueryRaw(void* request, void* cancel) {
+  if (!g_view_active) return TrueDnsQueryRaw(request, cancel);
+  DWORD error = GetLastError();
+  EnvBoxAuditEvent("DnsQueryRaw", 1, "dns-unsupported-raw");
+  SetLastError(error);
+  return ERROR_NOT_SUPPORTED;
 }
+
+int EnvBoxDnsHooksReady() { return g_dns_hooks_ready; }
 
 int EnvBoxInstallDnsHooks() {
   BuildDnsView();
+  g_dns_hooks_ready = 0;
   int ok = 0;
-  ok += EnvBoxAttach(&TrueGetNetworkParams, HookGetNetworkParams);
-  ok += EnvBoxAttach(&TrueGetAdaptersAddresses, HookGetAdaptersAddresses);
+  const int network_params = EnvBoxAttach(&TrueGetNetworkParams, HookGetNetworkParams);
+  const int adapters = EnvBoxAttach(&TrueGetAdaptersAddresses, HookGetAdaptersAddresses);
+  ok += network_params + adapters;
 
   // DNS routing only under VirtualView + Profile servers (Host path untouched).
   if (!g_view_active) {
+    g_dns_hooks_ready = network_params && adapters;
     EnvBoxAuditEvent("DnsQueryEx", 0, "dns-host");
     return ok;
   }
@@ -2664,30 +2562,30 @@ int EnvBoxInstallDnsHooks() {
   int free_ex_a = EnvBoxAttach(&TrueFreeAddrInfoExA, HookFreeAddrInfoExA);
   int free_ex_w = EnvBoxAttach(&TrueFreeAddrInfoExW, HookFreeAddrInfoExW);
   ok += free_a + free_w + free_ex_a + free_ex_w;
-  if (free_a) {
-    ok += EnvBoxAttach(&Truegetaddrinfo, Hookgetaddrinfo);
-  }
-  if (free_w) {
-    ok += EnvBoxAttach(&TrueGetAddrInfoW, HookGetAddrInfoW);
-  }
-  if (free_ex_a) {
-    ok += EnvBoxAttach(&TrueGetAddrInfoExA, HookGetAddrInfoExA);
-  }
-  if (free_ex_w) {
-    ok += EnvBoxAttach(&TrueGetAddrInfoExW, HookGetAddrInfoExW);
-  }
-  g_dns_free_hook_attached = EnvBoxAttach(&TrueDnsFree, HookDnsFree);
-  ok += g_dns_free_hook_attached;
-  if (g_dns_free_hook_attached) {
-    ok += EnvBoxAttach(&TrueDnsQuery_A, HookDnsQuery_A);
-    ok += EnvBoxAttach(&TrueDnsQuery_W, HookDnsQuery_W);
-    ok += EnvBoxAttach(&TrueDnsQuery_UTF8, HookDnsQuery_UTF8);
-  }
+  const int resolver_a = free_a && EnvBoxAttach(&Truegetaddrinfo, Hookgetaddrinfo);
+  const int resolver_w = free_w && EnvBoxAttach(&TrueGetAddrInfoW, HookGetAddrInfoW);
+  const int resolver_ex_a = free_ex_a && EnvBoxAttach(&TrueGetAddrInfoExA, HookGetAddrInfoExA);
+  const int resolver_ex_w = free_ex_w && EnvBoxAttach(&TrueGetAddrInfoExW, HookGetAddrInfoExW);
+  ok += resolver_a + resolver_w + resolver_ex_a + resolver_ex_w;
+  // Native dnsapi records can always be released by the original DnsFree.
+  const int query_a = EnvBoxAttach(&TrueDnsQuery_A, HookDnsQuery_A);
+  const int query_w = EnvBoxAttach(&TrueDnsQuery_W, HookDnsQuery_W);
+  const int query_utf8 = EnvBoxAttach(&TrueDnsQuery_UTF8, HookDnsQuery_UTF8);
+  ok += query_a + query_w + query_utf8;
   g_dns_cancel_hook_attached =
       EnvBoxAttach(&TrueDnsCancelQuery, HookDnsCancelQuery);
   ok += g_dns_cancel_hook_attached;
-  if (g_dns_free_hook_attached) {
-    ok += EnvBoxAttach(&TrueDnsQueryEx, HookDnsQueryEx);
-  }
+  const int query_ex = EnvBoxAttach(&TrueDnsQueryEx, HookDnsQueryEx);
+  ok += query_ex;
+  HMODULE dnsapi = GetModuleHandleW(L"dnsapi.dll");
+  TrueDnsQueryRaw = dnsapi == nullptr ? nullptr :
+      reinterpret_cast<decltype(TrueDnsQueryRaw)>(GetProcAddress(dnsapi, "DnsQueryRaw"));
+  const int raw_required = TrueDnsQueryRaw != nullptr;
+  const int raw = raw_required && EnvBoxAttach(&TrueDnsQueryRaw, HookDnsQueryRaw);
+  ok += raw;
+  g_dns_hooks_ready = network_params && adapters && free_a && free_w &&
+      free_ex_a && free_ex_w && resolver_a && resolver_w && resolver_ex_a &&
+      resolver_ex_w && query_a && query_w && query_utf8 && query_ex &&
+      g_dns_cancel_hook_attached && (!raw_required || raw);
   return ok;
 }

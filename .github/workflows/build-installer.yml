@@ -18,10 +18,10 @@ jobs:
       - name: Check out Aura
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
+      - name: Install Rust 1.99.0
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+          rustup default 1.99.0-x86_64-pc-windows-msvc
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@v2
@@ -83,7 +83,11 @@ jobs:
           "DETOURS_ROOT=$detours" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build Aura installer
-        run: .\scripts\build-installer.ps1
+        run: |
+          .\scripts\build-installer.ps1
+          if (-not (Test-Path -LiteralPath artifacts\envbox-supervisor.exe -PathType Leaf)) {
+            throw 'Supervisor backend missing from staged installer artifacts'
+          }
 
       - name: Write installer checksum
         run: |

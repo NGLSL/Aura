@@ -3,30 +3,38 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use thiserror::Error;
 use uuid::Uuid;
 
 pub mod browser_policy;
+pub mod container;
+pub use container::{Container, ContainerMode};
+pub mod dns;
+pub mod run_snapshot;
 pub mod session;
+pub mod storage_policy;
+pub use dns::{DnsProfile, DnsUpstream};
+pub use run_snapshot::RunSnapshot;
 
 pub use browser_policy::{
     browser_env_entries, ensure_chromium_webrtc_argv, ensure_chromium_webrtc_switch,
     ensure_webview2_arguments, plan_child_policy, BrowserChildPolicy, BrowserEngine,
-    BrowserGuarantee, BrowserPrivacyProfile, CommandLinePolicy, NetworkGuardCapability, PolicyApply,
-    WebRtcPolicy, AUDIT_API_NETWORK_UDP_DENY,
+    BrowserGuarantee, BrowserPrivacyProfile, CommandLinePolicy, NetworkGuardCapability,
+    PolicyApply, WebRtcPolicy, AUDIT_API_NETWORK_UDP_DENY,
 };
 pub use session::{
-    capabilities_for_target, evaluate_injection_support, isolation_for_strategy, is_packaged_target,
-    select_attach_strategy, ActivatedTarget, ActivationType, AttachStrategy, EnvironmentSession,
-    InjectionCapability, IntegrityLevel, IsolationGuarantee, MitigationPolicy, PackageIdentity,
-    SessionState, TargetCapabilities,
+    capabilities_for_target, evaluate_injection_support, is_packaged_target,
+    isolation_for_strategy, select_attach_strategy, ActivatedTarget, ActivationType,
+    AttachStrategy, EnvironmentSession, InjectionCapability, IntegrityLevel, IsolationGuarantee,
+    MitigationPolicy, PackageIdentity, SessionState, TargetCapabilities,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DomainError {
+    #[error("invalid Container: {0}")]
+    InvalidContainer(String),
     #[error("invalid Environment Profile: {0}")]
     InvalidProfile(String),
     #[error("invalid Application: {0}")]
@@ -36,8 +44,12 @@ pub enum DomainError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LaunchTarget {
-    Executable { path: PathBuf },
-    Command { command: String },
+    Executable {
+        path: PathBuf,
+    },
+    Command {
+        command: String,
+    },
     /// Packaged / WindowsApps target activated by AUMID (never raw WindowsApps exe).
     Packaged {
         aumid: String,
@@ -231,28 +243,6 @@ pub enum DnsMode {
     VirtualView,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DnsProfile {
-    pub mode: DnsMode,
-    pub servers: Vec<IpAddr>,
-}
-
-impl DnsProfile {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        match self.mode {
-            DnsMode::Host => {}
-            DnsMode::VirtualView => {
-                if self.servers.is_empty() {
-                    return Err(DomainError::InvalidProfile(
-                        "DNS VirtualView requires at least one server".into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RegistryProfile {
     pub whitelist_paths: Vec<String>,
@@ -309,6 +299,10 @@ pub struct RuntimeInstance {
     pub id: Uuid,
     pub application_id: Uuid,
     pub profile_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<Uuid>,
     pub root_pid: u32,
     pub process_ids: HashSet<u32>,
     pub started_at: SystemTime,
@@ -327,14 +321,13 @@ pub struct RuntimeInstance {
 impl RuntimeInstance {
     /// Map an EnvironmentSession control-plane aggregate to the persisted
     /// run record. Session fields never drop isolation/attach/package.
-    pub fn from_session(
-        session: &session::EnvironmentSession,
-        started_at: SystemTime,
-    ) -> Self {
+    pub fn from_session(session: &session::EnvironmentSession, started_at: SystemTime) -> Self {
         Self {
             id: session.id,
             application_id: session.application_id,
             profile_id: session.profile_id,
+            container_id: None,
+            snapshot_id: None,
             root_pid: session.root_processes.iter().next().copied().unwrap_or(0),
             process_ids: session.processes.clone(),
             started_at,
@@ -382,7 +375,10 @@ pub struct AuditEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     /// Collapsed call count for this line (default 1).
-    #[serde(default = "audit_event_default_n", skip_serializing_if = "audit_event_n_is_one")]
+    #[serde(
+        default = "audit_event_default_n",
+        skip_serializing_if = "audit_event_n_is_one"
+    )]
     pub n: u32,
 }
 
@@ -426,6 +422,7 @@ mod tests {
             dns: DnsProfile {
                 mode: DnsMode::VirtualView,
                 servers: vec!["1.1.1.1".parse().unwrap()],
+                ..Default::default()
             },
             environment: HashMap::from([("LANG".into(), "en_US.UTF-8".into())]),
             registry: RegistryProfile::default(),
@@ -436,6 +433,57 @@ mod tests {
     #[test]
     fn valid_profile_accepted() {
         assert!(valid_profile().validate().is_ok());
+    }
+
+    #[test]
+    fn snapshot_digest_is_map_order_stable_and_binds_instance_identity() {
+        let mut profile = valid_profile();
+        profile.environment = HashMap::from([("A".into(), "1".into()), ("B".into(), "2".into())]);
+        let container = Container::new("A", profile.id);
+        let a = RunSnapshot::new(&container, &profile, Uuid::new_v4()).unwrap();
+        profile.environment = HashMap::from([("B".into(), "2".into()), ("A".into(), "1".into())]);
+        let b = RunSnapshot::new(&container, &profile, Uuid::new_v4()).unwrap();
+        assert_eq!(a.configuration_id, b.configuration_id);
+        assert_ne!(a.content_digest, b.content_digest);
+        let mut changed = a.clone();
+        changed.instance_id = b.instance_id;
+        changed.snapshot_id = b.snapshot_id;
+        assert!(changed.validate().is_err());
+        let encoded = serde_json::to_string(&a).unwrap();
+        let decoded: RunSnapshot = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, a);
+        let mut missing = serde_json::to_value(&a).unwrap();
+        missing["effective_profile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("browser");
+        assert!(serde_json::from_value::<RunSnapshot>(missing).is_err());
+        let mut unknown = serde_json::to_value(&a).unwrap();
+        unknown["effective_profile"]["dns"]
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<RunSnapshot>(unknown).is_err());
+    }
+
+    #[test]
+    fn runtime_instance_legacy_record_defaults_container_identity() {
+        let session = EnvironmentSession::new(
+            Uuid::new_v4(),
+            LaunchTarget::Command {
+                command: "cmd.exe".into(),
+            },
+            Uuid::new_v4(),
+            IsolationGuarantee::FullPreExecution,
+            AttachStrategy::PreExecution,
+        );
+        let instance = RuntimeInstance::from_session(&session, SystemTime::now());
+        let encoded = serde_json::to_string(&instance).unwrap();
+        assert!(!encoded.contains("container_id") && !encoded.contains("snapshot_id"));
+        let decoded: RuntimeInstance = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.container_id, None);
+        assert_eq!(decoded.snapshot_id, None);
     }
 
     #[test]

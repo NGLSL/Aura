@@ -231,6 +231,11 @@ static void ApplyIpcProfile(const RuntimeProfile* src) {
   g_profile.inherit_children = src->inherit_children;
   g_profile.audit = src->audit;
   g_profile.dns_mode = src->dns_mode;
+  g_profile.dns_config_version = src->dns_config_version;
+  g_profile.dns_strict = src->dns_strict;
+  g_profile.dns_upstream_count = src->dns_upstream_count;
+  for (int i = 0; i < src->dns_upstream_count && i < ENVBOX_DNS_MAX; ++i)
+    g_profile.dns_upstreams[i] = src->dns_upstreams[i];
   g_profile.dns_server_count = src->dns_server_count;
   for (int i = 0; i < src->dns_server_count && i < ENVBOX_DNS_MAX; i++) {
     strncpy_s(g_profile.dns_servers[i], src->dns_servers[i], _TRUNCATE);
@@ -323,6 +328,20 @@ static void ApplyCurrentProcessEnvironment(const RuntimeProfile* profile,
     dns_servers.append(server);
   }
   SetEnvironmentVariableW(L"ENVBOX_DNS_SERVERS", dns_servers.c_str());
+  if (profile->dns_config_version == 1) {
+    EnvBoxEmitDnsConfiguration(profile, [](void*, const char* key, const char* value) {
+      wchar_t name[128] = L"ENVBOX_";
+      size_t n = strlen(key);
+      if (n + 8 > ARRAYSIZE(name)) return 0;
+      for (size_t i = 0; i < n; ++i) {
+        char c = key[i];
+        name[i + 7] = c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c;
+      }
+      wchar_t text[2048];
+      if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, text, ARRAYSIZE(text))) return 0;
+      return SetEnvironmentVariableW(name, text) ? 1 : 0;
+    }, nullptr);
+  }
 
   std::wstring registry_paths;
   for (int i = 0;
@@ -387,6 +406,62 @@ static void SplitListW(const wchar_t* raw, wchar_t out[][128], int max_items,
 
 // ENVBOX_* structured value fallback (no file, no TOML).
 // Required: locale_name, ui_language, region, tz_windows.
+static int DnsEnvironmentField(void*, const char* key, char* value, size_t capacity) {
+  wchar_t name[128] = L"ENVBOX_";
+  size_t length = strlen(key);
+  if (length + 8 > ARRAYSIZE(name) || capacity > 2048) return -1;
+  for (size_t i = 0; i < length; ++i) {
+    char c = key[i];
+    name[i + 7] = c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c;
+  }
+  wchar_t buffer[2048];
+  SetLastError(ERROR_SUCCESS);
+  DWORD count = GetEnvironmentVariableW(name, buffer, ARRAYSIZE(buffer));
+  if (count == 0) {
+    if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) return 0;
+    value[0] = '\0';
+    return 1;
+  }
+  if (count >= ARRAYSIZE(buffer)) return -1;
+  return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, buffer, -1, value,
+                             static_cast<int>(capacity), nullptr, nullptr) > 0 ? 1 : -1;
+}
+
+// Unlike IPC's enumerable key map, the getter alone cannot detect extra fields.
+// Check the process environment against the exact snapshot shape after decode;
+// a missing version must not turn residual typed fields into a legacy profile.
+static int DnsEnvironmentShapeValid(const RuntimeProfile* profile) {
+  struct Names { wchar_t values[128][128]; int count; } names = {};
+  if (!EnvBoxEmitDnsConfiguration(profile, [](void* context, const char* key, const char*) {
+    auto names = static_cast<Names*>(context);
+    size_t length = strlen(key);
+    if (names->count >= 128 || length + 8 > 128) return 0;
+    wchar_t* name = names->values[names->count++];
+    wcscpy_s(name, 128, L"ENVBOX_");
+    for (size_t i = 0; i < length; ++i)
+      name[i + 7] = key[i] >= 'a' && key[i] <= 'z' ? key[i] - 'a' + 'A' : key[i];
+    return 1;
+  }, &names)) return 0;
+  LPWCH block = GetEnvironmentStringsW();
+  if (!block) return 0;
+  int valid = 1;
+  for (const wchar_t* entry = block; *entry && valid; entry += wcslen(entry) + 1) {
+    if (_wcsnicmp(entry, L"ENVBOX_DNS_", 11) != 0) continue;
+    const wchar_t* separator = wcschr(entry, L'=');
+    if (!separator) { valid = 0; break; }
+    size_t length = separator - entry;
+    // The address projection is a compatibility view, not a typed authority.
+    // UDP_PORT remains a legacy-only fixture knob and cannot override v1 ports.
+    bool allowed = (length == 18 && _wcsnicmp(entry, L"ENVBOX_DNS_SERVERS", length) == 0) ||
+                   (length == 19 && _wcsnicmp(entry, L"ENVBOX_DNS_UDP_PORT", length) == 0);
+    for (int i = 0; i < names.count && !allowed; ++i)
+      allowed = wcslen(names.values[i]) == length && _wcsnicmp(entry, names.values[i], length) == 0;
+    if (!allowed) valid = 0;
+  }
+  FreeEnvironmentStringsW(block);
+  return valid;
+}
+
 static int LoadFromEnvValues() {
   wchar_t tmp[128];
 
@@ -404,29 +479,13 @@ static int LoadFromEnvValues() {
   }
   ReadEnvW(L"ENVBOX_TZ_IANA", g_profile.tz_iana, 128);
 
-  wchar_t dns_mode[8] = {};
-  if (ReadEnvW(L"ENVBOX_DNS_MODE", dns_mode, 8) && dns_mode[0] == L'1') {
-    g_profile.dns_mode = 1;
+  if (!EnvBoxDecodeDnsConfiguration(&g_profile, DnsEnvironmentField, nullptr) ||
+      !DnsEnvironmentShapeValid(&g_profile)) {
+    OutputDebugStringA("EnvBox: invalid/incomplete DNS snapshot\n");
+    return 0;
   }
-
-  char dns_raw[512] = {};
-  if (ReadEnvA("ENVBOX_DNS_SERVERS", dns_raw, (DWORD)sizeof(dns_raw))) {
-    char rows[ENVBOX_DNS_MAX][64];
-    int n = SplitListA(dns_raw, rows, ENVBOX_DNS_MAX);
-    if (n < 0) {
-      OutputDebugStringA("EnvBox: dns servers overflow, DNS View disabled\n");
-      g_profile.dns_mode = 0;
-      g_profile.dns_server_count = 0;
-    } else {
-      g_profile.dns_server_count = n;
-      for (int i = 0; i < n; i++) {
-        strncpy_s(g_profile.dns_servers[i], rows[i], _TRUNCATE);
-      }
-    }
-  }
-  // VirtualView + empty dns_servers is legal: DNS View / resolve stay off
-  // (hooks_dns requires servers), while Network Guard treats the empty list as
-  // "close external UDP/53". Do not coerce to Host.
+  // An empty VirtualView stays virtual and resolves unsuccessfully in strict
+  // mode. It must not expose the host's resolver configuration.
 
   wchar_t reg_raw[2048] = {};
   if (ReadEnvW(L"ENVBOX_REGISTRY_PATHS", reg_raw,
@@ -522,7 +581,5 @@ int EnvBoxLoadProfile() {
 
   ApplyCurrentProcessEnvironment(&g_profile, g_environment_complete);
   g_loaded = 1;
-  // Best-effort readiness notice; never affects startup success.
-  EnvBoxIpcNotifyRuntimeReady();
   return 1;
 }

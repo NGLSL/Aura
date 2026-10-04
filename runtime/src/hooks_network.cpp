@@ -196,7 +196,8 @@ static int AddrPort(const struct sockaddr* addr, int len) {
 static int AddrEqualForDns(const struct sockaddr* a, int alen,
                            const struct sockaddr* b, int blen) {
   if (a == nullptr || b == nullptr) return 0;
-  // Compare IP only (DNS port is checked separately).
+  const int port = AddrPort(a, alen);
+  if (port <= 0 || port != AddrPort(b, blen)) return 0;
   if (a->sa_family == AF_INET && b->sa_family == AF_INET) {
     if (alen < (int)sizeof(sockaddr_in) || blen < (int)sizeof(sockaddr_in)) {
       return 0;
@@ -274,10 +275,15 @@ static void DnsAllowAdd(const struct sockaddr* addr, int len) {
   g_dns_allow_count++;
 }
 
-static void DnsAllowAddText(const char* text) {
+static void DnsAllowAddText(const char* text, unsigned short port = 53) {
   sockaddr_storage ss = {};
   int slen = 0;
   if (ParseDnsServerA(text, &ss, &slen)) {
+    if (ss.ss_family == AF_INET) {
+      ((sockaddr_in*)&ss)->sin_port = htons(port);
+    } else {
+      ((sockaddr_in6*)&ss)->sin6_port = htons(port);
+    }
     DnsAllowAdd((const struct sockaddr*)&ss, slen);
   }
 }
@@ -309,10 +315,19 @@ static void DnsAllowAddHostResolvers() {
 static void BuildDnsAllowlist(const RuntimeProfile* pfl) {
   g_dns_allow_count = 0;
   if (pfl != nullptr && pfl->dns_mode == 1) {
-    // VirtualView: ONLY Profile dns_servers. Empty list closes external UDP/53
-    // (DoH / local stub). Loopback stays open via IsLoopbackAddr regardless.
-    for (int i = 0; i < pfl->dns_server_count && i < ENVBOX_DNS_MAX; i++) {
-      DnsAllowAddText(pfl->dns_servers[i]);
+    // Only explicitly configured UDP endpoints need a UDP exception. TCP,
+    // DoT and DoH do not authorize plaintext UDP to their addresses.
+    if (pfl->dns_config_version == 1) {
+      for (int i = 0; i < pfl->dns_upstream_count && i < ENVBOX_DNS_MAX; i++) {
+        const auto& upstream = pfl->dns_upstreams[i];
+        if (upstream.type == EnvBoxDnsUdp) {
+          DnsAllowAddText(upstream.address, upstream.port);
+        }
+      }
+    } else {
+      for (int i = 0; i < pfl->dns_server_count && i < ENVBOX_DNS_MAX; i++) {
+        DnsAllowAddText(pfl->dns_servers[i]);
+      }
     }
   } else {
     // Host mode (or no Profile): system DNS actually sends to host resolvers.
@@ -368,18 +383,14 @@ static void LoadWebrtcPolicy() {
   }
 }
 
-// Strict: deny non-loopback UDP except UDP/53 to the DNS resolver allowlist.
+// Strict: deny non-loopback UDP except exact configured DNS endpoints.
 // Returns 1 when the send/connect must be blocked.
 static int ShouldDenyUdp(const struct sockaddr* addr, int len) {
   if (g_webrtc_policy != 3) return 0;
   if (IsLoopbackAddr(addr, len)) return 0;
-  // UDP/53 is allowed ONLY to Profile/host resolver IPs - never any :53.
-  // STUN/TURN/any other port is denied (never a well-known-port blocklist;
-  // the deny is the default and DNS is the explicit exception).
-  if (AddrPort(addr, len) == 53) {
-    return IsAllowedDnsDest(addr, len) ? 0 : 1;
-  }
-  return 1;
+  // The allowlist includes the port, so a configured custom DNS port does
+  // not authorize other UDP ports at the same server.
+  return IsAllowedDnsDest(addr, len) ? 0 : 1;
 }
 
 static void AuditUdpDeny(const char* api) {

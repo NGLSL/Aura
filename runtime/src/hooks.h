@@ -28,6 +28,7 @@ int EnvBoxInstallCrtLocaleHooks();
 int EnvBoxInstallLanguageHooks();
 int EnvBoxInstallProcessHooks();
 int EnvBoxInstallDnsHooks();
+int EnvBoxDnsHooksReady();
 int EnvBoxInstallRegistryHooks();
 // Network Guard (ticket 56): Strict UDP deny for this process tree.
 // Returns 1 when the process may start (non-Strict, or Strict guard armed).

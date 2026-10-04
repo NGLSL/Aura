@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, pick_list, row, text, text_input};
+use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
 use iced::{Alignment, Element, Fill, Padding};
 
 use crate::app::EnvBoxApp;
@@ -100,13 +100,13 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
         }
     };
 
-    let dns = if p.dns.servers.is_empty() {
+    let dns = if p.dns.mode == envbox_core::DnsMode::Host {
         "跟随系统 DNS".to_string()
     } else {
         p.dns
-            .servers
+            .effective_upstreams()
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| s.label())
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -298,14 +298,7 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
                     .padding(Padding::from([5, 8]))
                     .font(font::ui_font()),
                 ),
-                form_row(
-                    "DNS 服务器",
-                    text_input("例如 1.1.1.1, 8.8.8.8", &app.profile_draft.dns_servers)
-                        .on_input(Message::ProfileDnsServers)
-                        .padding(Padding::from([5, 8]))
-                        .style(input_style)
-                        .font(font::ui_font()),
-                ),
+                form_row("DNS 上游顺序", dns_editor_view(app),),
                 form_row(
                     "WebRTC",
                     pick_list(
@@ -389,4 +382,78 @@ fn dns_mode_label(mode: &envbox_core::DnsMode) -> &'static str {
         envbox_core::DnsMode::Host => "宿主",
         envbox_core::DnsMode::VirtualView => "虚拟视图",
     }
+}
+
+fn dns_editor_view(app: &EnvBoxApp) -> Element<'_, Message> {
+    use crate::app::dns_editor::TransportChoice;
+    let editor = &app.profile_draft.dns_editor;
+    let mut content = column![
+        checkbox("Strict：全部上游失败时禁止回退宿主 DNS", editor.strict)
+            .on_toggle(Message::ProfileDnsStrict),
+        text("按列表顺序尝试，不自动添加上游。Host 模式单独使用宿主 DNS。"),
+    ]
+    .spacing(8);
+    if editor
+        .upstreams
+        .iter()
+        .any(envbox_core::DnsUpstream::is_plaintext)
+    {
+        content = content.push(text(
+            "包含 UDP/TCP 明文上游；前面的加密上游失败后可能发送明文查询。",
+        ));
+    }
+    if editor
+        .to_profile(app.profile_draft.dns_mode.to_mode())
+        .ok()
+        .is_some_and(|dns| dns.validate_runtime_support().is_err())
+    {
+        content = content.push(text(
+            "配置可以保存；当前 Runtime 不支持此协议、端口或 non-strict 组合，启动会拒绝。",
+        ));
+    }
+    for (index, upstream) in editor.upstreams.iter().enumerate() {
+        content = content.push(
+            row![
+                text(format!("{} · {}", index + 1, upstream.label())).width(Fill),
+                button("↑").on_press(Message::ProfileDnsMove(index, true)),
+                button("↓").on_press(Message::ProfileDnsMove(index, false)),
+                button("移除").on_press(Message::ProfileDnsRemove(index)),
+            ]
+            .spacing(4),
+        );
+    }
+    content = content.push(pick_list(
+        TransportChoice::ALL,
+        Some(editor.draft.transport),
+        Message::ProfileDnsTransport,
+    ));
+    if editor.draft.transport == TransportChoice::Doh {
+        content = content.push(
+            text_input("https://resolver.example/dns-query", &editor.draft.url)
+                .on_input(Message::ProfileDnsUrl),
+        );
+        content = content.push(
+            text_input("显式 bootstrap IP，逗号分隔", &editor.draft.bootstrap)
+                .on_input(Message::ProfileDnsBootstrap),
+        );
+    } else {
+        content = content.push(
+            text_input("literal IP，例如 1.1.1.1", &editor.draft.address)
+                .on_input(Message::ProfileDnsAddress),
+        );
+        content =
+            content.push(text_input("端口", &editor.draft.port).on_input(Message::ProfileDnsPort));
+        if editor.draft.transport == TransportChoice::Dot {
+            content = content.push(
+                text_input(
+                    "证书身份，例如 cloudflare-dns.com",
+                    &editor.draft.server_name,
+                )
+                .on_input(Message::ProfileDnsServerName),
+            );
+        }
+    }
+    content
+        .push(button("添加上游").on_press(Message::ProfileDnsAdd))
+        .into()
 }

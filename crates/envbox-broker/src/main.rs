@@ -4,8 +4,10 @@
 //!   envbox-broker [--pipe NAME]
 //!
 //! Default pipe: `\\.\pipe\envbox-runtime` (override ENVBOX_IPC_PIPE or --pipe).
-//! Hosts (CLI/GUI) register sessions with REGISTER_PROFILE / BIND_PID on the
-//! same pipe; Runtime connects with HELLO / GET_PROFILE.
+//! This pipe is an authenticated Runtime bootstrap endpoint. REGISTER_PROFILE
+//! and BIND_PID are trusted in-process registry operations, never commands
+//! accepted from a Runtime connection. A future Supervisor management endpoint
+//! must authorize its clients separately before changing this registry.
 
 use envbox_broker::{new_registry, serve};
 use std::sync::atomic::{AtomicBool, Ordering};

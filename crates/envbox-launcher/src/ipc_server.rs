@@ -12,6 +12,216 @@ use std::time::Duration;
 /// Shared host session registry used by the pipe server.
 pub type SharedTable = Arc<Mutex<SessionTable>>;
 
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedProcess {
+    pub pid: u32,
+    pub creation_time: u64,
+}
+
+pub(crate) fn protocol_denied(reason: &str) -> IpcMessage {
+    IpcMessage::Other {
+        name: "ERROR".into(),
+        fields: vec![("code".into(), reason.into())],
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn process_creation_time(pid: u32) -> Option<u64> {
+    use crate::launcher::win::SafeHandle;
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let process = SafeHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?);
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user).ok()?;
+        Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn process_creation_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(windows)]
+fn authenticate_process(pid: u32) -> std::io::Result<AuthenticatedProcess> {
+    use crate::launcher::win::SafeHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+        TokenIntegrityLevel, TokenUser, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe fn token_info(
+        token: HANDLE,
+        class: TOKEN_INFORMATION_CLASS,
+    ) -> std::io::Result<Vec<usize>> {
+        let mut size = 0;
+        let _ = unsafe { GetTokenInformation(token, class, None, 0, &mut size) };
+        if size == 0 || size > 65536 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Windows returns structures containing pointers: maintain alignment.
+        let mut data = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                Some(data.as_mut_ptr().cast()),
+                size,
+                &mut size,
+            )
+        }?;
+        Ok(data)
+    }
+    unsafe fn facts(pid: u32) -> std::io::Result<(Vec<u8>, u32)> {
+        let process =
+            SafeHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }?);
+        let mut raw = HANDLE::default();
+        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut raw) }?;
+        let token = SafeHandle(raw);
+        let user = unsafe { token_info(token.0, TokenUser) }?;
+        let sid = unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        if len == 0 || len > 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid owner SID",
+            ));
+        }
+        let sid_bytes = unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), len) }.to_vec();
+        let integrity = unsafe { token_info(token.0, TokenIntegrityLevel) }?;
+        let sid = unsafe {
+            (*(integrity.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()))
+                .Label
+                .Sid
+        };
+        let count = unsafe { *GetSidSubAuthorityCount(sid) };
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid integrity SID",
+            ));
+        }
+        let level = unsafe { *GetSidSubAuthority(sid, u32::from(count - 1)) };
+        Ok((sid_bytes, level))
+    }
+    let client = unsafe { facts(pid) }?;
+    let owner = unsafe { facts(std::process::id()) }?;
+    if client.0 != owner.0 || client.1 > owner.1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bootstrap owner/integrity mismatch",
+        ));
+    }
+    let creation_time = process_creation_time(pid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot query client generation",
+        )
+    })?;
+    Ok(AuthenticatedProcess { pid, creation_time })
+}
+
+#[cfg(windows)]
+pub(crate) fn process_parent(pid: u32) -> Option<u32> {
+    use crate::launcher::win::SafeHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snapshot = SafeHandle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?);
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        Process32FirstW(snapshot.0, &mut entry).ok()?;
+        loop {
+            if entry.th32ProcessID == pid {
+                return Some(entry.th32ParentProcessID);
+            }
+            if Process32NextW(snapshot.0, &mut entry).is_err() {
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn process_parent(_pid: u32) -> Option<u32> {
+    None
+}
+
+pub(crate) fn file_sha256(path: &std::path::Path) -> Result<String, crate::ipc::IpcError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| crate::ipc::IpcError::Io(e.to_string()))?;
+    let mut hash = Sha256::new();
+    let mut bytes = [0; 65536];
+    loop {
+        let n = file
+            .read(&mut bytes)
+            .map_err(|e| crate::ipc::IpcError::Io(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&bytes[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(windows)]
+pub(crate) fn process_has_module(pid: u32, expected: &std::path::Path) -> bool {
+    use crate::launcher::win::SafeHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
+    };
+    unsafe {
+        let Ok(handle) = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+        else {
+            return false;
+        };
+        let snapshot = SafeHandle(handle);
+        let mut entry = MODULEENTRY32W {
+            dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Module32FirstW(snapshot.0, &mut entry).is_err() {
+            return false;
+        }
+        loop {
+            let end = entry
+                .szExePath
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(entry.szExePath.len());
+            let path = std::path::PathBuf::from(String::from_utf16_lossy(&entry.szExePath[..end]));
+            if std::fs::canonicalize(path).ok().as_deref() == Some(expected) {
+                return true;
+            }
+            if Module32NextW(snapshot.0, &mut entry).is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn process_has_module(_pid: u32, _expected: &std::path::Path) -> bool {
+    false
+}
+
 /// Background Named Pipe broker. Dropping stops the accept loop.
 pub struct HostBroker {
     table: SharedTable,
@@ -213,12 +423,10 @@ fn serve_loop(
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, HANDLE,
     };
-    use windows::Win32::Storage::FileSystem::{
-        FlushFileBuffers, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
-    };
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_WAIT,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
 
     struct OwnedHandle(HANDLE);
@@ -247,7 +455,7 @@ fn serve_loop(
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
                 open_mode,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 8,
                 8192,
                 8192,
@@ -290,7 +498,6 @@ fn serve_loop(
 
         let _ = serve_connection(pipe.0, &table);
         unsafe {
-            let _ = FlushFileBuffers(pipe.0);
             let _ = DisconnectNamedPipe(pipe.0);
         }
         drop(pipe);
@@ -302,35 +509,94 @@ fn serve_connection(
     pipe: windows::Win32::Foundation::HANDLE,
     table: &SharedTable,
 ) -> std::io::Result<()> {
+    use windows::Win32::Foundation::{GetLastError, ERROR_NO_DATA};
     use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows::Win32::System::Pipes::{
+        GetNamedPipeClientProcessId, SetNamedPipeHandleState, PIPE_NOWAIT,
+    };
+
+    let mut client_pid = 0;
+    unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) }?;
+    let client = authenticate_process(client_pid)?;
+    // Bounded, nonblocking connection I/O: a client that keeps a pipe open
+    // without reading/writing must not hang broker teardown or bootstrap.
+    let mode = PIPE_NOWAIT;
+    unsafe { SetNamedPipeHandleState(pipe, Some(&mode), None, None) }?;
 
     let mut buf = [0u8; 8192];
     let mut acc = Vec::new();
+    let mut deadline = std::time::Instant::now() + Duration::from_millis(750);
     loop {
         let mut read = 0u32;
         let ok = unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) };
+        if ok.is_err()
+            && unsafe { GetLastError() } == ERROR_NO_DATA
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
         if ok.is_err() || read == 0 {
             return Ok(());
         }
         acc.extend_from_slice(&buf[..read as usize]);
         while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+            if pos > crate::ipc::IPC_IDENTITY_MAX_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "IPC line exceeds limit",
+                ));
+            }
             let line_bytes: Vec<u8> = acc.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes)
+            let line = std::str::from_utf8(&line_bytes)
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid IPC UTF-8")
+                })?
                 .trim_end_matches(['\r', '\n'])
                 .to_string();
             if line.is_empty() {
                 continue;
             }
             let Ok(msg) = IpcMessage::decode_line(&line) else {
+                let mut out = protocol_denied("malformed_message")
+                    .encode_line()
+                    .into_bytes();
+                out.push(b'\n');
+                let mut written = 0;
+                let _ = unsafe { WriteFile(pipe, Some(&out), Some(&mut written), None) };
                 continue;
             };
-            let reply = table.lock().unwrap().handle(&msg);
+            // Re-check the process generation on every message. A cached PID
+            // alone must not authorize a newly created process after reuse.
+            let reply = if process_creation_time(client_pid) == Some(client.creation_time) {
+                table.lock().unwrap().handle_client(&client, &msg)
+            } else {
+                Some(protocol_denied("client_generation_changed"))
+            };
             if let Some(rep) = reply {
                 let mut out = rep.encode_line().into_bytes();
                 out.push(b'\n');
-                let mut written = 0u32;
-                let _ = unsafe { WriteFile(pipe, Some(&out), Some(&mut written), None) };
+                let mut offset = 0;
+                while offset < out.len() && std::time::Instant::now() < deadline {
+                    let mut written = 0u32;
+                    let result =
+                        unsafe { WriteFile(pipe, Some(&out[offset..]), Some(&mut written), None) };
+                    if result.is_err() {
+                        return Ok(());
+                    }
+                    offset += written as usize;
+                    if written == 0 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
             }
+            deadline = std::time::Instant::now() + Duration::from_millis(750);
+        }
+        if acc.len() > crate::ipc::IPC_IDENTITY_MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IPC line exceeds limit",
+            ));
         }
     }
 }

@@ -2,3 +2,5 @@ LIBRARY "envbox-runtime32"
 EXPORTS
   EnvBoxDetourFinishHelperProcess @1 NONAME
   EnvBoxRuntimeLoaded @2
+  EnvBoxRuntimeReconnect @3
+  EnvBoxRuntimeCapabilities @4 DATA

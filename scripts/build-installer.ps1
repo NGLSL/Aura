@@ -128,6 +128,7 @@ $bins = @(
     "envbox-app.exe",
     "envbox.exe",
     "envbox-broker.exe",
+    "envbox-supervisor.exe",
     "envbox-probe.exe",
     "envbox-browser-probe.exe",
     "envbox-suspended-helper.exe",

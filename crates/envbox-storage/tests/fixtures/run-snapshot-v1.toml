@@ -1,0 +1,41 @@
+schema_version = 1
+profile_schema_version = 1
+snapshot_id = "00000000-0000-4000-8000-000000000014"
+instance_id = "00000000-0000-4000-8000-000000000014"
+container_id = "bae90d7d-02b5-40a3-b9e0-e10f2c1b2d8a"
+created_at_unix_ms = 1791144294068
+configuration_id = "888b0b6b52090cd2ad6c625fbb520e319dce0544d83f0fb6d7794bc3517c7527"
+content_digest = "85ca1fc3325df45b5a9caee9fef58e96ae6379e82fe97b417fa242703e05f4c7"
+mode = "compatibility"
+
+[effective_profile]
+id = "9e151352-e9c5-4d99-8ef6-dca04f79cb96"
+name = "Legacy Snapshot"
+
+[effective_profile.locale]
+locale_name = "en-US"
+ui_language = "en-US"
+region = "US"
+
+[effective_profile.timezone]
+windows_id = "Pacific Standard Time"
+iana_id = "America/Los_Angeles"
+
+[effective_profile.dns]
+mode = "virtual_view"
+servers = [
+    "1.1.1.1",
+    "1.0.0.1",
+]
+
+[effective_profile.environment]
+
+[effective_profile.registry]
+whitelist_paths = []
+
+[effective_profile.browser]
+webrtc = "host"
+
+[storage_policy]
+schema_version = 1
+rules = []

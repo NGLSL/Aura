@@ -166,6 +166,8 @@ impl InstanceManager {
 
         let profile_id = target.profile_id();
         let meta = RuntimeInstance {
+            container_id: None,
+            snapshot_id: None,
             id,
             application_id: app.id,
             profile_id,
@@ -757,6 +759,7 @@ mod tests {
             dns: DnsProfile {
                 mode: DnsMode::Host,
                 servers: vec![],
+                ..Default::default()
             },
             environment: HashMap::new(),
             registry: RegistryProfile::default(),

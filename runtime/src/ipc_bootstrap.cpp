@@ -9,13 +9,28 @@
 #include <string.h>
 
 #include <string>
+#include <memory>
 
 namespace {
 
 constexpr DWORD kConnectTimeoutMs = 2000;
 constexpr DWORD kIoTimeoutMs = 3000;
 constexpr size_t kMaxLine = 8192;
-constexpr int kMaxKv = 96;
+constexpr int kMaxKv = 256;
+
+// Built from actual installed facts in DllMain; entry gate replays it on the
+// same live connection as Ready. A fire-and-forget client can close before
+// the Host authenticates it, so that optional notice cannot authorize entry.
+std::string g_runtime_identity_wire;
+HANDLE g_recovery_job = nullptr;
+wchar_t g_recovery_job_name[256] = {};
+
+// OVERLAPPED and its event must remain alive until cancellation completes.
+void CancelAndDrain(HANDLE pipe, OVERLAPPED* operation) {
+  CancelIoEx(pipe, operation);
+  DWORD ignored = 0;
+  GetOverlappedResult(pipe, operation, &ignored, TRUE);
+}
 
 // ---------------------------------------------------------------------------
 // Pipe name resolution: ENVBOX_IPC_PIPE (bare name or \\.\pipe\... path).
@@ -68,7 +83,7 @@ int WriteAll(HANDLE h, const char* data, DWORD len, ULONGLONG deadline) {
       }
       DWORD w = WaitForSingleObject(ov.hEvent, timeout);
       if (w != WAIT_OBJECT_0) {
-        CancelIo(h);
+        CancelAndDrain(h, &ov);
         CloseHandle(ov.hEvent);
         return 0;
       }
@@ -78,6 +93,7 @@ int WriteAll(HANDLE h, const char* data, DWORD len, ULONGLONG deadline) {
       }
     }
     CloseHandle(ov.hEvent);
+    if (n == 0) return 0;
     sent += n;
   }
   return 1;
@@ -124,7 +140,7 @@ int ReadMore(PipeReader* r, ULONGLONG deadline) {
     }
     DWORD w = WaitForSingleObject(ov.hEvent, timeout);
     if (w != WAIT_OBJECT_0) {
-      CancelIo(r->h);
+      CancelAndDrain(r->h, &ov);
       CloseHandle(ov.hEvent);
       return 0;
     }
@@ -282,7 +298,7 @@ struct IpcMsg {
   char name[32];
   int count;
   char key[kMaxKv][32];
-  char val[kMaxKv][512];
+  char val[kMaxKv][2048];
 };
 
 int UnquoteInto(const char* src, size_t len, char* out, size_t cap) {
@@ -305,7 +321,7 @@ int UnquoteInto(const char* src, size_t len, char* out, size_t cap) {
     out[o++] = c;
   }
   out[o] = '\0';
-  return o > 0 || cap > 0;
+  return i == len && cap > 0;
 }
 
 int ParseMsg(const char* line, IpcMsg* out) {
@@ -354,8 +370,8 @@ int ParseMsg(const char* line, IpcMsg* out) {
       if (line[i] != '"') {
         return 0;  // unterminated quote
       }
-      UnquoteInto(line + start, i - start, out->val[out->count],
-                  sizeof(out->val[0]));
+      if (!UnquoteInto(line + start, i - start, out->val[out->count],
+                  sizeof(out->val[0]))) return 0;
       i++;  // skip closing quote
     } else {
       size_t start = i;
@@ -368,6 +384,12 @@ int ParseMsg(const char* line, IpcMsg* out) {
       }
       memcpy(out->val[out->count], line + start, len);
       out->val[out->count][len] = '\0';
+    }
+    if (strcmp(out->key[out->count], "dns_server") != 0 &&
+        strcmp(out->key[out->count], "environment") != 0 &&
+        strcmp(out->key[out->count], "registry_path") != 0) {
+      for (int previous = 0; previous < out->count; ++previous)
+        if (strcmp(out->key[previous], out->key[out->count]) == 0) return 0;
     }
     out->count++;
   }
@@ -439,6 +461,43 @@ int ParseFlag(const IpcMsg* m, const char* key, int def) {
   return (v[0] == '1' && v[1] == '\0') ? 1 : 0;
 }
 
+int DnsMessageField(void* context, const char* key, char* out, size_t capacity) {
+  const IpcMsg* message = static_cast<const IpcMsg*>(context);
+  std::string joined;
+  const char* value = nullptr;
+  if (strcmp(key, "dns_servers") == 0) {
+    for (int i = 0; i < message->count; ++i) if (strcmp(message->key[i], "dns_server") == 0) {
+      if (!joined.empty()) joined += ';'; joined += message->val[i];
+    }
+    if (joined.empty()) return 0;
+    value = joined.c_str();
+  } else value = MsgGet(message, key);
+  if (!value) return 0;
+  if (strlen(value) >= capacity) return -1;
+  strcpy_s(out, capacity, value);
+  return 1;
+}
+
+int DecodeDnsMessage(const IpcMsg* message, RuntimeProfile* profile) {
+  bool typed = MsgGet(message, "dns_config_version") != nullptr;
+  for (int i = 0; i < message->count; ++i) {
+    const char* key = message->key[i];
+    if (typed && (strcmp(key, "dns_server") == 0 || strcmp(key, "dns_servers") == 0)) return 0;
+    if (!typed && strncmp(key, "dns_", 4) == 0 && strcmp(key, "dns_mode") && strcmp(key, "dns_server")) return 0;
+  }
+  if (!MsgGet(message, "dns_mode") || !EnvBoxDecodeDnsConfiguration(profile, DnsMessageField, const_cast<IpcMsg*>(message))) return 0;
+  if (typed) {
+    std::string keys;
+    auto collect = [](void* context, const char* key, const char*) -> int { auto* names = static_cast<std::string*>(context); *names += '|'; *names += key; *names += '|'; return 1; };
+    if (!EnvBoxEmitDnsConfiguration(profile, collect, &keys)) return 0;
+    for (int i = 0; i < message->count; ++i) if (strncmp(message->key[i], "dns_", 4) == 0) {
+      std::string key = "|"; key += message->key[i]; key += '|';
+      if (keys.find(key) == std::string::npos) return 0;
+    }
+  }
+  return 1;
+}
+
 // Apply a decoded PROFILE message into *out. Returns 1 when required fields
 // are present (same completeness rule as the ENVBOX_* value fallback).
 int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
@@ -470,9 +529,7 @@ int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
   }
   out->inherit_children = ParseFlag(m, "inherit_children", 1);
   out->audit = ParseFlag(m, "audit", 0);
-  out->dns_mode = ParseFlag(m, "dns_mode", 0);
-  out->dns_server_count =
-      MsgGetAll(m, "dns_server", out->dns_servers, ENVBOX_DNS_MAX, 64);
+  if (!DecodeDnsMessage(m, out)) return 0;
   // VirtualView + empty dns_servers stays VirtualView: no virtual resolve, but
   // Network Guard can close external UDP/53 (empty allowlist).
   out->registry_path_count =
@@ -493,10 +550,10 @@ int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
 }
 
 // Send one fire-and-forget message on a fresh connection. Best-effort.
-void Notify(const char* name, const std::string& body) {
+void Notify(const char* name, const std::string& body, DWORD connect_ms = 100) {
   // Lifecycle notices are best-effort. After Aura exits, child creation must
   // not stall for the full bootstrap timeout before using inherited values.
-  HANDLE h = ConnectPipe(100);
+  HANDLE h = ConnectPipe(connect_ms);
   if (h == INVALID_HANDLE_VALUE) {
     return;
   }
@@ -570,7 +627,7 @@ int EnvBoxIpcFetchProfile(RuntimeProfile* out) {
   PipeReader reader = {};
   reader.h = h;
   char line[kMaxLine];
-  IpcMsg msg;
+  auto msg = std::make_unique<IpcMsg>();
   int got = 0;
   for (;;) {
     if (!ReadLine(&reader, line, sizeof(line), deadline)) {
@@ -578,12 +635,17 @@ int EnvBoxIpcFetchProfile(RuntimeProfile* out) {
       ClosePipe(h);
       return 0;
     }
-    if (!ParseMsg(line, &msg)) {
+    if (!ParseMsg(line, msg.get())) {
       OutputDebugStringA("EnvBox IPC: malformed message ignored\n");
       continue;
     }
-    if (strcmp(msg.name, "PROFILE") == 0) {
-      if (!FillProfileFromMsg(&msg, out)) {
+    if (strcmp(msg->name, "ERROR") == 0) {
+      OutputDebugStringA("EnvBox IPC: bootstrap denied by host\n");
+      ClosePipe(h);
+      return 0;
+    }
+    if (strcmp(msg->name, "PROFILE") == 0) {
+      if (!FillProfileFromMsg(msg.get(), out)) {
         OutputDebugStringA("EnvBox IPC: PROFILE incomplete\n");
         ClosePipe(h);
         return 0;
@@ -603,6 +665,226 @@ void EnvBoxIpcNotifyRuntimeReady(void) {
   std::string body;
   AppendKvU32(&body, "pid", (unsigned long)GetCurrentProcessId());
   Notify("RUNTIME_READY", body);
+}
+
+int EnvBoxRecoveryJobOpen() {
+  SetLastError(ERROR_SUCCESS);
+  DWORD length = GetEnvironmentVariableW(L"ENVBOX_RECOVERY_JOB_NAME", g_recovery_job_name, 256);
+  if (length == 0) {
+    if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) return 1;
+    SetLastError(ERROR_INVALID_DATA); return 0;
+  }
+  if (length >= 256) { SetLastError(ERROR_INVALID_DATA); return 0; }
+  HANDLE job = OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, g_recovery_job_name);
+  if (job == nullptr) return 0;
+  BOOL member = FALSE;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+  BOOL valid = IsProcessInJob(GetCurrentProcess(), job, &member) && member &&
+      QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr) &&
+      !(limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+  if (!valid) {
+    DWORD failure = GetLastError(); CloseHandle(job); g_recovery_job_name[0] = L'\0';
+    SetLastError(failure == ERROR_SUCCESS ? ERROR_ACCESS_DENIED : failure); return 0;
+  }
+  g_recovery_job = job;
+  return 1;
+}
+
+void EnvBoxRecoveryJobClose() {
+  if (g_recovery_job != nullptr) { CloseHandle(g_recovery_job); g_recovery_job = nullptr; }
+  g_recovery_job_name[0] = L'\0';
+}
+
+int EnvBoxIpcAwaitStartupRelease() {
+  // A single deadline covers connection, release, acknowledgement and final
+  // confirmation; an idle/disconnected Host never releases application entry.
+  ULONGLONG deadline = GetTickCount64() + 5000;
+  HANDLE pipe = ConnectPipe(RemainingMs(deadline));
+  if (pipe == INVALID_HANDLE_VALUE) return 0;
+  FILETIME created = {}, exited = {}, kernel = {}, user = {};
+  int success = 0;
+  if (!g_runtime_identity_wire.empty() &&
+      GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) &&
+      SendLine(pipe, g_runtime_identity_wire, deadline)) {
+    ULONGLONG generation = (static_cast<ULONGLONG>(created.dwHighDateTime) << 32)
+                           | created.dwLowDateTime;
+    char identity[128] = {};
+    _snprintf_s(identity, sizeof(identity), _TRUNCATE,
+        " pid=%lu creation_time=%llu", GetCurrentProcessId(), generation);
+    PipeReader reader = {};
+    reader.h = pipe;
+    char line[256] = {};
+    const char* requests[] = {"STARTUP_GATE_READY", "STARTUP_GATE_RELEASED"};
+    const char* replies[] = {"STARTUP_RELEASE", "STARTUP_GATE_CONFIRMED"};
+    success = 1;
+    for (int step = 0; step < 2; ++step) {
+      std::string expected = replies[step]; expected += identity;
+      if (!SendLine(pipe, std::string(requests[step]) + identity, deadline)
+          || !ReadLine(&reader, line, sizeof(line), deadline)
+          || expected != line) { success = 0; break; }
+    }
+  }
+  CloseHandle(pipe);
+  return success;
+}
+
+// Dedicated remote-thread entry; never called during loader initialization.
+// No borrowed remote parameters, no new DLL load, and no profile mutation.
+extern "C" const char EnvBoxRuntimeCapabilities[256] =
+    "protocol=1;profile_dns_schema=1;entry_gate=1;reconnect=1;dns_udp=1;dns_tcp=1;dns_dot=1;dns_doh=0";
+
+extern "C" DWORD WINAPI EnvBoxRuntimeReconnect(void* parameter) {
+  if (parameter != nullptr || g_runtime_identity_wire.empty()) return ERROR_INVALID_PARAMETER;
+  const ULONGLONG deadline = GetTickCount64() + 3000;
+  HANDLE pipe = ConnectPipe(RemainingMs(deadline));
+  if (pipe == INVALID_HANDLE_VALUE) return ERROR_TIMEOUT;
+  FILETIME created = {}, exited = {}, kernel = {}, user = {};
+  DWORD result = ERROR_ACCESS_DENIED;
+  if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+    std::string request = "RUNTIME_RECONNECT";
+    request += g_runtime_identity_wire.substr(strlen("RUNTIME_IDENTITY"));
+    char expected[160];
+    _snprintf_s(expected, sizeof(expected), _TRUNCATE,
+        "RUNTIME_RECONNECTED pid=%lu creation_time=%llu", GetCurrentProcessId(),
+        (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime);
+    PipeReader reader = {}; reader.h = pipe;
+    char response[256] = {};
+    char challenge_prefix[160];
+    _snprintf_s(challenge_prefix, sizeof(challenge_prefix), _TRUNCATE,
+        "RUNTIME_RECONNECT_CHALLENGE pid=%lu creation_time=%llu nonce=", GetCurrentProcessId(),
+        (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime);
+    if (SendLine(pipe, request, deadline) && ReadLine(&reader, response, sizeof(response), deadline)
+        && strncmp(response, challenge_prefix, strlen(challenge_prefix)) == 0) {
+      const char* nonce = response + strlen(challenge_prefix);
+      bool valid = strlen(nonce) == 36;
+      for (size_t i = 0; valid && i < 36; ++i) valid = (nonce[i] >= '0' && nonce[i] <= '9') || (nonce[i] >= 'a' && nonce[i] <= 'f') || nonce[i] == '-';
+      if (valid) {
+        std::string proof = "RUNTIME_RECONNECT_PROOF";
+        proof += response + strlen("RUNTIME_RECONNECT_CHALLENGE");
+        if (SendLine(pipe, proof, deadline) && ReadLine(&reader, response, sizeof(response), deadline)
+            && strcmp(expected, response) == 0) result = ERROR_SUCCESS;
+      }
+    }
+  }
+  CloseHandle(pipe);
+  return result;
+}
+
+int EnvBoxIpcNotifyRuntimeIdentity(HINSTANCE module, const int* counts,
+                                    size_t count) {
+  const RuntimeProfile* p = EnvBoxProfile();
+  if (p == nullptr || counts == nullptr || count != 10) return 0;
+  // Serialize actual immutable Runtime values, not a supplied snapshot token.
+  auto wide = [](const wchar_t* value) {
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1,
+                                nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string result(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1,
+                        result.data(), n, nullptr, nullptr);
+    result.resize(static_cast<size_t>(n - 1));
+    return result;
+  };
+  std::string actual = "PROFILE";
+  auto kvw = [&](const char* key, const wchar_t* value) {
+    std::string text = wide(value); AppendKv(&actual, key, text.c_str());
+  };
+  kvw("profile_id", p->profile_id);
+  kvw("instance_id", p->instance_id);
+  kvw("locale_name", p->locale_name);
+  kvw("ui_language", p->ui_language);
+  kvw("region", p->region);
+  kvw("tz_windows", p->tz_windows);
+  kvw("tz_iana", p->tz_iana);
+  AppendKvU32(&actual, "inherit_children", p->inherit_children ? 1 : 0);
+  AppendKvU32(&actual, "audit", p->audit ? 1 : 0);
+  kvw("webrtc", p->webrtc_policy);
+  auto dns_field = [](void* context, const char* key, const char* value) -> int {
+    auto* config = static_cast<std::string*>(context);
+    // The shared emitter uses ENV mode names; PROFILE wire uses numeric flags.
+    if (strcmp(key, "dns_mode") == 0) {
+      if (strcmp(value, "host") == 0) AppendKv(config, key, "0");
+      else if (strcmp(value, "virtual_view") == 0) AppendKv(config, key, "1");
+      else return 0;
+    } else if (strcmp(key, "dns_servers") == 0) {
+      std::string servers = value; size_t start = 0;
+      while (start < servers.size()) { size_t end = servers.find(';', start); if (end == std::string::npos) end = servers.size(); std::string server = servers.substr(start, end - start); AppendKv(config, "dns_server", server.c_str()); start = end + 1; }
+    } else AppendKv(config, key, value);
+    return config->size() < kMaxLine;
+  };
+  if (!EnvBoxEmitDnsConfiguration(p, dns_field, &actual)) return 0;
+  for (int i = 0; i < p->registry_path_count; ++i)
+    kvw("registry_path", p->registry_paths[i]);
+  bool complete = EnvBoxProfileEnvironmentComplete() != 0;
+  for (int i = 0; i < p->environment_count; ++i) {
+    kvw("environment", p->environment[i]);
+    const wchar_t* eq = wcschr(p->environment[i], L'=');
+    if (eq == nullptr || eq == p->environment[i]) { complete = false; continue; }
+    std::wstring key(p->environment[i], eq - p->environment[i]);
+    SetLastError(ERROR_SUCCESS);
+    DWORD n = GetEnvironmentVariableW(key.c_str(), nullptr, 0);
+    if (n == 0) {
+      if (eq[1] != L'\0' || GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+        complete = false;
+    } else {
+      std::wstring value(n, L'\0');
+      DWORD got = GetEnvironmentVariableW(key.c_str(), value.data(), n);
+      if (got >= n || got == 0) { complete = false; continue; }
+      value.resize(got);
+      if (value != eq + 1) complete = false;
+    }
+  }
+  FILETIME created = {}, exited = {}, kernel = {}, user = {};
+  if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+  ULONGLONG generation = (static_cast<ULONGLONG>(created.dwHighDateTime) << 32)
+                         | created.dwLowDateTime;
+  wchar_t path[32768] = {};
+  DWORD length = GetModuleFileNameW(module, path, 32768);
+  if (length == 0 || length >= 32768) return 0;
+  std::string body;
+  AppendKvU32(&body, "pid", GetCurrentProcessId());
+  char number[32];
+  _snprintf_s(number, sizeof(number), _TRUNCATE, "%llu", generation);
+  AppendKv(&body, "creation_time", number);
+  AppendKvU32(&body, "protocol", 1);
+  AppendKv(&body, "version", ENVBOX_RUNTIME_VERSION);
+  std::string path_utf8 = wide(path);
+  AppendKv(&body, "module_path", path_utf8.c_str());
+  AppendKv(&body, "actual_profile", actual.c_str());
+  AppendKvU32(&body, "config_complete", complete ? 1 : 0);
+  const char* groups[] = {"time", "winrt_time", "geo", "locale", "crt_locale",
+                          "language", "dns", "registry", "process", "network_policy"};
+  for (size_t i = 0; i < count; ++i) {
+    std::string entry = groups[i]; entry += ":"; entry += std::to_string(counts[i]);
+    AppendKv(&body, "hook", entry.c_str());
+  }
+  if (body.size() + sizeof("RUNTIME_IDENTITY_CONFIRM") >= 32768) return 0;
+  g_runtime_identity_wire = "RUNTIME_IDENTITY";
+  g_runtime_identity_wire += body;
+  // This remains a bounded notice; acceptance and application-entry release
+  // are separate host decisions. Sending it is not an accepted ACK.
+  // A PROFILE connection just closed; the serial broker can briefly have
+  // no pipe instance while replacing it. A required identity must retry this
+  // handoff rather than taking the legacy notice's immediate FILE_NOT_FOUND.
+  wchar_t gate[8] = {};
+  bool gated = GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE",gate,8)==1 && gate[0]==L'1';
+  if (EnvBoxProfileEnvironmentComplete() && !gated) {
+    // Short-lived legacy targets must not close before authentication or
+    // application entry. Gate targets retain their outside-loader handshake.
+    const ULONGLONG deadline=GetTickCount64()+3000;
+    HANDLE pipe=ConnectPipe(RemainingMs(deadline));
+    if (pipe==INVALID_HANDLE_VALUE) return 0;
+    PipeReader reader={}; reader.h=pipe;
+    char response[256]={}, expected[160];
+    _snprintf_s(expected,sizeof(expected),_TRUNCATE,
+        "RUNTIME_IDENTITY_CONFIRMED pid=%lu creation_time=%llu",GetCurrentProcessId(),generation);
+    int accepted=SendLine(pipe,std::string("RUNTIME_IDENTITY_CONFIRM")+body,deadline) &&
+        ReadLine(&reader,response,sizeof(response),deadline) && strcmp(expected,response)==0;
+    CloseHandle(pipe);
+    return accepted;
+  }
+  Notify("RUNTIME_IDENTITY", body, EnvBoxProfileEnvironmentComplete() ? 2000 : 100);
+  return 1;
 }
 
 void EnvBoxIpcNotifyHookError(const char* api_utf8, unsigned long code,
@@ -626,6 +908,36 @@ void EnvBoxIpcNotifyProcessCreated(unsigned long child_pid,
     AppendKv(&body, "image", image_utf8);
   }
   Notify("PROCESS_CREATED", body);
+}
+
+int EnvBoxIpcRegisterChild(HANDLE child, unsigned long child_pid) {
+  const RuntimeProfile* profile = EnvBoxProfile();
+  FILETIME parent_created = {}, child_created = {}, exited = {}, kernel = {}, user = {};
+  if (!profile || GetProcessId(child) != child_pid ||
+      !GetProcessTimes(GetCurrentProcess(), &parent_created, &exited, &kernel, &user) ||
+      !GetProcessTimes(child, &child_created, &exited, &kernel, &user)) return 0;
+  ULONGLONG parent_generation = (static_cast<ULONGLONG>(parent_created.dwHighDateTime) << 32) | parent_created.dwLowDateTime;
+  ULONGLONG child_generation = (static_cast<ULONGLONG>(child_created.dwHighDateTime) << 32) | child_created.dwLowDateTime;
+  ULONGLONG deadline = GetTickCount64() + 3000;
+  HANDLE pipe = ConnectPipe(RemainingMs(deadline));
+  if (pipe == INVALID_HANDLE_VALUE) { SetLastError(ERROR_TIMEOUT); return 0; }
+  std::string request = "REGISTER_CHILD";
+  AppendKvU32(&request, "pid", GetCurrentProcessId());
+  AppendKvU32(&request, "child_pid", child_pid);
+  char number[32], id[64];
+  _snprintf_s(number, sizeof(number), _TRUNCATE, "%llu", parent_generation);
+  AppendKv(&request, "creation_time", number);
+  _snprintf_s(number, sizeof(number), _TRUNCATE, "%llu", child_generation);
+  AppendKv(&request, "child_creation_time", number);
+  WideToUtf8(profile->instance_id, id, sizeof(id)); AppendKv(&request, "instance_id", id);
+  WideToUtf8(profile->profile_id, id, sizeof(id)); AppendKv(&request, "profile_id", id);
+  char expected[128], response[256];
+  _snprintf_s(expected, sizeof(expected), _TRUNCATE, "CHILD_BOUND pid=%lu creation_time=%llu", child_pid, child_generation);
+  PipeReader reader = {}; reader.h = pipe;
+  int ok = SendLine(pipe, request, deadline) && ReadLine(&reader, response, sizeof(response), deadline) && strcmp(expected, response) == 0;
+  ClosePipe(pipe);
+  if (!ok) SetLastError(ERROR_ACCESS_DENIED);
+  return ok;
 }
 
 void EnvBoxIpcNotifyProcessExited(unsigned long exit_code) {

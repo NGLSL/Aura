@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox-runtime-identity-fixture LANGUAGES CXX)
+add_executable(envbox-runtime-identity-fixture main.cpp)
+target_compile_features(envbox-runtime-identity-fixture PRIVATE cxx_std_17)
+add_executable(envbox-child-identity-fixture child_tree.cpp)
+target_compile_options(envbox-child-identity-fixture PRIVATE /GS- /Zl)
+target_link_options(envbox-child-identity-fixture PRIVATE /NODEFAULTLIB /ENTRY:FixtureEntry /SUBSYSTEM:CONSOLE)
+target_link_libraries(envbox-child-identity-fixture PRIVATE kernel32 advapi32)

@@ -20,6 +20,18 @@
 #define ENVBOX_ENV_ENTRY_MAX 512
 #endif
 
+enum RuntimeDnsUpstreamType { EnvBoxDnsUdp = 0, EnvBoxDnsTcp = 1,
+                              EnvBoxDnsDot = 2, EnvBoxDnsDoh = 3 };
+struct RuntimeDnsUpstream {
+  RuntimeDnsUpstreamType type;
+  char address[64];
+  unsigned short port;
+  char server_name[256];
+  char url[2048];
+  int bootstrap_count;
+  char bootstrap_ips[ENVBOX_DNS_MAX][64];
+};
+
 struct RuntimeProfile {
   wchar_t locale_name[85];
   wchar_t ui_language[85];
@@ -39,6 +51,10 @@ struct RuntimeProfile {
   int dns_mode;
   int dns_server_count;
   char dns_servers[ENVBOX_DNS_MAX][64];
+  int dns_config_version;
+  int dns_strict;
+  int dns_upstream_count;
+  RuntimeDnsUpstream dns_upstreams[ENVBOX_DNS_MAX];
   // Registry Virtual View (ticket 09): extra whitelist_paths from Profile.
   int registry_path_count;
   wchar_t registry_paths[ENVBOX_REG_MAX][128];
@@ -51,6 +67,15 @@ struct RuntimeProfile {
   // invent business semantics). Empty = host.
   wchar_t webrtc_policy[32];
 };
+
+// Flat wire fields: 1 found, 0 missing, -1 invalid/oversize. Typed snapshots
+// require version, mode, strict and count; no silently truncated fields.
+using EnvBoxDnsFieldGetter = int (*)(void*, const char*, char*, size_t);
+int EnvBoxDecodeDnsConfiguration(RuntimeProfile* out, EnvBoxDnsFieldGetter getter,
+                                 void* context);
+using EnvBoxDnsFieldSetter = int (*)(void*, const char*, const char*);
+int EnvBoxEmitDnsConfiguration(const RuntimeProfile* profile,
+                               EnvBoxDnsFieldSetter setter, void* context);
 
 // Process-wide immutable profile after successful init. Never mutated later.
 const RuntimeProfile* EnvBoxProfile();

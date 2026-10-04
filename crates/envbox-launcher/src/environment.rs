@@ -34,7 +34,10 @@ pub fn build_environment_block(
         }
     }
     let lower = |k: &str| k.to_ascii_lowercase();
-    const DROP: [&str; 13] = [
+    const DROP: [&str; 16] = [
+        "envbox_recovery_job_name",
+        "envbox_startup_gate",
+        "envbox_ipc_pipe",
         "envbox_instance_id",
         "envbox_profile_id",
         "envbox_inherit_children",
@@ -49,7 +52,14 @@ pub fn build_environment_block(
         "envbox_registry_paths",
         "envbox_webrtc_policy",
     ];
-    env.retain(|k, _| !DROP.contains(&lower(k).as_str()));
+    env.retain(|k, _| {
+        !DROP.contains(&lower(k).as_str())
+            && !lower(k).starts_with("envbox_dns_upstream_")
+            && !matches!(
+                lower(k).as_str(),
+                "envbox_dns_config_version" | "envbox_dns_strict" | "envbox_dns_config_error"
+            )
+    });
     // Host WebRTC policy must not strip user WEBVIEW2 args (spec: Host 不覆盖).
     // Non-Host policies rewrite WEBVIEW2 below via browser_env_entries.
     if profile
@@ -78,6 +88,28 @@ pub fn insert_profile_value_fallback(
     env: &mut HashMap<String, String>,
     profile: &EnvironmentProfile,
 ) {
+    env.retain(|key, _| {
+        let key = key.to_ascii_lowercase();
+        !key.starts_with("envbox_dns_upstream_")
+            && !matches!(
+                key.as_str(),
+                "envbox_dns_config_version" | "envbox_dns_strict" | "envbox_dns_config_error"
+            )
+    });
+    // Startup validates the complete payload first. Invalid sentinels also prevent a
+    // typed decoder from interpreting encoding failure as an empty Host configuration.
+    match checked_dns_environment(&profile.dns) {
+        Ok(values) => {
+            for (key, value) in values {
+                env.insert(key, value);
+            }
+        }
+        Err(err) => {
+            env.insert("ENVBOX_DNS_CONFIG_VERSION".into(), "invalid".into());
+            env.insert("ENVBOX_DNS_CONFIG_ERROR".into(), err.to_string());
+            env.insert("ENVBOX_DNS_STRICT".into(), "1".into());
+        }
+    }
     env.insert(
         "ENVBOX_LOCALE_NAME".into(),
         profile.locale.locale_name.clone(),
@@ -122,6 +154,17 @@ pub fn insert_profile_value_fallback(
     }
 }
 
+/// Checked typed DNS fallback fields, using the same v1 vocabulary as IPC.
+pub fn checked_dns_environment(
+    dns: &envbox_core::DnsProfile,
+) -> Result<HashMap<String, String>, envbox_core::DomainError> {
+    Ok(dns
+        .flat_fields()?
+        .into_iter()
+        .map(|(key, value)| (format!("ENVBOX_{}", key.to_ascii_uppercase()), value))
+        .collect())
+}
+
 /// Encode as a Windows Unicode environment block: `k=v\0k=v\0\0`.
 pub fn encode_environment_block(env: &HashMap<String, String>) -> Vec<u16> {
     let mut pairs: Vec<(&String, &String)> = env.iter().collect();
@@ -161,6 +204,7 @@ mod tests {
             dns: DnsProfile {
                 mode: DnsMode::Host,
                 servers: vec![],
+                ..Default::default()
             },
             environment: HashMap::from([("LANG".into(), "en_US.UTF-8".into())]),
             registry: RegistryProfile::default(),
@@ -211,6 +255,7 @@ mod tests {
         p.dns = envbox_core::DnsProfile {
             mode: envbox_core::DnsMode::VirtualView,
             servers: vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()],
+            ..Default::default()
         };
         p.registry = RegistryProfile {
             whitelist_paths: vec!["HKCU\\Software\\EnvBox".into()],
@@ -266,8 +311,7 @@ mod tests {
             ("PATH".into(), r"C:\Windows".into()),
         ]);
         let mut p = profile();
-        p.environment
-            .insert("LC_TIME".into(), "en_US.UTF-8".into());
+        p.environment.insert("LC_TIME".into(), "en_US.UTF-8".into());
         let merged =
             build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
         assert_eq!(merged.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
@@ -300,7 +344,10 @@ mod tests {
         for key in ["LANG", "LC_ALL", "LANGUAGE"] {
             assert!(!merged.contains_key(key), "inherited host {key}");
         }
-        assert_eq!(merged.get("LC_TIME").map(String::as_str), Some("en_US.UTF-8"));
+        assert_eq!(
+            merged.get("LC_TIME").map(String::as_str),
+            Some("en_US.UTF-8")
+        );
         assert!(merged.contains_key("PATH"));
     }
 
@@ -393,5 +440,82 @@ mod tests {
             .collect();
         assert!(text.contains("A=1\0"));
         assert!(text.contains("B=2\0"));
+    }
+
+    #[test]
+    fn typed_dns_preserves_ports_and_removes_inherited_upstreams() {
+        let host = HashMap::from([
+            ("envbox_dns_upstream_7_address".into(), "8.8.8.8".into()),
+            ("ENVBOX_DNS_CONFIG_ERROR".into(), "stale".into()),
+        ]);
+        let mut p = profile();
+        p.dns = DnsProfile::typed(
+            DnsMode::VirtualView,
+            true,
+            vec![
+                envbox_core::DnsUpstream::Tcp {
+                    address: "127.0.0.1".parse().unwrap(),
+                    port: 15353,
+                },
+                envbox_core::DnsUpstream::Udp {
+                    address: "127.0.0.1".parse().unwrap(),
+                    port: 15354,
+                },
+            ],
+        );
+        let merged =
+            build_environment_block(&host, Some(&p), Uuid::nil(), Uuid::nil(), true, false);
+        assert_eq!(
+            merged.get("ENVBOX_DNS_CONFIG_VERSION").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            merged.get("ENVBOX_DNS_UPSTREAM_0_TYPE").map(String::as_str),
+            Some("tcp")
+        );
+        assert_eq!(
+            merged.get("ENVBOX_DNS_UPSTREAM_0_PORT").map(String::as_str),
+            Some("15353")
+        );
+        assert_eq!(
+            merged.get("ENVBOX_DNS_UPSTREAM_1_PORT").map(String::as_str),
+            Some("15354")
+        );
+        assert!(!merged.contains_key("ENVBOX_DNS_CONFIG_ERROR"));
+        assert!(!merged
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("ENVBOX_DNS_UPSTREAM_7_ADDRESS")));
+    }
+
+    #[test]
+    fn invalid_dns_environment_uses_failure_sentinel() {
+        let mut p = profile();
+        p.dns = DnsProfile::typed(
+            DnsMode::VirtualView,
+            true,
+            vec![envbox_core::DnsUpstream::Udp {
+                address: "127.0.0.1".parse().unwrap(),
+                port: 0,
+            }],
+        );
+        assert!(checked_dns_environment(&p.dns).is_err());
+        let merged = build_environment_block(
+            &HashMap::new(),
+            Some(&p),
+            Uuid::nil(),
+            Uuid::nil(),
+            true,
+            false,
+        );
+        assert_eq!(
+            merged.get("ENVBOX_DNS_CONFIG_VERSION").map(String::as_str),
+            Some("invalid")
+        );
+        assert_eq!(
+            merged.get("ENVBOX_DNS_STRICT").map(String::as_str),
+            Some("1")
+        );
+        assert!(merged.contains_key("ENVBOX_DNS_CONFIG_ERROR"));
+        assert!(!merged.contains_key("ENVBOX_DNS_UPSTREAM_0_ADDRESS"));
     }
 }

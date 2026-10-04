@@ -12,5 +12,6 @@ mod profiles;
 mod settings;
 mod shell;
 mod unsaved_dialog;
+mod workspaces;
 
 pub use shell::view;

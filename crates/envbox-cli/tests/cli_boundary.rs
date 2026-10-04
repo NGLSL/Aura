@@ -622,6 +622,7 @@ fn sample_profile() -> envbox_core::EnvironmentProfile {
         dns: DnsProfile {
             mode: DnsMode::Host,
             servers: vec![],
+            ..Default::default()
         },
         environment: Default::default(),
         registry: RegistryProfile::default(),

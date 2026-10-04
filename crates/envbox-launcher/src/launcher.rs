@@ -18,6 +18,12 @@ pub enum LaunchError {
     Command(#[from] CommandError),
     #[error(transparent)]
     Job(#[from] JobError),
+    #[error("{source}; also failed to terminate newly created process: {cleanup}")]
+    JobCleanup {
+        #[source]
+        source: JobError,
+        cleanup: Box<LaunchError>,
+    },
     #[error("working directory does not exist: {0}")]
     WorkingDirectoryMissing(PathBuf),
     #[error("profile invalid: {0}")]
@@ -325,6 +331,24 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
         profile
             .validate()
             .map_err(|e| LaunchError::InvalidProfile(e.to_string()))?;
+        profile
+            .dns
+            .validate_runtime_support()
+            .map_err(|error| LaunchError::InvalidProfile(error.to_string()))?;
+        if crate::ipc::profile_to_message_with_flags(
+            profile,
+            &req.instance_id.to_string(),
+            req.inherit_children,
+            req.audit,
+        )
+        .encode_line()
+        .len()
+            > crate::ipc::IPC_MAX_LINE_BYTES
+        {
+            return Err(LaunchError::InvalidProfile(
+                "complete Runtime Profile payload exceeds the IPC limit".into(),
+            ));
+        }
     }
 
     let working_directory =
@@ -403,12 +427,19 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
             working_directory.as_deref(),
             &encode_environment_block(&env),
             false,
+            None,
         )?
     } else {
         // Startup Fail Policy: runtime DLL must exist, match target arch, and
         // inject; never launch un-hooked (tickets 04 / 30 / 31).
         let source_runtime = crate::injection::resolve_runtime_dll_for_target(&program)?;
         let runtime_dll = crate::injection::stage_runtime_dll(&source_runtime, req.instance_id)?;
+        if let Some(profile) = &req.profile {
+            crate::recovery::validate_runtime_for_profile(&runtime_dll, &profile.dns, false)
+                .map_err(|error| {
+                    LaunchError::InvalidProfile(format!("Runtime capability preflight: {error}"))
+                })?;
+        }
         spawn_suspended(
             &program,
             &args,
@@ -416,33 +447,35 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
             &encode_environment_block(&env),
             &runtime_dll,
             false,
+            None,
         )?
     };
 
     if let Err(err) = job.assign_pid(child.pid) {
         // Startup Fail Policy: never leave a suspended Root Process behind.
         if let Err(kill_err) = child.kill_raw() {
-            return Err(LaunchError::create_process_msg(format!(
-                "job assign failed ({err}); also failed to terminate pid={}: {kill_err}",
-                child.pid
-            )));
+            return Err(LaunchError::JobCleanup {
+                source: err,
+                cleanup: Box::new(kill_err),
+            });
         }
         return Err(err.into());
     }
 
-    if !host_mode {
-        #[cfg(windows)]
-        {
-            use windows::Win32::System::Threading::ResumeThread;
-            unsafe {
-                if ResumeThread(child.thread.0) == u32::MAX {
-                    let code = win::last_error();
-                    let _ = job.terminate();
-                    return Err(LaunchError::create_process(
-                        code,
-                        "ResumeThread failed".to_string(),
-                    ));
-                }
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::ResumeThread;
+        unsafe {
+            if ResumeThread(child.thread.0) == u32::MAX {
+                let code = win::last_error();
+                let cleanup = child.kill_raw().err();
+                return Err(LaunchError::create_process(
+                    code,
+                    match cleanup {
+                        Some(err) => format!("ResumeThread failed; cleanup failed: {err}"),
+                        None => "ResumeThread failed".to_string(),
+                    },
+                ));
             }
         }
     }
@@ -530,6 +563,97 @@ fn ensure_browser_locale_argv(
 }
 
 /// Spawn a Win32/Command target for the activation seam.
+#[cfg(windows)]
+struct ProcessStartup {
+    info: windows::Win32::System::Threading::STARTUPINFOEXW,
+    _storage: Vec<AttributeBlock>,
+    _jobs: Box<[windows::Win32::Foundation::HANDLE; 1]>,
+    initialized: bool,
+}
+#[cfg(windows)]
+#[repr(C, align(16))]
+#[derive(Clone)]
+struct AttributeBlock([u8; 16]);
+#[cfg(windows)]
+impl ProcessStartup {
+    fn new(job: Option<crate::job::JobAssignment<'_>>) -> Result<Self, LaunchError> {
+        use windows::Win32::System::Threading::*;
+        let mut value = Self {
+            info: STARTUPINFOEXW::default(),
+            _storage: vec![],
+            _jobs: Box::new([windows::Win32::Foundation::HANDLE::default()]),
+            initialized: false,
+        };
+        value.info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        if let Some(job) = job {
+            value.info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            let mut size = 0;
+            unsafe {
+                let _ = InitializeProcThreadAttributeList(
+                    LPPROC_THREAD_ATTRIBUTE_LIST::default(),
+                    1,
+                    0,
+                    &mut size,
+                );
+            }
+            if size == 0 {
+                return Err(LaunchError::create_process(
+                    win::last_error(),
+                    "Job attribute sizing failed",
+                ));
+            }
+            value._storage = vec![AttributeBlock([0; 16]); size.div_ceil(16)];
+            value.info.lpAttributeList =
+                LPPROC_THREAD_ATTRIBUTE_LIST(value._storage.as_mut_ptr().cast());
+            unsafe {
+                InitializeProcThreadAttributeList(value.info.lpAttributeList, 1, 0, &mut size)
+                    .map_err(|_| {
+                        LaunchError::create_process(
+                            win::last_error(),
+                            "Job attribute initialization failed",
+                        )
+                    })?;
+                value.initialized = true;
+                value._jobs[0] = job.handle;
+                UpdateProcThreadAttribute(
+                    value.info.lpAttributeList,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                    Some(value._jobs.as_ptr().cast()),
+                    std::mem::size_of_val(value._jobs.as_ref()),
+                    None,
+                    None,
+                )
+                .map_err(|_| {
+                    LaunchError::create_process(
+                        win::last_error(),
+                        "creation-time Job attribute failed",
+                    )
+                })?;
+            }
+        }
+        Ok(value)
+    }
+    fn extended_flag(&self) -> windows::Win32::System::Threading::PROCESS_CREATION_FLAGS {
+        if self.initialized {
+            windows::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT
+        } else {
+            Default::default()
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for ProcessStartup {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe {
+                windows::Win32::System::Threading::DeleteProcThreadAttributeList(
+                    self.info.lpAttributeList,
+                );
+            }
+        }
+    }
+}
 ///
 /// Profile mode: DetourCreateProcessWithDllExW (CREATE_SUSPENDED) when
 /// `runtime_dll` is set; otherwise plain CreateProcess.
@@ -559,6 +683,11 @@ pub fn spawn_for_activation(
     }
 
     if let Some(dll) = &req.runtime_dll {
+        if !dll.is_file() {
+            return Err(crate::activation::ActivateError::Inject(
+                crate::injection::InjectError::RuntimeDllInvalid(dll.clone()),
+            ));
+        }
         let child = spawn_suspended(
             &program,
             &args,
@@ -566,8 +695,10 @@ pub fn spawn_for_activation(
             &env_block,
             dll,
             req.create_new_console,
+            req.creation_job,
         )
         .map_err(map_launch_to_activate)?;
+        verify_creation_job(&child, req.creation_job).map_err(map_launch_to_activate)?;
         Ok(ActivationSpawn {
             pid: child.pid,
             suspended: true,
@@ -583,11 +714,13 @@ pub fn spawn_for_activation(
             req.working_directory.as_deref(),
             &env_block,
             req.create_new_console,
+            req.creation_job,
         )
         .map_err(map_launch_to_activate)?;
+        verify_creation_job(&child, req.creation_job).map_err(map_launch_to_activate)?;
         Ok(ActivationSpawn {
             pid: child.pid,
-            suspended: false,
+            suspended: true,
             #[cfg(windows)]
             process: child.process,
             #[cfg(windows)]
@@ -597,6 +730,39 @@ pub fn spawn_for_activation(
 }
 
 /// Open a process handle by PID (packaged attach path).
+fn verify_creation_job(
+    child: &SpawnedChild,
+    assignment: Option<crate::job::JobAssignment<'_>>,
+) -> Result<(), LaunchError> {
+    #[cfg(windows)]
+    if let Some(assignment) = assignment {
+        let mut member = windows::Win32::Foundation::BOOL::default();
+        let result = unsafe {
+            windows::Win32::System::JobObjects::IsProcessInJob(
+                child.process.0,
+                assignment.handle,
+                &mut member,
+            )
+        };
+        if result.is_err() || !member.as_bool() {
+            let code = if result.is_err() {
+                win::last_error()
+            } else {
+                // A successful query has no Win32 error to preserve.
+                0
+            };
+            let cleanup = child.kill_raw().err();
+            return Err(LaunchError::create_process(
+                code,
+                format!("creation-time Job membership missing; new-root cleanup={cleanup:?}"),
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (child, assignment);
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn open_process_handle(pid: u32) -> Result<win::SafeHandle, crate::activation::ActivateError> {
     use windows::Win32::System::Threading::{
@@ -678,11 +844,11 @@ fn spawn_suspended(
     env_block: &[u16],
     runtime_dll: &Path,
     create_new_console: bool,
+    creation_job: Option<crate::job::JobAssignment<'_>>,
 ) -> Result<SpawnedChild, LaunchError> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::System::Threading::{
         CREATE_NEW_CONSOLE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-        STARTUPINFOW,
     };
 
     let dll_ansi = crate::injection::dll_path_ansi(runtime_dll)?;
@@ -698,8 +864,7 @@ fn spawn_suspended(
             .collect()
     });
 
-    let mut si = STARTUPINFOW::default();
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut startup = ProcessStartup::new(creation_job)?;
     let mut pi = PROCESS_INFORMATION::default();
 
     // DetourCreateProcessWithDllExW — CREATE_SUSPENDED then Resume after Job assign.
@@ -712,6 +877,7 @@ fn spawn_suspended(
             0,
             (CREATE_SUSPENDED
                 | CREATE_UNICODE_ENVIRONMENT
+                | startup.extended_flag()
                 | if create_new_console {
                     CREATE_NEW_CONSOLE
                 } else {
@@ -723,7 +889,7 @@ fn spawn_suspended(
                 .as_mut()
                 .map(|w| PCWSTR(w.as_ptr()))
                 .unwrap_or_else(PCWSTR::null),
-            &mut si,
+            &mut startup.info.StartupInfo,
             &mut pi,
             dll_ansi.as_ptr(),
             std::ptr::null(),
@@ -747,11 +913,12 @@ fn spawn_plain(
     working_directory: Option<&Path>,
     env_block: &[u16],
     create_new_console: bool,
+    creation_job: Option<crate::job::JobAssignment<'_>>,
 ) -> Result<SpawnedChild, LaunchError> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::System::Threading::{
-        CreateProcessW, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-        STARTUPINFOW,
+        CreateProcessW, CREATE_NEW_CONSOLE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+        PROCESS_INFORMATION,
     };
 
     let cmdline = create_process_command_line(program, args);
@@ -763,8 +930,7 @@ fn spawn_plain(
             .chain(std::iter::once(0))
             .collect()
     });
-    let mut si = STARTUPINFOW::default();
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut startup = ProcessStartup::new(creation_job)?;
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
         let ok = CreateProcessW(
@@ -773,7 +939,9 @@ fn spawn_plain(
             None,
             None,
             false,
-            CREATE_UNICODE_ENVIRONMENT
+            CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                | startup.extended_flag()
                 | if create_new_console {
                     CREATE_NEW_CONSOLE
                 } else {
@@ -784,7 +952,7 @@ fn spawn_plain(
                 .as_mut()
                 .map(|w| PCWSTR(w.as_ptr()))
                 .unwrap_or_else(PCWSTR::null),
-            &mut si,
+            &mut startup.info.StartupInfo,
             &mut pi,
         );
         if ok.is_err() {
@@ -808,6 +976,7 @@ fn spawn_plain(
     _working_directory: Option<&Path>,
     _env_block: &[u16],
     _create_new_console: bool,
+    _creation_job: Option<crate::job::JobAssignment<'_>>,
 ) -> Result<SpawnedChild, LaunchError> {
     Err(LaunchError::create_process_msg(
         "CreateProcessW is Windows-only",
@@ -841,6 +1010,7 @@ fn spawn_suspended(
     _env_block: &[u16],
     _runtime_dll: &Path,
     _create_new_console: bool,
+    _creation_job: Option<crate::job::JobAssignment<'_>>,
 ) -> Result<SpawnedChild, LaunchError> {
     let _ = (program, args, working_directory);
     Err(LaunchError::create_process_msg(
@@ -875,6 +1045,31 @@ fn classify_exe(path: &Path) -> Result<ResolvedCommand, LaunchError> {
         via_comspec,
         comspec_payload: via_comspec.then(|| path.display().to_string()),
     })
+}
+
+/// Resolve the executable that actually runs, including ComSpec, before
+/// staging an architecture-specific Runtime for the Session bootstrap.
+pub(crate) fn activation_program(
+    target: &LaunchTarget,
+    arguments: &[String],
+    environment: &HashMap<String, String>,
+) -> Result<PathBuf, LaunchError> {
+    let resolved = match target {
+        LaunchTarget::Executable { path } => classify_exe(path)?,
+        LaunchTarget::Command { command } => {
+            let path = environment
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                .map(|(_, value)| value.as_str());
+            resolve_command(command, path)?
+        }
+        LaunchTarget::Packaged { .. } => {
+            return Err(LaunchError::create_process_msg(
+                "packaged target has no Win32 activation executable",
+            ));
+        }
+    };
+    spawn_args(&resolved, arguments, environment).map(|(program, _)| program)
 }
 
 fn spawn_args(
@@ -1114,7 +1309,7 @@ mod tests {
         let block = encode_environment_block(&environment);
         for argument in ["safe&ver", "safe|ver", "safe>ver", "safe^ver", "safe(ver)"] {
             let (program, args) = spawn_args(&resolved, &[argument.into()], &environment).unwrap();
-            let child = spawn_plain(&program, &args, None, &block, false).unwrap();
+            let child = spawn_plain(&program, &args, None, &block, false, None).unwrap();
             let wait = unsafe {
                 windows::Win32::System::Threading::WaitForSingleObject(child.process.0, 5_000)
             };

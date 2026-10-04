@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox-dns-dot-fixture LANGUAGES CXX)
+add_executable(envbox-dns-dot-fixture main.cpp ../../runtime/src/dns_dot.cpp)
+target_compile_features(envbox-dns-dot-fixture PRIVATE cxx_std_17)
+target_compile_definitions(envbox-dns-dot-fixture PRIVATE ENVBOX_DNS_TRANSPORT_TESTING=1)
+target_link_libraries(envbox-dns-dot-fixture PRIVATE ws2_32 secur32 crypt32)
