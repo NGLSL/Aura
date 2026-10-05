@@ -23,15 +23,18 @@ Both Content-Length and streamed bodies enforce the byte limit.
 
 The current-thread runtime uses a bounded tracked executor for Hyper connection
 and HTTP/2 tasks. At exit, new work is disabled and every owned task is aborted
-and awaited. Deadline/cancel covers trust preparation and network work; local
-CryptoAPI/registry calls have checks before/after and per item, but cannot be
-preempted inside the native call. Rust unwinding panics are isolated at the FFI
+and awaited. Trust preparation and network work check deadline/cancellation.
+Native CRL cache lookup within the TLS verifier receives a deadline-only budget;
+it cannot promptly observe caller cancellation between CAPI calls. Transport
+checks cancellation after TLS before HTTP and again after cleanup. Local native
+calls cannot be preempted mid-call. This limitation remains an enablement gate.
+Rust unwinding panics are isolated at the FFI
 boundary and asynchronous query boundary; allocator aborts or invalid caller
 pointers are not recoverable Rust panics.
 
 Offline trust reads bounded CurrentUser/LocalMachine physical registry ROOT,
 CA and Disallowed snapshots, plus readonly landed Disallowed CTL cache. No
-CryptoAPI chain, certificate URL retrieval, logical-store provider, SSL_CERT
+CryptoAPI chain, online certificate retrieval, logical-store provider, SSL_CERT
 environment override or host trust mutation is used. ROOT anchors require
 effective serverAuth EKU/time eligibility. CA material remains intermediate
 candidates. Explicit denied certificates and supported CTL subjects restrict
@@ -40,12 +43,25 @@ roots and peer certificates. Unknown CTL structure/algorithm fails closed.
 Revocation requires a nonempty CRL collection, full non-root chain coverage,
 known status and unexpired CRLs. The underlying rustls builder defaults to
 chain checking and unknown-status denial, but empty CRLs disable its revocation
-checks; this crate rejects that case explicitly and enables CRL expiration
-enforcement. See the [rustls verifier builder](https://docs.rs/rustls/0.23.45/rustls/client/struct.ServerCertVerifierBuilder.html).
+checks. Fixture snapshots reject empty lists during preparation. Native
+verification may read existing HTTP(S) CDP cache entries with fixed
+`CRYPT_CACHE_ONLY_RETRIEVAL | CRYPT_DONT_CACHE_RESULT` flags, but never accepts
+an empty-list verification result. Only unknown/expired revocation triggers
+this lookup; all candidates go through the same strict standard verifier.
+Cache misses, malformed entries and incomplete chains remain failures. The
+reader bounds certificates, URLs, bytes and deadline; it never downloads or
+writes cache/store material. CRL expiration enforcement remains enabled. See
+the [rustls verifier builder](https://docs.rs/rustls/0.23.45/rustls/client/struct.ServerCertVerifierBuilder.html).
+
+The standalone `fixture-trust` feature can supply explicit cache candidate DER
+to exercise that same retry branch without touching host caches. This input is
+absent from product builds and the C ABI. Native cache work currently has only
+a deadline budget; prompt cancellation between CAPI calls remains a product
+enablement gate. Transport checks cancellation after TLS before HTTP.
 
 This is a narrower local policy than Windows' complete native trust engine.
 Logical/Enterprise/GroupPolicy/SmartCard providers, all Windows CTL semantics and
-Cryptnet URL-cache coverage are not reproduced. Public resolvers can fail when
+complete Cryptnet/OCSP/delta-CRL coverage are not reproduced. Public resolvers can fail when
 matching offline revocation material is unavailable; no Host fallback follows.
 
 `include/envbox_dns_doh.h` specifies the C ABI and typed error values. Buffer and

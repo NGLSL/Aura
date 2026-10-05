@@ -1,4 +1,4 @@
-//! Offline local trust snapshot and explicit distrust; no chain/URL APIs.
+//! Offline local trust snapshot and explicit distrust; no chain or wire retrieval.
 use crate::{Budget, Error};
 use rustls::{
     client::{
@@ -37,6 +37,11 @@ pub struct Snapshot {
     deny_sha256: Vec<[u8; 32]>,
     deny_signature_hash: Vec<Vec<u8>>,
     restricted_sha256: Vec<[u8; 32]>,
+    // Native snapshots may consult already cached CDP material. Fixture
+    // snapshots remain self-contained and never consult the host URL cache.
+    use_url_cache: bool,
+    #[cfg(any(test, feature = "fixture-trust"))]
+    fixture_cached_crls: Option<Vec<Vec<u8>>>,
 }
 
 struct Store(HCERTSTORE);
@@ -257,6 +262,7 @@ impl Snapshot {
             }
         }
         snapshot.cached_disallowed_ctl(&mut limits, budget)?;
+        snapshot.use_url_cache = true;
         budget.check()?;
         Ok(snapshot)
     }
@@ -584,9 +590,10 @@ impl Snapshot {
 
     pub(crate) fn verifier(mut self, budget: Budget) -> Result<Arc<dyn ServerCertVerifier>, Error> {
         budget.check()?;
-        // rustls intentionally disables revocation with an empty list. Reject
-        // it explicitly before constructing any TLS connection.
-        if self.crls.is_empty() {
+        // rustls disables revocation with an empty list. Fixture snapshots must
+        // reject it here; native verification defers acceptance until peer CDPs
+        // supply usable cached CRLs, never accepting an unchecked result.
+        if self.crls.is_empty() && !self.use_url_cache {
             return Err(Error::RevocationUnknown);
         }
         let mut roots = RootCertStore::empty();
@@ -609,16 +616,15 @@ impl Snapshot {
             }
         }
         self.intermediates = candidates;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
-            .with_crls(self.crls.clone())
-            .enforce_revocation_expiration()
-            .build()
-            .map_err(|_| Error::TrustSnapshot)?;
+        let roots = Arc::new(roots);
+        let verifier = standard_verifier(roots.clone(), self.crls.clone())?;
         budget.check()?;
+        let cache_deadline = self.use_url_cache.then_some(budget.deadline);
         Ok(Arc::new(OfflineVerifier {
             inner: verifier,
             snapshot: self,
+            roots,
+            cache_deadline,
         }))
     }
 
@@ -668,12 +674,50 @@ impl Snapshot {
         }
         Ok(snapshot)
     }
+
+    /// Supply cache candidates to the standalone fixture without reading or
+    /// writing Windows caches. Absent from product builds and the C ABI.
+    #[cfg(any(test, feature = "fixture-trust"))]
+    pub fn with_fixture_cached_crls(mut self, crls: Vec<Vec<u8>>) -> Result<Self, Error> {
+        let mut limits = Limits::default();
+        for der in &crls {
+            limits.add(der.len(), Budget::until(u64::MAX))?;
+        }
+        self.fixture_cached_crls = Some(crls);
+        self.use_url_cache = true;
+        Ok(self)
+    }
 }
 
 #[derive(Debug)]
 struct OfflineVerifier {
     inner: Arc<WebPkiServerVerifier>,
     snapshot: Snapshot,
+    roots: Arc<RootCertStore>,
+    cache_deadline: Option<u64>,
+}
+
+fn standard_verifier(
+    roots: Arc<RootCertStore>,
+    crls: Vec<CertificateRevocationListDer<'static>>,
+) -> Result<Arc<WebPkiServerVerifier>, Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    WebPkiServerVerifier::builder_with_provider(roots, provider)
+        .with_crls(crls)
+        .enforce_revocation_expiration()
+        .build()
+        .map_err(|_| Error::TrustSnapshot)
+}
+
+fn missing_revocation_material(error: &rustls::Error) -> bool {
+    matches!(
+        error,
+        rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownRevocationStatus
+                | rustls::CertificateError::ExpiredRevocationList
+                | rustls::CertificateError::ExpiredRevocationListContext { .. }
+        )
+    )
 }
 impl ServerCertVerifier for OfflineVerifier {
     fn verify_server_cert(
@@ -687,7 +731,52 @@ impl ServerCertVerifier for OfflineVerifier {
         self.snapshot.verify_peer_policy(end, intermediates)?;
         let mut candidates: Vec<_> = intermediates.to_vec();
         candidates.extend(self.snapshot.intermediates.iter().cloned());
-        self.inner
+        // An empty CRL list disables revocation in rustls. Never accept that
+        // result: native snapshots must first obtain usable cached material.
+        let result = if self.snapshot.crls.is_empty() {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownRevocationStatus,
+            ))
+        } else {
+            self.inner
+                .verify_server_cert(end, &candidates, name, ocsp, now)
+        };
+        let Some(deadline) = self.cache_deadline else {
+            return result;
+        };
+        let Err(error) = result else {
+            return result;
+        };
+        if !missing_revocation_material(&error) {
+            return Err(error);
+        }
+        // This reads existing HTTP(S) cache keys only. It cannot download a
+        // missing CRL or change trust anchors. Synchronous CryptoAPI work is
+        // deadline checked, but cannot be interrupted at arbitrary instructions.
+        #[cfg(any(test, feature = "fixture-trust"))]
+        let supplied = self.snapshot.fixture_cached_crls.clone();
+        #[cfg(not(any(test, feature = "fixture-trust")))]
+        let supplied: Option<Vec<Vec<u8>>> = None;
+        let cached = supplied
+            .map_or_else(
+                || {
+                    crate::offline_crl::for_certificates(
+                        std::iter::once(end.as_ref()).chain(candidates.iter().map(AsRef::as_ref)),
+                        Budget::until(deadline),
+                    )
+                },
+                Ok,
+            )
+            .map_err(|error| rustls::Error::General(format!("offline CRL cache: {error:?}")))?;
+        if cached.is_empty() {
+            return Err(error);
+        }
+        let mut crls: Vec<_> = cached.into_iter().map(Into::into).collect();
+        crls.extend(self.snapshot.crls.iter().cloned());
+        // Cached DER is only a candidate. The standard verifier must check
+        // issuer/signature, freshness, revocation, chain, purpose and name.
+        standard_verifier(self.roots.clone(), crls)
+            .map_err(|error| rustls::Error::General(format!("offline CRL verifier: {error:?}")))?
             .verify_server_cert(end, &candidates, name, ocsp, now)
     }
     fn verify_tls12_signature(
@@ -738,6 +827,8 @@ mod tests {
             let mut result = vec![tag];
             if content.len() < 128 {
                 result.push(content.len() as u8);
+            } else if content.len() < 256 {
+                result.extend([0x81, content.len() as u8]);
             } else {
                 result.extend([0x82, (content.len() >> 8) as u8, content.len() as u8]);
             }
@@ -822,6 +913,56 @@ mod tests {
             Snapshot::default().verifier(budget()).unwrap_err(),
             Error::RevocationUnknown
         );
+    }
+
+    #[test]
+    fn cache_retry_is_limited_to_missing_or_expired_revocation_material() {
+        use rustls::CertificateError;
+        for certificate_error in [
+            CertificateError::UnknownRevocationStatus,
+            CertificateError::ExpiredRevocationList,
+        ] {
+            assert!(missing_revocation_material(
+                &rustls::Error::InvalidCertificate(certificate_error)
+            ));
+        }
+        for certificate_error in [
+            CertificateError::Revoked,
+            CertificateError::UnknownIssuer,
+            CertificateError::NotValidForName,
+            CertificateError::Expired,
+            CertificateError::BadSignature,
+            CertificateError::InvalidPurpose,
+        ] {
+            assert!(!missing_revocation_material(
+                &rustls::Error::InvalidCertificate(certificate_error)
+            ));
+        }
+        assert!(!missing_revocation_material(&rustls::Error::General(
+            "cache failure".to_owned()
+        )));
+    }
+
+    #[test]
+    fn native_empty_crls_and_cache_miss_cannot_accept_a_peer() {
+        let mut snapshot = Snapshot::default();
+        snapshot.use_url_cache = true;
+        snapshot.roots.push(context_certificate(1).into());
+        let verifier = snapshot.verifier(budget()).unwrap();
+        let end = CertificateDer::from(context_certificate(2));
+        let result = verifier.verify_server_cert(
+            &end,
+            &[],
+            &ServerName::try_from("offline-test").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(matches!(
+            result,
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownRevocationStatus
+            ))
+        ));
     }
 
     #[test]

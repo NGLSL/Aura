@@ -111,11 +111,15 @@ crl("revoked-leaf-crl", ROOT, [LEAF[1]])
 crl("revoked-ca-crl", ROOT, [INTERMEDIATE[1]])
 crl("ca-crl", INTERMEDIATE)
 crl("bad-root-crl", BADROOT)
+tampered_crl = bytearray((OUT / "root-crl.der").read_bytes())
+tampered_crl[-1] ^= 1  # Preserve ASN.1, invalidate only the signature.
+(OUT / "bad-signature-crl.der").write_bytes(tampered_crl)
 
 
 def case(executable, trap, label, *, certificate="leaf", key=None, identity="fixture.test",
          roots="root", crls="root-crl", ca="", deny="", behavior="answer", protocol="h2",
-         expected=0, budget=1800, cancel=None, repeats=1, tls12=False, bootstrap="127.0.0.1"):
+         expected=0, budget=1800, cancel=None, repeats=1, tls12=False, bootstrap="127.0.0.1",
+         cached_crls=None):
     address = ipaddress.ip_address(bootstrap)
     listener = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET)
     listener.bind((bootstrap, 0))
@@ -255,6 +259,8 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
         "--repeat", str(repeats), "--trap", str(trap)]
     if cancel is not None:
         command += ["--cancel-ms", str(cancel)]
+    if cached_crls is not None:
+        command += ["--cached-crls", paths(cached_crls)]
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=8)
     finally:
@@ -334,6 +340,21 @@ def main():
         case(exe, trap, "revoked-ca", certificate="chain", key="chain-leaf", crls="revoked-ca-crl;ca-crl", expected=8)
         case(exe, trap, "unknown-ca-revocation", certificate="chain", key="chain-leaf", crls="ca-crl", expected=7)
         case(exe, trap, "denied-ca", certificate="chain", key="chain-leaf", crls="root-crl;ca-crl", deny="intermediate", expected=10)
+        # Exercise the production retry/standard-verifier branch using explicit
+        # fixture candidates. This never seeds or reads the Windows URL cache.
+        case(exe, trap, "cached-positive", crls="", cached_crls="root-crl")
+        case(exe, trap, "cached-refresh-stale", crls="stale-crl", cached_crls="root-crl")
+        case(exe, trap, "cached-miss", crls="", cached_crls="", expected=7)
+        case(exe, trap, "cached-wrong-issuer", crls="", cached_crls="other-crl", expected=7)
+        case(exe, trap, "cached-stale", crls="", cached_crls="stale-crl", expected=7)
+        case(exe, trap, "cached-bad-signature", crls="", cached_crls="bad-signature-crl", expected=5)
+        case(exe, trap, "cached-revoked-ee", crls="", cached_crls="revoked-leaf-crl", expected=8)
+        case(exe, trap, "cached-chain-positive", certificate="chain", key="chain-leaf", crls="", cached_crls="root-crl;ca-crl")
+        case(exe, trap, "cached-revoked-ca", certificate="chain", key="chain-leaf", crls="", cached_crls="revoked-ca-crl;ca-crl", expected=8)
+        case(exe, trap, "cached-unknown-ca", certificate="chain", key="chain-leaf", crls="", cached_crls="ca-crl", expected=7)
+        case(exe, trap, "cached-cannot-clear-revoked", crls="revoked-leaf-crl", cached_crls="root-crl", expected=8)
+        case(exe, trap, "cached-wrong-name", identity="wrong.fixture.test", crls="", cached_crls="root-crl", expected=9)
+        case(exe, trap, "cached-untrusted", certificate="untrusted", crls="", cached_crls="root-crl", expected=6)
         case(exe, trap, "redirect", behavior="redirect", expected=12)
         case(exe, trap, "http-non2xx", behavior="http-error", expected=12)
         case(exe, trap, "media", behavior="bad-media", expected=13)

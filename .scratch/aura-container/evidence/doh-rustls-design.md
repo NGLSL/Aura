@@ -12,7 +12,7 @@ WinHTTP 原型保留为 [No-Go 的既有证据](doh-bootstrap.md)。本轮验证
 
 ## 本地信任材料
 
-不用 `rustls-native-certs` 的公用加载入口：它受 `SSL_CERT_FILE/SSL_CERT_DIR` 覆盖；Windows loader 也有属性读取 `unwrap()`。专用 loader 只读固定本地 store，所有读取失败返回 typed error，不调用 CryptoAPI chain、SSL chain policy、URL retrieval 或网络获取。[公用加载入口](https://raw.githubusercontent.com/rustls/rustls-native-certs/main/src/lib.rs)、[Windows loader](https://raw.githubusercontent.com/rustls/rustls-native-certs/v/0.8.4/src/windows.rs)。
+不用 `rustls-native-certs` 的公用加载入口：它受 `SSL_CERT_FILE/SSL_CERT_DIR` 覆盖；Windows loader 也有属性读取 `unwrap()`。专用 loader 只读固定本地 store，所有读取失败返回 typed error，不调用 CryptoAPI chain、SSL chain policy 或网络获取。2026-10-06 的唯一 URL retrieval 允许项是下述固定 flags 的只读 CRL cache lookup。[公用加载入口](https://raw.githubusercontent.com/rustls/rustls-native-certs/main/src/lib.rs)、[Windows loader](https://raw.githubusercontent.com/rustls/rustls-native-certs/v/0.8.4/src/windows.rs)。
 
 `READONLY` 不会把 logical system store 收窄到本地 registry；logical collection 可包含额外注册 physical provider。候选使用 `CERT_STORE_PROV_SYSTEM_REGISTRY_W`，明确 CurrentUser/LocalMachine 的 ROOT、CA、Disallowed。此选择缩窄原生 logical store 的覆盖，不宣称完全复现 Windows Enterprise/SmartCard/CTL 链策略。[CertOpenStore](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certopenstore)、[System Store Locations](https://learn.microsoft.com/en-us/windows/win32/seccrypto/system-store-locations)。
 
@@ -26,9 +26,11 @@ WinHTTP 原型保留为 [No-Go 的既有证据](doh-bootstrap.md)。本轮验证
 
 ## 吊销策略
 
-保持现有 DoT 的严格离线策略，不为 DoH 偷换为“缺材料时跳过”：先拒绝空 CRL，标准 verifier `with_crls` 加 `enforce_revocation_expiration`，保持全非根链深度和 Unknown Deny。不启用只查叶证书或 unknown allow。无匹配 issuer、过期、不支持格式和 revoked 均失败，不补做 URL 获取。[Rustls verifier 源码](https://docs.rs/rustls/0.23.43/src/rustls/webpki/server_verifier.rs.html)。
+保持现有 DoT 的严格离线策略，不为 DoH 偷换为“缺材料时跳过”：标准 verifier `with_crls` 加 `enforce_revocation_expiration`，保持全非根链深度和 Unknown Deny。不启用只查叶证书或 unknown allow。自包含 fixture 在构建 verifier 前拒绝空 CRL；native 快照可以等待收到 peer CDP 后读取已有缓存，但绝不接受空 CRL verifier 的结果。无匹配 issuer、过期、不支持格式和 revoked 均失败，不在线补材料。[Rustls verifier 源码](https://docs.rs/rustls/0.23.43/src/rustls/webpki/server_verifier.rs.html)。
 
 Rustls 空 CRL 会跳过吊销，默认也允许过期 CRL；其标准 verifier 不验证 stapled OCSP。store 内 CRL 不等于完整 Cryptnet/OCSP 缓存。因此本机材料不足时公共 DoH 可以失败，不能把内存测试 CA/CRL 的成功写成产品公共服务正向。此限制必须在交付中明示。
+
+2026-10-06 增量：只读 `certutil -urlcache CRL` 发现用户 Cryptnet cache 有约 80 个条目，不能从 CA store 的一份旧 CRL 推断所有本地来源均缺材料。native verifier 仅在 unknown/expired revocation 时尝试读取证书 CDP；`CryptGetObjectUrl` 固定 `CRYPT_GET_URL_FROM_EXTENSION`，`CryptRetrieveObjectByUrlW` 固定 `CONTEXT_OID_CRL` 和 `CRYPT_CACHE_ONLY_RETRIEVAL | CRYPT_DONT_CACHE_RESULT`。仅接受有界 HTTP(S) cache key，禁止 file/LDAP/FTP、chain API、在线获取及 cache/store 写入。缓存 DER 只是未经认证的候选，加入原 CRL 后仍由相同 ROOT、完整链、签名/issuer/expiry/revoked/name/purpose 标准 verifier 验证；Revoked、UnknownIssuer、错名等错误不进入重试。没有候选则保留失败。每次读取最多 64 份证书、32 个 CDP、证书与 CRL DER 合计 8 MiB；超限拒绝。同步 CAPI 检查绝对 deadline，不能中途抢占；取消由 transport 在 TLS 后、HTTP 前及销毁后检查。[缓存读取 flags](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptretrieveobjectbyurla)、[缓存与 store 的差异](https://learn.microsoft.com/en-us/windows/win32/seccrypto/certificate-revocation-list-semantics)。实际命中及未完成项见 [只读 CRL 缓存证据](doh-offline-crl-cache.md)。
 
 ## FFI、HTTP 与资源
 
@@ -43,6 +45,8 @@ Rustls 空 CRL 会跳过吊销，默认也允许过期 CRL；其标准 verifier 
 测试信任入口只存在于 standalone fixture feature，不写宿主 trust，不通过产品 ENV 开启。受控同一连接记录 remote IP、SNI、ALPN=h2、HTTP authority/path 和 DNS wire。负向包含不可信、错名、过期、吊销、无 CRL/错误 issuer/过期 CRL、Disallowed、错误状态/媒体、redirect、超大/中断/慢速 body，以及各阶段 deadline/cancel 和重复查询资源回落。
 
 fresh WMI Host 须确认 Runtime modules=0。进程内 tripwire 观测并阻断 DNS/getaddr、WinHTTP/PAC、CryptoAPI chain/URL API 和非配置 socket endpoint；受控 AIA/CRL/OCSP/redirect canary 记录实际访问。每项观测限定到覆盖范围，API trap 不能冒充系统抓包，内存 CA 正向不能冒充 production loader 正向。冷加载、两架构和目标 OS 单独归档；无法观察或关联的部分保持 Unproven/No-Go，不自动启用产品能力。
+
+该 tripwire 矩阵使用自包含 fixture，仍要求 URL API 调用为零，不读取宿主 cache。native cache 路径另以固定 cache-only flags、真实 cache miss 的 owned listener 零连接和双架构公共诊断验证；这不是完整系统 ETW/抓包的替代品。
 
 本文件记录研究与实现约束。实际日志、锁定依赖版本和最终 Go/No-Go 由后续原型证据补充，不能从本文推断票 18/19 已完成。
 

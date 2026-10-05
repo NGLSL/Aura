@@ -56,3 +56,12 @@ observations, not global ETW/packet capture or a complete Windows-version matrix
 Fixture trust success does not demonstrate a public resolver is usable with the
 machine's production ROOT/CRL snapshot. The separate native FFI fixture proves
 default-feature-off Rust staticlibs link with MSVC C++ on both architectures.
+
+The matrix now also supplies explicit `--cached-crls` DER candidates through
+the fixture-only trust input. Thirteen cases per architecture exercise the
+production retry and standard verifier branch: valid/stale-refresh positives,
+miss, wrong issuer, expired or tampered-signature CRLs, revoked EE/CA, full chain
+coverage, unknown CA revocation, inability to override known revoked, wrong
+name and untrusted chain. No Windows cache entry is seeded or read. This adds
+26 cases to the previous 58 executed IPv4 cases, for 84 when both architectures
+run; the 10 optional IPv6 cases remain separately qualified by preflight.

@@ -122,4 +122,14 @@ WDK/SDK 构建输入已于 2026-10-06 在项目 `target` 内恢复并通过空�
 
 用户已明确回复“尚无测试虚拟机，先完成可独立实现的部分”。因此不在宿主执行驱动加载、Verifier 或内核故障恢复；这些验收保持待完成，完整 P0–P8 总目标未达成。
 
+## 2026-10-06 后续：DoH 只读 CRL cache 与 AuthRoot 研究
+
+基线 `af1f6f6` 之后新增 Cryptnet CRL cache-only/no-write adapter 和 native 严格 revocation 重试；fixture 不读宿主缓存。修正早期材料结论的范围：CA store 只有旧 CRL 不代表用户 Cryptnet cache 没有材料，只读列表实际约 80 条。双架构 presented-chain 观察：Google cache hit 2，Cloudflare 0；研究 AuthRoot 变体仍 `UnknownRevocationStatus`，default 仍 `UnknownIssuer`。未知/过期、空列表和 cache miss 保持拒绝，未在线补取或放宽 trust。
+
+审查修正前的历史结果：fresh WMI Host PID 16056 / Runtime modules 0，Rust 1.99 workspace build/test exit 0，**403 passed / 0 failed / 34 ignored**；i686 DoH crate 实际 **14 passed / 0 failed / 1 ignored**。两架构重新构建的 IPv4 fixture **58/58 passed**，Host PID 2632 / Runtime modules 0；IPv6 disabled，10 项未执行。default staticlib/MSVC DLL/C ABI 双架构构建和运行完成，但公共 IPv4 均 certificate failure，18 No-Go/19 off 保留。最终审查后结果见后段的 84 场景与 Host PID 17372 whole-suite。
+
+AuthRoot 签名/显式 signer trust、Root Program 属性、freshness/rollback/未知 schema 以及受控离线材料输入的后续顺序已经保存，不能把全量 AuthRoot 提升为 root 来通过验收。证据和剩余实施门槛见 [缓存切片](doh-offline-crl-cache.md)、[AuthRoot 研究](authroot-offline-research.md) 与 [本轮 review](doh-offline-crl-review.md)。无 VM 的用户态研究可继续；驱动加载、Verifier、完整 WFP/overlay 和故障恢复仍保留原门禁。
+
+本轮审查修正 CDP 二阶段实际长度小于预估值时的误拒，全部 pointer 检查改用实际返回范围；新增 26 个 fixture cache 候选重试正反向场景，最终双架构 IPv4 **84/84 passed**，WMI Host PID 30664 / Runtime modules 0。修正后完整 suite 再验 **403/0/34**，Host PID 17372 / Runtime modules 0，build/test exit 0；默认 C ABI 最终双架构仍 certificate failure/No-Go。native cache 各步骤及时取消尚未支持，已明确作为正式启用前门禁，不以 fixture 取消通过代替。
+
 统一 review 的 Standards / Spec 两轴都必须包含未完成要求，不能因为阶段代码测试通过就宣称 49 或完整 Container 已完成。实现后按 Skill 在当前分支提交经过 review 的具体变更；不隐含 push、release、宿主驱动安装或外部提交。

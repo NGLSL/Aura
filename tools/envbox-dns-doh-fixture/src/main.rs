@@ -92,13 +92,18 @@ fn main() {
             .get("--cancel-ms")
             .map(|value| now + value.parse::<u64>().unwrap())
             .unwrap_or(u64::MAX);
-        let snapshot = Snapshot::fixture(
+        let mut snapshot = Snapshot::fixture(
             materials(options.get("--roots")),
             materials(options.get("--ca")),
             materials(options.get("--crls")),
             materials(options.get("--deny")),
         )
         .expect("fixture trust shape");
+        if let Some(candidates) = options.get("--cached-crls") {
+            snapshot = snapshot
+                .with_fixture_cached_crls(materials(Some(candidates)))
+                .expect("fixture cache candidate bounds");
+        }
         let budget = unsafe {
             Budget::from_callback(
                 now + budget_ms,

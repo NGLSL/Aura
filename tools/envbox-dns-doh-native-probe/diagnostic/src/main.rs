@@ -7,6 +7,8 @@ mod budget;
 mod error;
 #[path = "../../../../crates/envbox-dns-doh/src/executor.rs"]
 mod executor;
+#[path = "../../../../crates/envbox-dns-doh/src/offline_crl.rs"]
+mod offline_crl;
 #[path = "../../../../crates/envbox-dns-doh/src/transport.rs"]
 mod transport;
 pub mod trust {
@@ -309,6 +311,27 @@ impl ServerCertVerifier for RecordingVerifier {
                 "{}",
                 peer_certificate_line(&format!("intermediate[{index}]"), certificate)
             );
+        }
+        // An independent read-only observation of presented-chain CDPs. This
+        // does not inject candidates into the verifier or authorize anchors.
+        match offline_crl::for_certificates(
+            std::iter::once(end.as_ref()).chain(intermediates.iter().map(AsRef::as_ref)),
+            Budget::until(deadline()),
+        ) {
+            Ok(crls) => {
+                println!("peer_cdp_cached_crl_count={}", crls.len());
+                for (index, der) in crls.iter().enumerate() {
+                    let hash = Sha256::digest(der)
+                        .iter()
+                        .map(|byte| format!("{byte:02X}"))
+                        .collect::<String>();
+                    println!(
+                        "peer_cdp_cached_crl={index} bytes={} der_sha256={hash} authenticated=0",
+                        der.len()
+                    );
+                }
+            }
+            Err(error) => println!("peer_cdp_cached_crl_error={error:?}"),
         }
         self.inner
             .verify_server_cert(end, intermediates, name, ocsp, now)

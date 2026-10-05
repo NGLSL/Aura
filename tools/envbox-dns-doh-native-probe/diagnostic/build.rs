@@ -10,7 +10,7 @@ fn main() {
     // exactly that documentation line while keeping every Rust item intact.
     let mut contents = contents
         .strip_prefix(
-            "//! Offline local trust snapshot and explicit distrust; no chain/URL APIs.\n",
+            "//! Offline local trust snapshot and explicit distrust; no chain or wire retrieval.\n",
         )
         .expect("trust source header changed unexpectedly")
         .to_owned();
@@ -30,9 +30,13 @@ fn main() {
     // Research-only switch: test whether the already-materialized AuthRoot
     // physical store supplies the public anchor under the same eligibility,
     // deny-list and CRL policy. It never changes the product crate.
-    let include_authroot = env::var_os("DOH_DIAGNOSTIC_INCLUDE_AUTHROOT")
-        .is_some_and(|value| value == "1");
-    let variant = if include_authroot { "authroot" } else { "native" };
+    let include_authroot =
+        env::var_os("DOH_DIAGNOSTIC_INCLUDE_AUTHROOT").is_some_and(|value| value == "1");
+    let variant = if include_authroot {
+        "authroot"
+    } else {
+        "native"
+    };
     if include_authroot {
         assert_eq!(
             contents.matches(ROOT_LABELS).count(),

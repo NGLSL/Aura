@@ -44,6 +44,14 @@ completed worker may exit zero while the JSON still cannot claim acceptance.
 Literal TCP connect and Rustls TLS handshake each have a 15-second endpoint
 deadline inside a 60-second worker budget.
 
+The diagnostic also records presented-chain CDP cache-only observations:
+candidate CRL count, byte length and SHA-256, marked `authenticated=0`. It uses
+the production read-only cache adapter with fixed cache-only/no-write flags;
+these observations neither inject trust nor prove full chain revocation.
+The product verifier independently performs any permitted strict cache retry.
+Fixture trust remains self-contained and does not read the host URL cache.
+See the [cache slice evidence](../../.scratch/aura-container/evidence/doh-offline-crl-cache.md).
+
 For research only, setting `DOH_DIAGNOSTIC_INCLUDE_AUTHROOT=1` before the
 diagnostic build/run creates an isolated diagnostic variant that includes the
 current physical AuthRoot store as candidate anchors. This switch changes only

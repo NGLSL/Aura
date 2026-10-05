@@ -3,6 +3,7 @@ mod budget;
 mod error;
 mod executor;
 mod ffi;
+mod offline_crl;
 mod transport;
 pub mod trust;
 pub use budget::{Budget, CancelCallback};
