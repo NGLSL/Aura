@@ -281,3 +281,114 @@ fn independent_hidden_startup_converges() {
         CloseHandle(process).unwrap();
     }
 }
+
+#[test]
+#[ignore = "invoked only by the isolated same-SID low-integrity management fixture"]
+fn low_integrity_cannot_manage_medium_supervisor() {
+    use std::collections::BTreeMap;
+    use std::os::windows::process::CommandExt;
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let fixture = std::env::var_os("AURA_MANAGEMENT_FIXTURE")
+        .expect("AURA_MANAGEMENT_FIXTURE must point to the native fixture");
+    let _endpoint = PRINCIPAL_ENDPOINT.lock().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let targets = Arc::new(Mutex::new(HashSet::new()));
+    let server_stop = stop.clone();
+    let server_targets = targets.clone();
+    let approved = ApprovedManager::from_file(&std::env::current_exe().unwrap()).unwrap();
+    let server = std::thread::spawn(move || {
+        serve(ServerConfig {
+            store: envbox_storage::ConfigStore::new(
+                std::env::temp_dir()
+                    .join(format!("aura-supervisor-low-il-{}", uuid::Uuid::new_v4())),
+            ),
+            approved_managers: vec![approved],
+            managed_targets: server_targets,
+            stop: server_stop,
+            request_timeout: Duration::from_millis(250),
+        })
+    });
+
+    let client = SupervisorClient {
+        executable: std::env::current_exe().unwrap(),
+        timeout: Duration::from_secs(2),
+    };
+    let end = Instant::now() + Duration::from_secs(2);
+    let first = loop {
+        match client.request(request("Ping", None)) {
+            Ok(response) => break response,
+            Err(error) => {
+                assert!(Instant::now() < end, "{error}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    assert_eq!(first.status, "Ok");
+    let endpoint = client.endpoint().unwrap();
+    let output = std::env::temp_dir().join(format!(
+        "aura-management-low-il-{}.log",
+        uuid::Uuid::new_v4()
+    ));
+    let mut child = std::process::Command::new(fixture)
+        .args(["--launch-low", &endpoint, output.to_str().unwrap()])
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .spawn()
+        .unwrap();
+    let status = child.wait().unwrap();
+    let details = std::fs::read_to_string(&output).unwrap_or_default();
+    let _ = std::fs::remove_file(&output);
+    println!("low_integrity_management_fixture status={status}\n{details}");
+    assert!(status.success(), "fixture failed: {details}");
+
+    let fields: BTreeMap<_, _> = details
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+    let owner_integrity = fields
+        .get("launcher_integrity")
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("fixture must report the Supervisor owner integrity");
+    assert!(
+        owner_integrity >= 0x2000,
+        "the server owner must be medium or high integrity, got {owner_integrity:#x}"
+    );
+    assert_eq!(fields.get("create_process").map(String::as_str), Some("ok"));
+    assert_eq!(
+        fields.get("probe_integrity").map(String::as_str),
+        Some("4096")
+    );
+    assert_eq!(fields.get("same_sid").map(String::as_str), Some("true"));
+    assert_eq!(fields.get("target_endpoint"), Some(&endpoint));
+    match fields.get("pipe_open").map(String::as_str) {
+        Some("denied") => {
+            assert_eq!(
+                fields.get("pipe_open_error_code").map(String::as_str),
+                Some("5"),
+                "only ERROR_ACCESS_DENIED is an accepted OS-level integrity rejection"
+            );
+            let error = fields
+                .get("pipe_open_error")
+                .expect("OS denial must include the CreateFile error");
+            assert_eq!(error, "5");
+        }
+        Some("ok") => assert_eq!(
+            fields.get("response_status").map(String::as_str),
+            Some("AuthenticationDenied"),
+            "a low-integrity client that reaches the server must be rejected by server authentication"
+        ),
+        other => panic!("unexpected direct endpoint result: {other:?}\n{details}"),
+    }
+
+    let after = client
+        .request(request("Ping", Some(first.generation.clone())))
+        .expect("the authenticated manager must remain usable after the low-integrity attempt");
+    assert_eq!(after.status, "Ok");
+    assert_eq!(after.generation, first.generation);
+    println!(
+        "low_integrity_management owner_integrity={owner_integrity:#x} low_integrity=0x1000 same_sid=true direct_endpoint=true manager_ping=ok generation_preserved=true"
+    );
+    stop.store(true, Ordering::Release);
+    server.join().unwrap().unwrap();
+}

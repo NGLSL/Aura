@@ -691,10 +691,13 @@ fn strict_unsupported_entrypoints_reject_without_pending_work() {
         ("ex-a", "callback", "10045"),
         ("ex-a", "namespace", "10045"),
         ("ex-a", "provider", "10045"),
-        ("ex-w", "event", "10045"),
-        ("ex-w", "callback", "10045"),
+        ("ex-a", "sync-flags", "10045"),
+        ("ex-w", "flags", "10045"),
+        ("ex-w", "sync-flags", "10045"),
         ("ex-w", "namespace", "10045"),
         ("ex-w", "provider", "10045"),
+        ("gai-a", "sync-flags", "10045"),
+        ("gai-w", "sync-flags", "10045"),
         ("raw", "name", "50"),
         ("raw", "packet", "50"),
         ("null-ex", "request", "87"),
@@ -761,6 +764,175 @@ fn strict_unsupported_entrypoints_reject_without_pending_work() {
         0,
         "unsupported calls must not enter Profile DNS transport"
     );
+}
+
+/// GetAddrInfoExW asynchronous event and callback modes are routed through
+/// the Profile wire client.  The ANSI async ABI remains an explicit reject
+/// because Microsoft documents those parameters as reserved for ExA.
+#[test]
+fn strict_getaddrinfoexw_async_routes_without_host_fallback() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let stop = spawn_fixture_dns(
+        try_bind_fixture_dns().expect("fixture bind"),
+        FixtureMode::DelayedAddress,
+    );
+    let root = std::env::temp_dir().join(format!("envbox-dns-exw-async-{}", Uuid::new_v4()));
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let probe = probe_exe().expect("probe required");
+
+    for mode in ["event", "callback", "close-event"] {
+        let out = envbox_with_root(&root)
+            .env("ENVBOX_RUNTIME_DLL", &dll)
+            .args(["run", "--profile", &profile])
+            .arg(&probe)
+            .args(["--dns-strict", "ex-w", mode])
+            .output()
+            .expect("GetAddrInfoExW async probe");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{mode}: {out:?}");
+        assert_eq!(field_after(&text, "StrictProbe_Status:"), "997", "{text}");
+        assert_eq!(
+            field_after(&text, "StrictProbe_InitialOverlappedStatus:"),
+            "10036",
+            "{mode} must publish WSAEINPROGRESS while the request is pending: {text}"
+        );
+        assert_eq!(
+            field_after(&text, "StrictProbe_FinalCallbacks:"),
+            if mode == "callback" { "1" } else { "0" },
+            "{text}"
+        );
+        assert_eq!(field_after(&text, "StrictProbe_Records:"), "1", "{text}");
+        if mode == "event" || mode == "close-event" {
+            assert_eq!(
+                field_after(&text, "StrictProbe_DrainStatus:"),
+                "0",
+                "{text}"
+            );
+            assert_eq!(
+                field_after(&text, "StrictProbe_DrainStatusSecond:"),
+                "0",
+                "{text}"
+            );
+        } else {
+            assert_eq!(
+                field_after(&text, "StrictProbe_CallbackStatus:"),
+                "0",
+                "{text}"
+            );
+        }
+    }
+    assert!(stop.queries.load(Ordering::SeqCst) >= 1);
+}
+
+/// The callback may release every caller-owned async buffer before returning.
+/// Runtime completion must have finished all borrowed writes before entering
+/// user code and must not touch OVERLAPPED/result/name-handle afterwards.
+#[test]
+fn strict_getaddrinfoexw_callback_can_release_caller_storage() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let stop = spawn_fixture_dns(
+        try_bind_fixture_dns().expect("fixture bind"),
+        FixtureMode::Address,
+    );
+    let root =
+        std::env::temp_dir().join(format!("envbox-dns-exw-callback-free-{}", Uuid::new_v4()));
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let out = envbox_with_root(&root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile])
+        .arg(probe_exe().expect("probe required"))
+        .args(["--dns-strict", "ex-w", "callback-free"])
+        .output()
+        .expect("GetAddrInfoExW callback release probe");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(field_after(&text, "StrictProbe_Status:"), "997", "{text}");
+    assert_eq!(field_after(&text, "StrictProbe_DrainEvent:"), "0", "{text}");
+    assert_eq!(
+        field_after(&text, "StrictProbe_CallbackStatus:"),
+        "0",
+        "{text}"
+    );
+    assert_eq!(
+        field_after(&text, "StrictProbe_FinalCallbacks:"),
+        "1",
+        "{text}"
+    );
+    assert_eq!(field_after(&text, "StrictProbe_Records:"), "0", "{text}");
+    assert!(stop.queries.load(Ordering::SeqCst) >= 1);
+}
+
+/// Cancellation must complete the ExW callback exactly once with the
+/// documented WSA_E_CANCELLED status and no result chain.
+#[test]
+fn strict_getaddrinfoexw_async_cancel_is_single_completion() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let stop = spawn_fixture_dns(
+        try_bind_fixture_dns().expect("fixture bind"),
+        FixtureMode::Silent,
+    );
+    let root = std::env::temp_dir().join(format!("envbox-dns-exw-cancel-{}", Uuid::new_v4()));
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let out = envbox_with_root(&root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile])
+        .arg(probe_exe().expect("probe required"))
+        .args(["--dns-strict", "ex-w", "cancel"])
+        .output()
+        .expect("GetAddrInfoExW cancel probe");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(field_after(&text, "StrictProbe_Status:"), "997", "{text}");
+    assert_eq!(
+        field_after(&text, "StrictProbe_InitialOverlappedStatus:"),
+        "10036",
+        "cancel must observe WSAEINPROGRESS before publishing its terminal status: {text}"
+    );
+    assert_eq!(field_after(&text, "StrictProbe_Cancel:"), "0", "{text}");
+    assert_eq!(
+        field_after(&text, "StrictProbe_CallbackStatus:"),
+        "10111",
+        "{text}"
+    );
+    assert_eq!(
+        field_after(&text, "StrictProbe_FinalCallbacks:"),
+        "1",
+        "{text}"
+    );
+    assert_eq!(field_after(&text, "StrictProbe_Records:"), "0", "{text}");
+    assert!(stop.queries.load(Ordering::SeqCst) <= 1);
+}
+
+/// Event completion must retire internal state even when callers inspect the
+/// result through their own OVERLAPPED storage and do not call the helper.
+#[test]
+fn strict_getaddrinfoexw_event_releases_more_than_pending_limit() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let stop = spawn_fixture_dns(
+        try_bind_fixture_dns().expect("fixture bind"),
+        FixtureMode::Address,
+    );
+    let root = std::env::temp_dir().join(format!("envbox-dns-exw-repeat-{}", Uuid::new_v4()));
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let out = envbox_with_root(&root)
+        .env("ENVBOX_RUNTIME_DLL", &dll)
+        .args(["run", "--profile", &profile])
+        .arg(probe_exe().expect("probe required"))
+        .args(["--dns-strict", "ex-w", "repeat"])
+        .output()
+        .expect("GetAddrInfoExW repeat probe");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        field_after(&text, "StrictProbe_RepeatCompleted:"),
+        "80",
+        "{text}"
+    );
+    assert!(stop.queries.load(Ordering::SeqCst) >= 1);
 }
 
 #[test]
@@ -1510,6 +1682,11 @@ fn dnsquery_ex_async_smoke_routes_fixture() {
         "async DnsQueryEx must invoke the caller callback exactly once:\n{stdout}"
     );
     assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_CallbackCancelStatus:"),
+        "87",
+        "callback-side cancel of the completed generation must stay local:\n{stdout}"
+    );
+    assert_eq!(
         field_after(&stdout, "DnsQueryEx_A_Async_ReentryReturnStatus:"),
         "9506",
         "callback re-entry must create a second pending request:\n{stdout}"
@@ -1533,6 +1710,11 @@ fn dnsquery_ex_async_smoke_routes_fixture() {
         field_after(&stdout, "DnsQueryEx_A_Async_ReentryCallbackStatus:"),
         "0",
         "re-entry callback must report success:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_StaleCancelStatus:"),
+        "87",
+        "a copied old generation must not cancel the re-entered request:\n{stdout}"
     );
     assert_eq!(
         field_after(&stdout, "DnsQueryEx_A_Async_Reentry:"),
@@ -1619,6 +1801,11 @@ fn dnsquery_ex_async_cancel_completes_callback() {
         field_after(&stdout, "DnsQueryEx_A_Async_CancelCopied:"),
         "1",
         "DnsCancelQuery must accept a copied Runtime-owned cancel handle:\n{stdout}"
+    );
+    assert_eq!(
+        field_after(&stdout, "DnsQueryEx_A_Async_CallbackCancelStatus:"),
+        "87",
+        "callback-side cancel after concurrent cancellation must remain local:\n{stdout}"
     );
     assert_eq!(
         field_after(&stdout, "DnsQueryEx_A_Async_InitialQueryStatus:"),

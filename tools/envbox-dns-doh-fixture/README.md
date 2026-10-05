@@ -42,6 +42,14 @@ timeout and cancellation. Certificate/revocation failures must precede HTTP
 application requests. Forbidden API counts, denied endpoints, UDP calls and
 canary traffic must remain zero.
 
+The matrix also verifies an IPv4 IP URL against its IP SAN, with no DNS SNI.
+Five IPv6 cases per architecture cover hostname URLs over an IPv6 bootstrap,
+HTTP/1.1 and HTTP/2, a bracketed IP URL with IP SAN validation, wrong IP
+identity, and read cancellation. A plain-socket `::1` preflight runs first.
+If the host denies IPv6, the runner explicitly reports those cases as
+UNVERIFIED and does not count them as passed; the executed IPv4 matrix still
+runs. Fixing host networking is outside this fixture's scope.
+
 Fresh hidden WMI runs provide a process environment independent from an injected
 interactive shell. These are process-scoped instrumentation and loopback
 observations, not global ETW/packet capture or a complete Windows-version matrix.

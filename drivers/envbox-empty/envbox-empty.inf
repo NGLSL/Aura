@@ -1,0 +1,49 @@
+; Deliberately minimal PnP package metadata for the build/signing fixture.
+; The repository build never installs or loads this package.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+; System is the Microsoft-defined GUID_DEVCLASS_SYSTEM setup class.
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = 01/01/2026,0.1.0.0
+CatalogFile = envbox-empty.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[Manufacturer]
+%ManufacturerName% = EnvBoxEmpty,NTamd64.10.0...16299
+
+[EnvBoxEmpty.NTamd64.10.0...16299]
+%DeviceName% = EnvBoxEmpty_Install,Root\EnvBoxEmpty
+
+[EnvBoxEmpty_Install.NT]
+CopyFiles = EnvBoxEmpty_Install.NT.Copy
+
+[EnvBoxEmpty_Install.NT.Copy]
+envbox-empty.sys
+
+[EnvBoxEmpty_Install.NT.Services]
+AddService = EnvBoxEmpty,0x00000002,EnvBoxEmpty.Service
+
+[EnvBoxEmpty.Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\envbox-empty.sys
+
+[SourceDisksFiles]
+envbox-empty.sys = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[Strings]
+ManufacturerName = "EnvBox build fixture"
+DeviceName      = "EnvBox Empty Build Fixture Device"
+ServiceName      = "EnvBox Empty Build Fixture"
+DiskName         = "EnvBox Empty Driver"

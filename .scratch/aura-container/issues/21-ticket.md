@@ -40,3 +40,5 @@ Blocked by: None（可开始只读预检；实验/外部交付仍受下述条件
 ## 当前实施记录
 
 2026-10-04：前置资格未通过，未执行正式后端。19 等待 DoH bootstrap 隔离 Go；21 已完成只读预检，但无 WDK、隔离 VM 和相应测试材料。用户确认尚无 VM，先完成独立部分；不在宿主安装驱动。见 [实施进度](../evidence/implementation-progress.md)。
+
+2026-10-06 增量：已在项目 `target` 内恢复固定版本、固定 hash 的 WDK/SDK NuGet 输入，真实编译 x64 空功能驱动，并通过 `Inf2Cat`、`InfVerif /w`、`InfVerif /h` 与 PE/import 结构检查。`signtool` 明确返回 unsigned；未创建或导入证书，未安装、加载或修改启动策略。此前“无 WDK”的构建阻塞已解除，隔离实验环境与测试信任路径仍缺，22 的加载门禁不变。详见 [构建独立证据](../evidence/driver-build-independent.md)。本票仍为 needs-info，不将构建成功算作驱动运行或发布资格。

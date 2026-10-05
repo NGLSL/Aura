@@ -35,3 +35,5 @@ A04、A10、F06。本票完成仅代表该切片；总目标只有全部最终�
 ## 当前实施记录
 
 2026-10-04：已实施并验证可独立交付的切片；完整验收尚未全部通过，本票未关闭。实际运行、静态检查、失败来源和剩余缺口见 [实施进度](../evidence/implementation-progress.md)。不得从 claimed 或某组测试通过推断整票/完整 Container 完成。
+
+2026-10-06 增量：同 SID 的真实 low IL (`0x1000`) 客户端直接连接 medium Supervisor 实际 endpoint，被 Windows 以 `ERROR_ACCESS_DENIED (5)` 拒绝；随后已认证 manager 的相同 generation Ping 仍成功。不存在 endpoint 的控制样本返回 error `2` / helper exit `29`，不能误算为认证拒绝。没有修改生产 pipe ACL 或宿主配置。该结果是连接阶段 OS 拒绝，不冒称服务端收到请求后的 `AuthenticationDenied`；其他 SID、remote、高完整性组合仍未验证。见 [独立负向证据](../evidence/management-independent-final.md)。

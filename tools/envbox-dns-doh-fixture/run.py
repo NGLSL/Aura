@@ -67,7 +67,8 @@ def cert(label, *, issuer=None, private=None, ca=False, expired=False, wrong_eku
                    [x509.UniformResourceIdentifier(CANARY_URL)], None, None, None)]), False))
     if not ca:
         builder = builder.add_extension(x509.SubjectAlternativeName([
-            x509.DNSName("fixture.test"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), False)
+            x509.DNSName("fixture.test"), x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+            x509.IPAddress(ipaddress.ip_address("::1"))]), False)
     if wrong_eku or not ca:
         builder = builder.add_extension(x509.ExtendedKeyUsage([
             ExtendedKeyUsageOID.CLIENT_AUTH if wrong_eku else ExtendedKeyUsageOID.SERVER_AUTH]), False)
@@ -114,9 +115,10 @@ crl("bad-root-crl", BADROOT)
 
 def case(executable, trap, label, *, certificate="leaf", key=None, identity="fixture.test",
          roots="root", crls="root-crl", ca="", deny="", behavior="answer", protocol="h2",
-         expected=0, budget=1800, cancel=None, repeats=1, tls12=False):
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
+         expected=0, budget=1800, cancel=None, repeats=1, tls12=False, bootstrap="127.0.0.1"):
+    address = ipaddress.ip_address(bootstrap)
+    listener = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET)
+    listener.bind((bootstrap, 0))
     listener.listen(8)
     listener.settimeout(.1)
     port = listener.getsockname()[1]
@@ -246,8 +248,9 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
     worker = threading.Thread(target=server)
     worker.start()
     paths = lambda value: ";".join(str(OUT / (name + ".der")) for name in value.split(';') if name)
-    url = f"https://{identity}:{port}/dns-query?fixture=1"
-    command = [str(executable), "--url", url, "--ip", "127.0.0.1", "--roots", paths(roots),
+    authority = f"[{identity}]" if ":" in identity else identity
+    url = f"https://{authority}:{port}/dns-query?fixture=1"
+    command = [str(executable), "--url", url, "--ip", bootstrap, "--roots", paths(roots),
         "--crls", paths(crls), "--ca", paths(ca), "--deny", paths(deny), "--budget-ms", str(budget),
         "--repeat", str(repeats), "--trap", str(trap)]
     if cancel is not None:
@@ -270,15 +273,38 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
     assert CANARY_COUNT == baseline_canary
     if expected == 0:
         assert result.returncode == 0 and observed["requests"] == repeats, label
-        assert all(value == "127.0.0.1" for value in observed["peer"])
+        assert all(ipaddress.ip_address(value) == address for value in observed["peer"])
         assert all(value == protocol for value in observed["alpn"])
-        assert all(value == f"{identity}:{port}" for value in observed["authority"])
-        assert all(value == identity for value in observed["sni"])
+        assert all(value == f"{authority}:{port}" for value in observed["authority"])
+        try:
+            ipaddress.ip_address(identity)
+            expected_sni = None
+        except ValueError:
+            expected_sni = identity
+        assert all(value == expected_sni for value in observed["sni"])
     elif expected in (6, 7, 8, 9, 10, 11):
         assert observed["requests"] == 0, label
 
 
 def main():
+    # A host policy can deny IPv6 even on loopback. Probe with plain sockets,
+    # before any TLS client/trap is involved; an unavailable family is not a pass.
+    ipv6_available = False
+    try:
+        with socket.socket(socket.AF_INET6) as listener, socket.socket(socket.AF_INET6) as client:
+            listener.bind(("::1", 0))
+            listener.listen(1)
+            listener.settimeout(1)
+            client.settimeout(1)
+            client.connect(listener.getsockname())
+            connection, _ = listener.accept()
+            connection.close()
+        ipv6_available = True
+        print(json.dumps({"ipv6_preflight": "available"}), flush=True)
+    except OSError as error:
+        print(json.dumps({"ipv6_preflight": "unverified", "error": str(error),
+                          "winerror": getattr(error, "winerror", None),
+                          "unexecuted_cases_per_arch": 5}), flush=True)
     thread = threading.Thread(target=canary)
     thread.start()
     try:
@@ -287,6 +313,13 @@ def main():
         case(exe, trap, "h2-positive")
         case(exe, trap, "h2-tls12-positive", tls12=True)
         case(exe, trap, "h1-positive", protocol="http/1.1")
+        case(exe, trap, "ipv4-ip-identity", identity="127.0.0.1")
+        if ipv6_available:
+            case(exe, trap, "ipv6-h2-positive", bootstrap="::1")
+            case(exe, trap, "ipv6-h1-positive", bootstrap="::1", protocol="http/1.1")
+            case(exe, trap, "ipv6-ip-identity", bootstrap="::1", identity="::1")
+            case(exe, trap, "ipv6-wrong-ip-identity", bootstrap="::1", identity="::2", expected=9)
+            case(exe, trap, "ipv6-read-cancel", bootstrap="::1", behavior="read-stall", cancel=100, expected=2)
         case(exe, trap, "h2-resource", repeats=16)
         case(exe, trap, "untrusted", certificate="untrusted", expected=6)
         case(exe, trap, "expired", certificate="expired", expected=6)
@@ -312,7 +345,7 @@ def main():
         case(exe, trap, "read-deadline", behavior="read-stall", budget=200, expected=3)
         case(exe, trap, "handshake-cancel", behavior="handshake-stall", cancel=100, expected=2)
         case(exe, trap, "read-cancel", behavior="read-stall", cancel=100, expected=2)
-      print("PASS", OUT, flush=True)
+      print("PASS executed cases; IPv6=" + ("verified" if ipv6_available else "UNVERIFIED"), OUT, flush=True)
     finally:
         STOP.set()
         thread.join(2)

@@ -8,13 +8,238 @@ use envbox_launcher::{
 use envbox_storage::ConfigStore;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::os::windows::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+/// Holds an immutable Runtime image open without FILE_SHARE_DELETE while a
+/// managed run can still need it. The content-addressed staging cache is
+/// outside the installation directory, but the lease also makes an in-use
+/// image resistant to an installer or cleanup pass that tries to remove it.
+struct BundleLease {
+    path: PathBuf,
+    identity: FileIdentity,
+    sha256: String,
+    _file: std::fs::File,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
+
+fn handle_identity(file: &std::fs::File) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information)
+            .map_err(|_| io::Error::last_os_error())?;
+    }
+    Ok(FileIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+fn is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+fn open_stable_bundle(path: &std::path::Path) -> io::Result<(std::fs::File, FileIdentity)> {
+    let before = std::fs::symlink_metadata(path)?;
+    if is_reparse(&before) || !before.is_file() {
+        return Err(io::Error::other(
+            "Runtime bundle path is a reparse point or not a regular file",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .open(path)?;
+    let identity = handle_identity(&file)?;
+    let opened = file.metadata()?;
+    if is_reparse(&opened) || !opened.is_file() {
+        return Err(io::Error::other(
+            "opened Runtime bundle is not a bounded regular file",
+        ));
+    }
+
+    // Re-open the path only as an identity probe. The returned `file` remains
+    // the lease handle; if the path changed between the first open and this
+    // probe, the two file IDs differ and the operation fails closed.
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .open(path)?;
+    let probe_identity = handle_identity(&probe)?;
+    let after = std::fs::symlink_metadata(path)?;
+    if is_reparse(&after) || probe_identity != identity {
+        return Err(io::Error::other(
+            "Runtime bundle path identity changed during open",
+        ));
+    }
+    Ok((file, identity))
+}
+
+fn hash_bundle_handle(file: &mut std::fs::File) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_reparse(&metadata) || metadata.len() > MAX_BUNDLE_BYTES {
+        return Err(io::Error::other(
+            "Runtime bundle is not a bounded regular file",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut input = file.take(MAX_BUNDLE_BYTES + 1);
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    let mut total = 0u64;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count as u64);
+        if total > MAX_BUNDLE_BYTES {
+            return Err(io::Error::other("Runtime bundle exceeds 64 MiB"));
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn retain_bundles(
+    leases: &mut Vec<BundleLease>,
+    facts: &[MemberRuntimeIdentity],
+) -> io::Result<()> {
+    for fact in facts {
+        let path = std::fs::canonicalize(&fact.module_path)?;
+        if let Some(lease) = leases.iter().find(|lease| lease.path == path) {
+            let (_probe, identity) = open_stable_bundle(&fact.module_path)?;
+            if identity != lease.identity {
+                return Err(io::Error::other(
+                    "Runtime bundle path identity changed while retained",
+                ));
+            }
+            if lease.sha256 != fact.module_sha256 {
+                return Err(io::Error::other(
+                    "Runtime bundle hash conflicts with an existing lease",
+                ));
+            }
+            continue;
+        }
+        // Deliberately share read only. Omitting FILE_SHARE_WRITE and
+        // FILE_SHARE_DELETE keeps
+        // both a live instance's exact bundle from becoming delete-pending and
+        // a concurrent writer from replacing its bytes while its Runtime may
+        // still be mapped in a target process.
+        let (mut file, identity) = open_stable_bundle(&fact.module_path)?;
+        let sha256 = hash_bundle_handle(&mut file)?;
+        if sha256 != fact.module_sha256 {
+            return Err(io::Error::other(
+                "Runtime bundle hash does not match authenticated Runtime identity",
+            ));
+        }
+        leases.push(BundleLease {
+            path,
+            identity,
+            sha256,
+            _file: file,
+        });
+    }
+    Ok(())
+}
+
+fn process_generation_is_absent<F>(
+    identities: &[ProcessIdentity],
+    mut observe: F,
+) -> io::Result<bool>
+where
+    F: FnMut(u32) -> io::Result<ManagedTarget>,
+{
+    if identities.is_empty() {
+        return Ok(false);
+    }
+    for identity in identities {
+        let expected = ManagedTarget {
+            pid: identity.pid,
+            creation_time: identity.creation_time,
+        };
+        match observe(identity.pid) {
+            Ok(current) if current != expected => {}
+            Ok(_) => return Ok(false),
+            Err(error) if process_is_absent_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+fn process_is_absent_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error().is_some_and(|code| {
+            // The windows crate commonly exposes HRESULT_FROM_WIN32(code)
+            // through io::Error, so inspect the low Win32 word as well as the
+            // direct positive error representation.
+            matches!((code as u32) & 0xffff, 2 | 3 | 6 | 87 | 1168)
+        })
+}
+
+/// Classify whether the last sealed member generations are gone. This is only
+/// diagnostic evidence for a missing named Job; the caller still stays
+/// TrackingLost because a PID list cannot prove that an unknown descendant did
+/// not escape the lost Job.
+fn sealed_members_are_absent(result: &RunResult) -> io::Result<bool> {
+    if !sealed_member_evidence_complete(result) {
+        return Ok(false);
+    }
+    process_generation_is_absent(&result.known_members, ManagedTarget::observe)
+}
+
+fn sealed_member_evidence_complete(result: &RunResult) -> bool {
+    if result.record_schema != 3
+        || result.known_members.is_empty()
+        || result.member_runtimes.len() != result.known_members.len()
+    {
+        return false;
+    }
+    let mut known = HashSet::new();
+    if result.known_members.iter().any(|member| {
+        member.pid == 0
+            || member.creation_time == 0
+            || !known.insert((member.pid, member.creation_time))
+    }) {
+        return false;
+    }
+    let mut facts = HashSet::new();
+    result.member_runtimes.iter().all(|fact| {
+        fact.pid != 0
+            && fact.creation_time != 0
+            && !fact.module_path.as_os_str().is_empty()
+            && !fact.module_sha256.is_empty()
+            && !fact.config_sha256.is_empty()
+            && !fact.runtime_version.is_empty()
+            && known.contains(&(fact.pid, fact.creation_time))
+            && facts.insert((fact.pid, fact.creation_time))
+    })
+}
 
 struct OwnedRun {
     retry_recovery: bool,
     _snapshot: Option<RunSnapshot>,
     _recovered_broker: Option<envbox_launcher::HostBroker>,
+    _bundle_leases: Vec<BundleLease>,
     command: RunCommand,
     result: RunResult,
     // These handles survive every management client disconnect.
@@ -116,6 +341,7 @@ impl Runs {
                 retry_recovery: false,
                 _snapshot: record.snapshot,
                 _recovered_broker: None,
+                _bundle_leases: Vec::new(),
                 command: record.command,
                 result,
                 session: None,
@@ -125,8 +351,22 @@ impl Runs {
             if run.result.state == "TrackingLost" && run._snapshot.is_some() {
                 if let Err(error) = restore(&mut run, &self.generation, recovery_deadline) {
                     run.retry_recovery = error.kind() == io::ErrorKind::TimedOut;
+                    run.result.state = "TrackingLost".into();
                     run.result.error =
                         Some(format!("recovery could not establish control: {error}"));
+                    let path = self
+                        .store
+                        .root()
+                        .join("containers")
+                        .join(run.command.container_id.to_string())
+                        .join("runs")
+                        .join(format!("{}.json", run.command.instance_id));
+                    if let Err(persist) = atomic_record(&path, &run.result) {
+                        run.result.error = Some(format!(
+                            "{}; recovery loss record could not be persisted: {persist}",
+                            run.result.error.as_deref().unwrap_or("recovery failed")
+                        ));
+                    }
                 } else {
                     let path = self
                         .store
@@ -194,6 +434,7 @@ impl Runs {
                     run.members.clear();
                     run.session.take();
                     run._recovered_broker.take();
+                    run._bundle_leases.clear();
                     run.job.take();
                 }
                 Ok(stats) => {
@@ -235,6 +476,14 @@ impl Runs {
                                 continue;
                             }
                         };
+                        if let Err(error) = retain_bundles(&mut run._bundle_leases, &facts) {
+                            if run.result.state != "Stopping" {
+                                run.result.state = "TrackingLost".into();
+                            }
+                            run.result.error =
+                                Some(format!("Runtime bundle retention failed: {error}"));
+                            continue;
+                        }
                         let verified_job = match job.stats() {
                             Ok(stats) => stats,
                             Err(error) => {
@@ -628,6 +877,17 @@ impl Runs {
                 ));
             }
         };
+        let mut bundle_leases = Vec::new();
+        if let Err(error) = retain_bundles(&mut bundle_leases, &result.member_runtimes) {
+            return Err(self.cleanup_failed_start(
+                command,
+                &snapshot,
+                pending,
+                job,
+                &record,
+                format!("cannot retain active Runtime bundle: {error}"),
+            ));
+        }
         session.instance.container_id = Some(snapshot.container_id);
         session.instance.snapshot_id = Some(snapshot.snapshot_id);
         self.running.insert(
@@ -636,6 +896,7 @@ impl Runs {
                 retry_recovery: false,
                 _snapshot: Some(snapshot),
                 _recovered_broker: None,
+                _bundle_leases: bundle_leases,
                 command: command.clone(),
                 result: result.clone(),
                 session: Some(session),
@@ -688,6 +949,7 @@ impl Runs {
                 retry_recovery: false,
                 _snapshot: Some(snapshot.clone()),
                 _recovered_broker: None,
+                _bundle_leases: Vec::new(),
                 command: command.clone(),
                 result: pending,
                 session: None,
@@ -707,9 +969,23 @@ impl Runs {
             match restore(run, &self.generation, deadline) {
                 Err(error) => {
                     run.retry_recovery = error.kind() == io::ErrorKind::TimedOut;
+                    run.result.state = "TrackingLost".into();
                     run.result.error = Some(format!(
                         "workspace recovery could not establish control: {error}"
                     ));
+                    let path = self
+                        .store
+                        .root()
+                        .join("containers")
+                        .join(container_id.to_string())
+                        .join("runs")
+                        .join(format!("{}.json", run.command.instance_id));
+                    if let Err(persist) = atomic_record(&path, &run.result) {
+                        run.result.error = Some(format!(
+                            "{}; recovery loss record could not be persisted: {persist}",
+                            run.result.error.as_deref().unwrap_or("recovery failed")
+                        ));
+                    }
                 }
                 Ok(()) => {
                     run.retry_recovery = false;
@@ -882,7 +1158,9 @@ fn sealed_member_facts(
 fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -> io::Result<()> {
     use envbox_launcher::{request_runtime_reconnect, session_pipe_name, HostBroker, SessionTable};
     use sha2::{Digest, Sha256};
-    let result = &run.result;
+    // Work from an immutable snapshot of the journal while this function
+    // transitions `run` to Exited or Running below.
+    let result = run.result.clone();
     let snapshot = run
         ._snapshot
         .as_ref()
@@ -920,8 +1198,29 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
             "sealed Runtime bundle or configuration hash changed",
         ));
     }
-    let job = InstanceJob::open_named(&result.job_name)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let job = match InstanceJob::open_named(&result.job_name) {
+        Ok(job) => job,
+        Err(error)
+            if matches!(
+                error,
+                envbox_launcher::job::JobError::Open(2 | 3 | 6 | 87 | 1168)
+            ) =>
+        {
+            // A missing named Job is never enough to conclude that the whole
+            // tree exited. Job Objects do not give us a durable descendant
+            // list after the last handle is gone, and an unsealed descendant
+            // may still be alive. Keep the run TrackingLost even when all
+            // sealed generations are absent; the extra distinction makes the
+            // UI/record explain why no safe Stop or new Run is granted.
+            let detail = if sealed_members_are_absent(&result).unwrap_or(false) {
+                "named tracking Job no longer exists; sealed generations are absent but the complete process tree cannot be proven"
+            } else {
+                "named tracking Job no longer exists; process tree membership cannot be proven"
+            };
+            return Err(io::Error::other(format!("{detail} ({error})")));
+        }
+        Err(error) => return Err(io::Error::other(error.to_string())),
+    };
     job.verify_tracking_limits()
         .map_err(|error| io::Error::other(error.to_string()))?;
     let stats = job
@@ -932,6 +1231,7 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         run.result.state = "Exited".into();
         run.result.supervisor_generation = generation.into();
         run.result.error = None;
+        run._bundle_leases.clear();
         return Ok(());
     }
     let members: Vec<_> = stats
@@ -949,7 +1249,7 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
             "Job members are not fully sealed or their process generations changed",
         ));
     }
-    let sealed = sealed_member_facts(result, &members)?;
+    let sealed = sealed_member_facts(&result, &members)?;
     let mut checked_bundles: HashMap<std::path::PathBuf, String> = HashMap::new();
     for fact in &sealed {
         if fact.config_sha256 != result.runtime_config_sha256
@@ -972,6 +1272,11 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
             ));
         }
     }
+    // Acquire the leases before reconnecting any target. If a later
+    // reconnection check fails, the run remains TrackingLost but its exact
+    // bundle paths stay protected while the original process generations are
+    // still present.
+    retain_bundles(&mut run._bundle_leases, &sealed)?;
     let mut table = SessionTable::new();
     table.set_instance_id(&run.command.instance_id.to_string());
     table.register_profile_flags(
@@ -1301,5 +1606,88 @@ mod member_evidence_tests {
         .unwrap();
         assert_eq!(sealed[0].module_path, result.runtime_module_path);
         assert_eq!(sealed[0].module_sha256, result.runtime_module_sha256);
+    }
+
+    #[test]
+    fn missing_job_classification_requires_every_sealed_generation_to_be_gone() {
+        let identities = vec![
+            ProcessIdentity {
+                pid: 41,
+                creation_time: 410,
+            },
+            ProcessIdentity {
+                pid: 42,
+                creation_time: 420,
+            },
+        ];
+        assert!(process_generation_is_absent(&identities, |pid| {
+            Err(io::Error::from_raw_os_error(if pid == 41 {
+                87
+            } else {
+                1168
+            }))
+        })
+        .unwrap());
+        assert!(process_generation_is_absent(&identities, |pid| {
+            Ok(ManagedTarget {
+                pid,
+                creation_time: if pid == 41 { 999 } else { 420 },
+            })
+        })
+        .is_ok_and(|absent| !absent));
+        assert!(process_generation_is_absent(&identities, |pid| {
+            if pid == 41 {
+                Err(io::Error::from_raw_os_error(5))
+            } else {
+                Err(io::Error::from_raw_os_error(87))
+            }
+        })
+        .is_err());
+
+        let mut incomplete = record(3);
+        incomplete.member_runtimes.pop();
+        assert!(!sealed_members_are_absent(&incomplete).unwrap());
+    }
+
+    #[test]
+    fn active_bundle_lease_blocks_delete_until_run_releases_it() {
+        let root = std::env::temp_dir().join(format!("aura-bundle-lease-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("envbox-runtime64.dll");
+        std::fs::write(&path, b"fixture bundle").unwrap();
+        use sha2::Digest;
+        let expected_hash = format!("{:x}", sha2::Sha256::digest(b"fixture bundle"));
+        let mut leases = Vec::new();
+        retain_bundles(
+            &mut leases,
+            &[MemberRuntimeIdentity {
+                pid: 1,
+                creation_time: 1,
+                module_path: path.clone(),
+                module_sha256: expected_hash.clone(),
+                config_sha256: String::new(),
+                runtime_version: String::new(),
+            }],
+        )
+        .unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        leases.clear();
+        std::fs::write(&path, b"tampered bundle").unwrap();
+        let mut rejected = Vec::new();
+        assert!(retain_bundles(
+            &mut rejected,
+            &[MemberRuntimeIdentity {
+                pid: 1,
+                creation_time: 1,
+                module_path: path.clone(),
+                module_sha256: expected_hash,
+                config_sha256: String::new(),
+                runtime_version: String::new(),
+            }],
+        )
+        .is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

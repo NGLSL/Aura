@@ -1,8 +1,8 @@
 # Container 实施进度与证据入口
 
-Date: 2026-10-04
+Date: 2026-10-06
 Status: independent-slices-implemented-and-reviewed
-Review baseline: `8a971ab9b768412f0e8bbddbfea65c2b1966c0fb`
+Review baseline: `a5baed8`
 Branch: `dev`
 
 用户授权按 implement Skill 推进全部 P0–P8，并在最后统一 code-review。49 张票的总目标保持不变；本文件只记录进度，不将计划或原型当作完整交付。
@@ -11,7 +11,42 @@ Branch: `dev`
 
 工作区已有 DNS 全 QTYPE 修复、Probe/CLI DNS 测试、Rust 1.99 toolchain、三份 CI workflows 与 README 修改；容器规格、研究及 DNS transports 规格也已存在。实施不得回退它们。Review 区分此前 DNS 工作与本轮 Container 新实现，不把原有改动当作未知作者的废弃文件。
 
-## 本轮增量：混合架构恢复与 DoH 底座
+## 本轮增量：无需 VM 的独立实现与验收
+
+用户要求先完成不依赖虚拟机的部分，随后确认宿主禁用 IPv6。本轮保持 IPv6 关闭；IPv6 场景的未执行不计入通过，且不作为其他 IPv4 失败的解释。完整 P0–P8 和 49 票总目标仍未完成。
+
+| 范围 | 本轮实际结果 | 剩余门槛 |
+| --- | --- | --- |
+| 05 真实入口矩阵 | 旧 V3 pair 的 CreateProcess/AsUser、CMD、PowerShell 输出 Runtime/Profile 且实际 exit 0；稳定 process handle generation 核对/停止控制样本通过，临时根清理成功 | Host Chrome 与 Aura Chrome 同参数都提前 exit 13，浏览器 Unverified/renderer NotObserved；WithToken、Native、Packaged 等仍未验 |
+| 09 管理通道负向 | same-SID low IL 真实访问 medium endpoint 被 OS 以 error 5 拒绝，正常 manager 同 generation Ping 成功；不存在 endpoint 为 error 2/helper 29，不能误算通过 | 其他 SID、remote、高完整性矩阵与服务端收到请求后的 low IL 拒绝仍未验 |
+| 12–13 恢复/Runtime 保留 | 恢复失败写回 TrackingLost journal；NoJob 即使最后 sealed generations 均不存在也不冒称完整树 Exited；稳定 read-only/read-share file handle 验证 file identity 和有界 SHA，实际写入/删除/释放后篡改拒绝 | conhost、OS reboot、Supervisor 崩溃后的外部 cleanup、installer upgrade 等仍未闭 |
+| 16 异步 Resolver | ExW 的 event/callback/cancel、提前关闭原 event、callback 释放 caller storage、80 次无需 helper 的 event 退休通过；DnsQueryEx callback 内取消旧 token 返回 87，同 storage 重入后旧 generation 不能取消新请求；不支持的 provider/namespace/flags 明确拒绝 | fixture 证明 Profile 路由与生命周期；全机 Host DNS 零流量及应用自带 DNS 绕过未证明 |
+| 17 公共 DoT | 冻结 v2 Runtime 的 x64/x86 strict Profile IPv4 单次运行，A/W/UTF8/Ex/async 五入口均成功；fresh Host 无 Runtime，live module path/hash 与指定 DLL 相符，原始输出及唯一 JSON 保留 | 旧 V3 的 x86 async 1460 与历史重试保留；本轮单次 smoke 不证明系统辅助流量和跨 OS/缓存矩阵 |
+| 18 原生 DoH | 双架构本地 IPv4 58 个场景通过；IPv6 10 个场景未执行。product-default native FFI 公共 IPv4 为 UnknownIssuer；独立 AuthRoot 研究变体暴露下一层 UnknownRevocationStatus | AuthRoot CTL 严格安全接入、离线吊销材料、完整系统观测及其他 OS 未证明；整体 No-Go，19 未启用 |
+| 21 驱动构建 | 固定 hash WDK/SDK NuGet 输入、真实 x64 空功能 SYS、INF/CAT/PE 结构检查通过；明确 unsigned | 没有安装/加载；测试信任、VM/隔离环境、Verifier、恢复与正式签名仍缺；22 加载门禁不变 |
+
+分项证据见 [真实入口](real-app-independent-final.md)、[恢复与保留](recovery-independent-final.md)、[管理负向](management-independent-final.md)、[异步 Resolver](resolver-async-final.md)、[DoT](dot-independent-final.md)、[DoH IPv4/IPv6](doh-ipv6-independent.md)、[DoH 原生信任](doh-native-acceptance.md)、[空驱动构建](driver-build-independent.md)。下面前次结果保留其原始来源，不混作本轮验证数。
+
+本轮最终检查采用 fresh WMI Host PID **19324**，`Runtime modules=0`，清理继承的 `ENVBOX_*` 后使用冻结 v2 pair：
+
+- Rust **1.99.0** `cargo build --locked --workspace`：exit 0。
+- `cargo test --locked --workspace --no-fail-fast`：**395 passed / 0 failed / 34 ignored**，exit 0；ignored 不计入通过。包含最新 32 项 DNS CLI 测试、callback 内旧 token 取消/re-entry 断言、恢复与 bundle lease 测试。
+- 原始日志 `target/workspace-nonvm-final-build.log`、`target/workspace-nonvm-final-test.log`；身份/退出码/时间/双架构 hash 见 `target/workspace-nonvm-final-result.json`。
+- MSVC/CMake x64/x86 Release Runtime 构建通过；本轮 8 个修改的 Rust 文件直接 `rustfmt --check` 通过；PowerShell 8 个脚本和 Python 2 个脚本解析通过，`git diff --check` 通过。未扩大整理既有全仓格式差异。
+- 最终 Spec review 修复 callback-free Probe 自身的释放后读取竞态；即时响应 fixture 及重建 x64/i686 Probe 后，最终 suite 再次通过。fresh WMI PID **11012**、Runtime modules=0 的 x86 mixed 注入定向测试 **6 passed / 0 failed**；新 Probe/hash/原始日志见 Resolver 证据。
+- 首轮通过结果（Host 13116）保留于 `target/before-probe-review-workspace-nonvm-final-*`。其后将 x86 运行与构建并行造成 `envbox.exe` 被占用、构建 error 5，失败日志和 result 保留为 `workspace-nonvm-final-concurrent-build-failure*`；已在 x86 测试结束后顺序构建/运行取得上述最终结果，未把旧 test log 与失败 build result 拼成通过。
+- [本轮统一 review](nonvm-unified-review.md)：Standards、Spec 分别 **0 个未处理 actionable finding**。运行验收与剩余门禁独立记录，review 通过不表示全部 49 票完成。
+
+本轮最终 Runtime pair 为 `target/nonvm-final-runtime-v2/`：
+
+```text
+x64 CA8283ADAE000DBEAAE65902A10F2E0E05B94C38C14F7B3652EDD3066C43D965
+x86 5D2FD1038748F0D579F5B2EB59EBAEECDFF6C7846D12FD93876875696B6CEBE7
+```
+
+该 pair 用于最终 workspace/DNS 与公共 DoT 证据；真实入口、驱动、原生 DoH 和早期 recovery 证据各自注明实际产物，不将旧产物的行为结论移植到新 DLL。全套检查不包含安装器实际安装/升级、正式发布、驱动加载或 VM 验收。
+
+## 前次增量：混合架构恢复与 DoH 底座
 
 上次交付为 `9919ad1`；用户明确优先补混合架构恢复，再推进 DoH。完整 P0–P8 仍未完成，本轮新增结果如下。
 
@@ -83,7 +118,7 @@ x86 438d56e88e73eb0d2fca87400ec2f134c937041555c709611bdb2857be0f7e1a
 
 真实连接身份、Runtime 身份和 Hook 完成状态分开确认。旧 Runtime 的 READY 发生在 Hook 安装之前；新实现于 Hook transaction commit 后报告完整身份。Detours 初始挂起没有 Runtime ACK；入口门控使用真实标记及 x64/x86 证明，不在 loader lock 内等待放行。
 
-当前缺 WDK/隔离 VM 的事实属于运行门槛；继续推进独立工作，不伪造驱动运行/正式签名证据。未提供的正式证书和产品签名资格仍归 43/44 验收，不提前阻断具有测试资格的原型。
+WDK/SDK 构建输入已于 2026-10-06 在项目 `target` 内恢复并通过空驱动构建。当前仍缺明确的隔离 VM 与测试信任/恢复路径，不伪造驱动运行或正式签名证据。未提供的正式证书和产品签名资格仍归 43/44 验收，不提前阻断具有测试资格的原型。
 
 用户已明确回复“尚无测试虚拟机，先完成可独立实现的部分”。因此不在宿主执行驱动加载、Verifier 或内核故障恢复；这些验收保持待完成，完整 P0–P8 总目标未达成。
 

@@ -35,3 +35,5 @@ A14、A15、F06、F08。本票完成仅代表该切片；总目标只有全部�
 ## 当前实施记录
 
 2026-10-04：已实施并验证可独立交付的切片；完整验收尚未全部通过，本票未关闭。实际运行、静态检查、失败来源和剩余缺口见 [实施进度](../evidence/implementation-progress.md)。不得从 claimed 或某组测试通过推断整票/完整 Container 完成。
+
+2026-10-06 增量：Supervisor 对活跃及已恢复实例保留 Runtime bundle 的稳定只读句柄，仅允许 read sharing；从句柄计算有界 SHA-256，核对已认证摘要与 Windows file identity，拒绝路径替换、reparse 和篡改。实际测试证明持有期间写入/删除被拒绝，释放后修改内容再获取被拒绝；确认 Job 为空或 Stop 完成后释放 lease。Supervisor 崩溃后的外部 cleanup、真实 installer upgrade 与 OS reboot 仍未验，不能从句柄保留测试推断这些场景已通过。见 [独立证据](../evidence/recovery-independent-final.md)。

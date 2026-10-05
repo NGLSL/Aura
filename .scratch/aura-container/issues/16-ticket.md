@@ -34,4 +34,6 @@ A02、A06、A16、F03、F06。DNS 相关细节遵循 [DNS transports 规格](../
 
 ## 当前实施记录
 
+2026-10-06：补充 ExW event/callback/cancel Runtime-owned worker，复制 caller event，提交返回 997、pending Internal 10036、原子最后发布 terminal 状态；原生 status-only helper 保持重复读取语义。DnsQueryEx 使用加锁的 generation token，完成不再回写 caller storage，callback 内旧 token 与重入后的 stale copy 均本地返回 87，不能转发 Host 或取消新 generation。Profile 下 ExA async、unsupported provider/namespace/flags 明确拒绝。冻结 v2 x64 全 DNS CLI 32 项及 fresh Host 最终 workspace 395 项通过，完整系统流量与所有错误输入/资源矩阵仍未闭，票保持 claimed。详见 [Resolver 独立证据](../evidence/resolver-async-final.md) 和 [最终检查](../evidence/implementation-progress.md)。
+
 2026-10-04：已实施并验证可独立交付的切片；完整验收尚未全部通过，本票未关闭。实际运行、静态检查、失败来源和剩余缺口见 [实施进度](../evidence/implementation-progress.md)。不得从 claimed 或某组测试通过推断整票/完整 Container 完成。

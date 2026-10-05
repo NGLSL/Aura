@@ -31,6 +31,21 @@ struct DnsQueryResult {
     reserved: *mut c_void,
 }
 
+// The public DNS_RECORD header uses pointer-sized pNext/pName fields.  Keep
+// this repr(C) view shared by the async A-record consumer so x86 reads the
+// same wire record at wType/data offsets 8/24 that x64 reads at 16/32.
+#[repr(C)]
+struct DnsRecordHeader {
+    next: *mut DnsRecordHeader,
+    name: *mut c_void,
+    kind: u16,
+    length: u16,
+    flags: u32,
+    ttl: u32,
+    reserved: u32,
+    data: [u8; 0],
+}
+
 #[derive(Clone, Copy)]
 #[repr(C, align(8))]
 struct DnsQueryCancel {
@@ -68,6 +83,7 @@ struct AsyncDnsState {
     cancel: DnsQueryCancel,
     result: DnsQueryResult,
     query_status: AtomicI32,
+    callback_cancel_status: AtomicI32,
     callback_count: AtomicU32,
     addresses: Mutex<Vec<String>>,
     reenter: bool,
@@ -78,6 +94,7 @@ struct AsyncDnsState {
     reentry_initial_query_status: AtomicI32,
     reentry_query_status: AtomicI32,
     reentry_callback_count: AtomicU32,
+    stale_cancel_status: AtomicI32,
     reentry_addresses: Mutex<Vec<String>>,
 }
 
@@ -93,18 +110,18 @@ unsafe fn consume_dns_result(results: *mut DnsQueryResult, addresses: &Mutex<Vec
     let status = (*results).query_status;
     if !(*results).query_records.is_null() {
         let mut ips = Vec::new();
-        let mut record = (*results).query_records;
+        let mut record = (*results).query_records.cast::<DnsRecordHeader>();
         while !record.is_null() {
-            let base = record as *const u8;
-            let wtype = u16::from_le_bytes([*base.add(16), *base.add(17)]);
-            if wtype == 1 {
-                let bytes = [*base.add(32), *base.add(33), *base.add(34), *base.add(35)];
+            let record_ref = &*record;
+            if record_ref.kind == 1 {
+                let data = record_ref.data.as_ptr();
+                let bytes = [*data, *data.add(1), *data.add(2), *data.add(3)];
                 ips.push(format!(
                     "{}.{}.{}.{}",
                     bytes[0], bytes[1], bytes[2], bytes[3]
                 ));
             }
-            record = *(record as *const *mut c_void);
+            record = record_ref.next;
         }
         if let Ok(mut stored) = addresses.lock() {
             *stored = ips;
@@ -186,14 +203,34 @@ unsafe extern "system" fn dns_query_ex_completion(
     let state = context as *mut AsyncDnsState;
     let status = consume_dns_result(results, &(*state).addresses);
     (*state).query_status.store(status, Ordering::Release);
+    if (*state).inspect_pending {
+        // Completion leaves the old opaque token as a local tombstone.  A
+        // cancel from inside this callback must therefore stop at the Runtime
+        // with ERROR_INVALID_PARAMETER (87), never reach the Windows provider.
+        // Host control calls omit this extra cancellation so their native
+        // callback contract is not changed by the Probe.
+        let callback_cancel = DnsCancelQuery(&(*state).cancel);
+        (*state)
+            .callback_cancel_status
+            .store(callback_cancel, Ordering::Release);
+    }
     (*state).callback_count.fetch_add(1, Ordering::AcqRel);
-    if (*state).reenter
+    if (*state).inspect_pending
+        && (*state).reenter
         && (*state)
             .reentry_started
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     {
+        // Preserve the completed generation before re-entry overwrites the
+        // shared cancel storage.  The stale copy must remain locally rejected
+        // and must not cancel the newly published generation.
+        let stale_cancel = (*state).cancel;
         start_reentry(state);
+        let stale_status = DnsCancelQuery(&stale_cancel);
+        (*state)
+            .stale_cancel_status
+            .store(stale_status, Ordering::Release);
     }
     SetEvent((*state).event);
 }
@@ -486,6 +523,7 @@ struct AsyncDnsOutcome {
     return_status: i32,
     initial_query_status: i32,
     callback_status: i32,
+    callback_cancel_status: i32,
     callback_count: u32,
     cancel_status: Option<i32>,
     cancel_copied: bool,
@@ -495,6 +533,7 @@ struct AsyncDnsOutcome {
     reentry_initial_query_status: Option<i32>,
     reentry_query_status: Option<i32>,
     reentry_callback_count: Option<u32>,
+    stale_cancel_status: Option<i32>,
     reentry_wait_status: Option<u32>,
     reentry_addresses: Option<Vec<String>>,
 }
@@ -536,6 +575,11 @@ fn print_resolve_dnsquery_ex_async(
     println!("DnsQueryEx_A_Async_CallbackStatus:");
     println!("{}", outcome.callback_status);
     println!();
+    if outcome.callback_cancel_status >= 0 {
+        println!("DnsQueryEx_A_Async_CallbackCancelStatus:");
+        println!("{}", outcome.callback_cancel_status);
+        println!();
+    }
     println!("DnsQueryEx_A_Async_Callbacks:");
     println!("{}", outcome.callback_count);
     println!();
@@ -570,6 +614,11 @@ fn print_resolve_dnsquery_ex_async(
     if let Some(count) = outcome.reentry_callback_count {
         println!("DnsQueryEx_A_Async_ReentryCallbacks:");
         println!("{count}");
+        println!();
+    }
+    if let Some(status) = outcome.stale_cancel_status {
+        println!("DnsQueryEx_A_Async_StaleCancelStatus:");
+        println!("{status}");
         println!();
     }
     if let Some(status) = outcome.reentry_wait_status {
@@ -963,6 +1012,7 @@ fn dns_query_ex_a_async(
             return_status: -1,
             initial_query_status: -1,
             callback_status: -1,
+            callback_cancel_status: -1,
             callback_count: 0,
             cancel_status: None,
             cancel_copied: false,
@@ -972,6 +1022,7 @@ fn dns_query_ex_a_async(
             reentry_initial_query_status: None,
             reentry_query_status: None,
             reentry_callback_count: None,
+            stale_cancel_status: None,
             reentry_wait_status: None,
             reentry_addresses: None,
         };
@@ -990,6 +1041,7 @@ fn dns_query_ex_a_async(
             return_status: -1,
             initial_query_status: -1,
             callback_status: -1,
+            callback_cancel_status: -1,
             callback_count: 0,
             cancel_status: None,
             cancel_copied: false,
@@ -999,6 +1051,7 @@ fn dns_query_ex_a_async(
             reentry_initial_query_status: None,
             reentry_query_status: None,
             reentry_callback_count: None,
+            stale_cancel_status: None,
             reentry_wait_status: None,
             reentry_addresses: None,
         };
@@ -1018,6 +1071,7 @@ fn dns_query_ex_a_async(
             reserved: std::ptr::null_mut(),
         },
         query_status: AtomicI32::new(-1),
+        callback_cancel_status: AtomicI32::new(-1),
         callback_count: AtomicU32::new(0),
         addresses: Mutex::new(Vec::new()),
         reenter,
@@ -1034,6 +1088,7 @@ fn dns_query_ex_a_async(
         reentry_initial_query_status: AtomicI32::new(-1),
         reentry_query_status: AtomicI32::new(-1),
         reentry_callback_count: AtomicU32::new(0),
+        stale_cancel_status: AtomicI32::new(-1),
         reentry_addresses: Mutex::new(Vec::new()),
     });
     let state_ptr = Box::into_raw(state);
@@ -1156,6 +1211,7 @@ fn dns_query_ex_a_async(
             return_status,
             initial_query_status,
             callback_status,
+            callback_cancel_status: (*state_ptr).callback_cancel_status.load(Ordering::Acquire),
             callback_count,
             cancel_status,
             cancel_copied: cancel_requested && copy_cancel,
@@ -1165,6 +1221,11 @@ fn dns_query_ex_a_async(
             reentry_initial_query_status,
             reentry_query_status,
             reentry_callback_count,
+            stale_cancel_status: if reenter && reentry_started {
+                Some((*state_ptr).stale_cancel_status.load(Ordering::Acquire))
+            } else {
+                None
+            },
             reentry_wait_status,
             reentry_addresses,
         }

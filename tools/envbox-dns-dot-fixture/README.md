@@ -24,6 +24,43 @@ python tools/envbox-dns-dot-fixture/run.py `
   target/dot-fixture32/Release/envbox-dns-dot-fixture.exe
 ```
 
+For a public production-trust smoke, use `run_public_injected.py` with the
+real CLI, Probe and one architecture's Runtime DLL:
+
+```powershell
+python tools/envbox-dns-dot-fixture/run_public_injected.py `
+  target\debug\envbox.exe target\debug\envbox-probe.exe `
+  target\nonvm-final-runtime-v2\envbox-runtime64.dll
+```
+
+The default endpoint is the literal IPv4 address `1.1.1.1:853` with TLS
+identity `cloudflare-dns.com`; no IPv6 endpoint or Host fallback is added.
+Each invocation is exactly one attempt and writes a unique
+`target/dot-public-injected-evidence-<uuid>.json` file. That evidence records
+the cleared `ENVBOX_*` keys, CLI/Probe/DLL paths and SHA-256 values, a fresh
+uninjected Host Probe, raw Probe output, and the live Probe Runtime module
+path/hash. A Runtime module already loaded in the Python controller aborts the
+run, and temporary configuration is deleted only after a resolved `target`
+containment check.
+
+The final 2026-10-06 single attempts used the selected `target/nonvm-final-runtime-v2`
+pair, with the x64 CLI driving both architecture probes: x64 CLI + x64 Probe +
+`envbox-runtime64.dll`, then x64 CLI + x86 Probe-only + `envbox-runtime32.dll`.
+Both attempts completed A/W/UTF8/Ex/async with `DnsRR_Status=0` and
+`DnsRR_Records=1`:
+
+- x64: `target/dot-public-injected-v2-x64-single.log`, evidence
+  `target/dot-public-injected-evidence-2b2a6cf2567b47b6b874547c9b286b7c.json`;
+- x86: `target/dot-public-injected-v2-x86-single.log`, evidence
+  `target/dot-public-injected-evidence-746ea8ca4ba14aa785591039983aa6dc.json`.
+
+The selected Runtime SHA-256 values are x64
+`CA8283ADAE000DBEAAE65902A10F2E0E05B94C38C14F7B3652EDD3066C43D965` and x86
+`5D2FD1038748F0D579F5B2EB59EBAEECDFF6C7846D12FD93876875696B6CEBE7`.
+Each run was `attempt=1`, `retry=false`; the older V3 timeout/retry logs remain
+historical samples and are not mixed into this pair's result. Any later async
+Runtime freeze must be tested once per architecture with separate evidence.
+
 The fixture covers DNS name and IP SAN success, fragmented TLS/framing, maximum
 65535-byte packets, 16 sequential connections with handle counts after warmup,
 untrusted/expired/mismatched/revoked certificates, absent local CRL, truncated

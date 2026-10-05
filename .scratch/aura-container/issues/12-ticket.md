@@ -36,4 +36,6 @@ A05、A15、F06。本票完成仅代表该切片；总目标只有全部最终�
 
 2026-10-04：已实施并验证可独立交付的切片；完整验收尚未全部通过，本票未关闭。实际运行、静态检查、失败来源和剩余缺口见 [实施进度](../evidence/implementation-progress.md)。不得从 claimed 或某组测试通过推断整票/完整 Container 完成。
 
+2026-10-06 增量：恢复失败的 `TrackingLost` 状态与原因现在写回持久记录。NoJob 下即使逐一确认最后 sealed PID generations 已不存在，也仍保持 `TrackingLost`，因为最后成员列表不能证明完整进程树没有未知后代；真实 Supervisor/不存在 PID fixture 验证了此行为和 journal。只有实际重新取得的 Job 确认没有活动进程，才使用正常 Exited 终态。OS reboot、conhost 与失去 Job 的完整树证明仍未完成。见 [恢复独立证据](../evidence/recovery-independent-final.md)。
+
 后续增量：schema 3 逐成员 Runtime 身份已实现，双向 mixed GUI 树/root live 或 exit 每例两次真实恢复共四例通过；旧 schema 2 兼容/保守拒绝三例通过。未知 conhost companion 仍 Lost，OS reboot/NoJob 仍未验；见 [混合恢复证据](../evidence/mixed-recovery.md)。

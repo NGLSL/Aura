@@ -1206,7 +1206,8 @@ impl SessionTable {
         ] {
             let counts: Vec<_> = id.hooks.iter().filter(|(name, _)| name == group).collect();
             let complete = counts.len() == 1
-                && (counts[0].1 == required || (group == "dns" && dns_mode && counts[0].1 == 16));
+                && (counts[0].1 == required
+                    || (group == "dns" && dns_mode && matches!(counts[0].1, 16 | 17)));
             if !complete {
                 return Err(IpcError::Protocol(format!(
                     "required hook set incomplete: {group}"

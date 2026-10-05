@@ -238,10 +238,17 @@ mod win {
                     &mut ret,
                 )
                 .is_ok()
-                    && ret >= 16
+                    && (ret as usize) >= std::mem::size_of::<usize>() + std::mem::size_of::<u32>()
                 {
-                    // SID_AND_ATTRIBUTES { Sid: *mut SID, Attributes: u32 } on x64 = 16 bytes.
-                    let sid_ptr = usize::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+                    // TOKEN_MANDATORY_LABEL begins with SID_AND_ATTRIBUTES:
+                    // { Sid: *mut SID, Attributes: u32 }.  Its size is 8
+                    // bytes on Win32 and 16 bytes on Win64; the pointer is
+                    // therefore decoded using the target process width.
+                    let sid_ptr = match std::mem::size_of::<usize>() {
+                        4 => u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize,
+                        8 => u64::from_le_bytes(buf[0..8].try_into().unwrap()) as usize,
+                        _ => 0,
+                    };
                     if sid_ptr != 0 {
                         let sid = sid_ptr as *const u8;
                         let sub_count = *sid.add(1) as usize;

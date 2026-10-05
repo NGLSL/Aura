@@ -49,6 +49,7 @@ static INT(WSAAPI* TrueGetAddrInfoExW)(
     PCWSTR, PCWSTR, DWORD, LPGUID, const ADDRINFOEXW*, PADDRINFOEXW*,
     struct timeval*, LPOVERLAPPED, LPLOOKUPSERVICE_COMPLETION_ROUTINE,
     LPHANDLE) = GetAddrInfoExW;
+static INT(WSAAPI* TrueGetAddrInfoExCancel)(LPHANDLE) = GetAddrInfoExCancel;
 static void(WSAAPI* TrueFreeAddrInfoExA)(PADDRINFOEXA) = FreeAddrInfoExA;
 static void(WSAAPI* TrueFreeAddrInfoExW)(PADDRINFOEXW) = FreeAddrInfoExW;
 static DNS_STATUS(WINAPI* TrueDnsQuery_A)(PCSTR, WORD, DWORD, PVOID,
@@ -1296,7 +1297,8 @@ static TNode* BuildChain(const AddrPair* pairs, int np, unsigned short port,
 static int ResolveRoutedA(const char* qname_utf8, const char* service,
                           int ai_family, int ai_socktype, int ai_protocol,
                           int ai_flags, DnsAddrs* addrs, unsigned short* port,
-                          ULONGLONG query_deadline = 0) {
+                          ULONGLONG query_deadline = 0,
+                          HANDLE cancel_event = nullptr) {
   int want_a = (ai_family == AF_UNSPEC || ai_family == 0 || ai_family == AF_INET);
   int want_aaaa =
       (ai_family == AF_UNSPEC || ai_family == 0 || ai_family == AF_INET6);
@@ -1311,7 +1313,8 @@ static int ResolveRoutedA(const char* qname_utf8, const char* service,
   }
   *port = p;
 
-  if (DnsRouteName(qname_utf8, want_a, want_aaaa, addrs, nullptr, query_deadline) <= 0) {
+  if (DnsRouteName(qname_utf8, want_a, want_aaaa, addrs, cancel_event,
+                   query_deadline) <= 0) {
     return EAI_AGAIN;  // no Host fallback
   }
   if ((addrs->nxdomain || addrs->nodata) && addrs->n_v4 == 0 &&
@@ -1395,6 +1398,310 @@ static void FreeAddrInfoExWChain(PADDRINFOEXW ai) {
   }
 }
 
+// GetAddrInfoExW is the only GetAddrInfoEx ABI that supports asynchronous
+// parameters on the Windows versions supported by this Runtime.  Do not pass
+// a Profile query to the native provider: its namespace policy can ignore the
+// caller's server view.  The state below owns the worker and cancellation
+// event, while the caller retains the documented OVERLAPPED/result storage
+// until completion. The native status-only result helper reads the published
+// OVERLAPPED state even after the worker retires its internal map entry.
+struct EnvBoxAddrInfoAsyncContext {
+  LPLOOKUPSERVICE_COMPLETION_ROUTINE completion;
+  LPOVERLAPPED overlapped;
+  PADDRINFOEXW* result;
+  HANDLE cancel_token;
+  HANDLE cancel_event;
+  HANDLE notify_event;
+  DWORD name_space;
+  ULONGLONG query_deadline;
+  wchar_t query_name[256];
+  wchar_t service[64];
+  ADDRINFOEXW hints;
+  int has_hints;
+  volatile LONG cancel_requested;
+  volatile LONG refs;
+  int completion_started;
+  int completed;
+  INT completed_status;
+  int registered;
+  EnvBoxAddrInfoAsyncContext* next;
+};
+
+static const LONG kAddrInfoAsyncMaxPending = 64;
+static const size_t kAddrInfoAsyncNameCapacity = 256;
+static const size_t kAddrInfoAsyncServiceCapacity = 64;
+// The Profile wire route can preserve these legacy address-info semantics.
+// Flags that request Windows cache/LLMNR/custom-server/secure-DNS behavior
+// are rejected rather than silently changing their meaning on the wire.
+static const int kAddrInfoSupportedFlags =
+    AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST;
+static int AddrInfoFlagsSupported(int flags) {
+  return (flags & ~kAddrInfoSupportedFlags) == 0;
+}
+static volatile LONG64 g_addr_info_async_generation = 0;
+static LONG g_addr_info_async_work_count = 0;
+static EnvBoxAddrInfoAsyncContext* g_addr_info_async_pending = nullptr;
+static SRWLOCK g_addr_info_async_lock = SRWLOCK_INIT;
+
+static HANDLE AddrInfoAsyncToken(ULONGLONG generation) {
+  // The token is an opaque value consumed only by our Cancel hook.  Keeping it
+  // out of the kernel handle table avoids a close/reuse race when a caller
+  // retains a stale lpNameHandle after completion.
+  ULONG_PTR value = static_cast<ULONG_PTR>((generation << 1) | 1ULL);
+  return reinterpret_cast<HANDLE>(value);
+}
+
+static ULONGLONG NextAddrInfoAsyncGeneration() {
+  LONG64 generation = InterlockedIncrement64(&g_addr_info_async_generation);
+  if (generation <= 0) {
+    InterlockedExchange64(&g_addr_info_async_generation, 1);
+    generation = 1;
+  }
+  return static_cast<ULONGLONG>(generation);
+}
+
+static EnvBoxAddrInfoAsyncContext* FindAddrInfoAsyncByTokenLocked(
+    HANDLE token) {
+  for (EnvBoxAddrInfoAsyncContext* p = g_addr_info_async_pending;
+       p != nullptr; p = p->next) {
+    if (p->cancel_token == token) return p;
+  }
+  return nullptr;
+}
+
+static int RegisterAddrInfoAsync(EnvBoxAddrInfoAsyncContext* context) {
+  int ok = 0;
+  AcquireSRWLockExclusive(&g_addr_info_async_lock);
+  if (g_addr_info_async_work_count < kAddrInfoAsyncMaxPending) {
+    g_addr_info_async_work_count++;
+    // One reference belongs to the pending-map entry and one to the queued
+    // worker.  The worker reference prevents event/callback consumers from
+    // freeing the context while the worker is still publishing completion.
+    context->refs = 2;
+    context->registered = 1;
+    context->next = g_addr_info_async_pending;
+    g_addr_info_async_pending = context;
+    ok = 1;
+  }
+  ReleaseSRWLockExclusive(&g_addr_info_async_lock);
+  return ok;
+}
+
+static void ReleaseAddrInfoAsyncRef(EnvBoxAddrInfoAsyncContext* context);
+
+static int UnregisterAddrInfoAsync(EnvBoxAddrInfoAsyncContext* context) {
+  if (context == nullptr) return 0;
+  int removed = 0;
+  AcquireSRWLockExclusive(&g_addr_info_async_lock);
+  if (context->registered) {
+    EnvBoxAddrInfoAsyncContext** link = &g_addr_info_async_pending;
+    while (*link != nullptr) {
+      if (*link == context) {
+        *link = context->next;
+        break;
+      }
+      link = &(*link)->next;
+    }
+    context->registered = 0;
+    if (g_addr_info_async_work_count > 0) g_addr_info_async_work_count--;
+    removed = 1;
+  }
+  ReleaseSRWLockExclusive(&g_addr_info_async_lock);
+  if (removed) ReleaseAddrInfoAsyncRef(context);
+  return removed;
+}
+
+static void ReleaseAddrInfoAsyncRef(EnvBoxAddrInfoAsyncContext* context) {
+  if (context == nullptr || InterlockedDecrement(&context->refs) != 0) {
+    return;
+  }
+  if (context->cancel_event != nullptr) {
+    CloseHandle(context->cancel_event);
+    context->cancel_event = nullptr;
+  }
+  if (context->notify_event != nullptr) {
+    CloseHandle(context->notify_event);
+    context->notify_event = nullptr;
+  }
+  HeapFree(GetProcessHeap(), 0, context);
+}
+
+static void CompleteAddrInfoAsync(EnvBoxAddrInfoAsyncContext* context,
+                                  INT status, PADDRINFOEXW records,
+                                  int native_records) {
+  if (context == nullptr) return;
+  int should_notify = 0;
+  int cancelled = 0;
+  AcquireSRWLockExclusive(&g_addr_info_async_lock);
+  if (!context->registered || context->completion_started) {
+    ReleaseSRWLockExclusive(&g_addr_info_async_lock);
+    if (records != nullptr) {
+      if (native_records) {
+        TrueFreeAddrInfoExW(records);
+      } else {
+        FreeAddrInfoExWChain(records);
+      }
+    }
+    ReleaseAddrInfoAsyncRef(context);
+    return;
+  }
+  context->completion_started = 1;
+  cancelled = InterlockedCompareExchange(&context->cancel_requested, 0, 0) != 0;
+  if (cancelled) {
+    status = WSA_E_CANCELLED;
+    if (records != nullptr) {
+      if (native_records) {
+        TrueFreeAddrInfoExW(records);
+      } else {
+        FreeAddrInfoExWChain(records);
+      }
+      records = nullptr;
+    }
+  }
+  context->completed_status = status;
+  // Complete all writes through caller-owned storage before publishing the
+  // terminal status read by the native result helper. lpNameHandle itself is
+  // only an output slot: after returning from GetAddrInfoExW the caller may
+  // discard it, so the context never retains or rewrites that pointer.
+  if (context->result != nullptr) *context->result = records;
+  // Keep the documented result-slot pointer in OVERLAPPED.Pointer as well;
+  // the native helper reads this publication on Windows builds whose export
+  // is too short for a Detours trampoline.  InternalHigh remains zero, as it
+  // does for the native provider; the helper is a status read, not an EnvBox
+  // marker protocol.
+  context->overlapped->InternalHigh = 0;
+  context->overlapped->Pointer = reinterpret_cast<PVOID>(context->result);
+  LPLOOKUPSERVICE_COMPLETION_ROUTINE completion = context->completion;
+  LPOVERLAPPED overlapped = context->overlapped;
+  HANDLE event = context->notify_event;
+  context->completed = 1;
+  // Native GetAddrInfoExOverlappedResult does not take our map lock. Its status
+  // read can let the caller release OVERLAPPED immediately, so this is the last
+  // access to borrowed output and must publish all preceding result writes.
+  InterlockedExchangePointer(
+      reinterpret_cast<PVOID volatile*>(&overlapped->Internal),
+      reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(status)));
+  should_notify = 1;
+  ReleaseSRWLockExclusive(&g_addr_info_async_lock);
+
+  if (!should_notify) return;
+  if (completion != nullptr) {
+    // The context remains registered during user code so a reentrant Cancel
+    // sees a completed operation and cannot free it twice.
+    completion(static_cast<DWORD>(status), 0, overlapped);
+    UnregisterAddrInfoAsync(context);
+    ReleaseAddrInfoAsyncRef(context);
+  } else if (event != nullptr) {
+    SetEvent(event);
+    // The helper needs no context; retire even when callers never query it.
+    UnregisterAddrInfoAsync(context);
+    ReleaseAddrInfoAsyncRef(context);
+  } else {
+    // This is prevented before queueing, but leave a deterministic failure if
+    // a malformed OVERLAPPED is ever observed after registration.
+    UnregisterAddrInfoAsync(context);
+    ReleaseAddrInfoAsyncRef(context);
+  }
+}
+
+static DWORD WINAPI AddrInfoAsyncWorker(PVOID parameter) {
+  EnvBoxAddrInfoAsyncContext* context =
+      static_cast<EnvBoxAddrInfoAsyncContext*>(parameter);
+  if (context == nullptr) return 0;
+
+  PADDRINFOEXW records = nullptr;
+  INT status = EAI_AGAIN;
+  int native_records = 0;
+  const int numeric_or_local =
+      context->query_name[0] == L'\0' ||
+      IsNumericNodeW(context->query_name) ||
+      IsLocalMachineDnsNameW(context->query_name) ||
+      (context->has_hints &&
+       (context->hints.ai_flags & AI_NUMERICHOST) != 0);
+  if (numeric_or_local) {
+    const ADDRINFOEXW* hints = context->has_hints ? &context->hints : nullptr;
+    status = TrueGetAddrInfoExW(
+        context->query_name,
+        context->service[0] == L'\0' ? nullptr : context->service,
+        context->name_space, nullptr, hints, &records, nullptr, nullptr,
+        nullptr, nullptr);
+    native_records = records != nullptr;
+  } else {
+    char name_u8[256] = {};
+    char service_u8[64] = {};
+    if (WideToUtf8(context->query_name, name_u8, ARRAYSIZE(name_u8)) &&
+        (context->service[0] == L'\0' ||
+         WideToUtf8(context->service, service_u8, ARRAYSIZE(service_u8)))) {
+      const ADDRINFOEXW* hints = context->has_hints ? &context->hints : nullptr;
+      const int flags = hints ? hints->ai_flags : 0;
+      const int family = hints ? hints->ai_family : AF_UNSPEC;
+      const int stype = hints ? hints->ai_socktype : 0;
+      const int proto = hints ? hints->ai_protocol : 0;
+      DnsAddrs addrs;
+      unsigned short port = 0;
+      int routed = ResolveRoutedA(
+          name_u8, context->service[0] == L'\0' ? nullptr : service_u8,
+          family, stype, proto, flags, &addrs, &port,
+          context->query_deadline, context->cancel_event);
+      if (routed == 0) {
+        AddrPair pairs[kDnsMaxAnswers * 2];
+        int np = CollectPairs(&addrs, family, pairs, ARRAYSIZE(pairs));
+        records = BuildChain<ADDRINFOEXW, wchar_t, decltype(&AllocAddrInfoExW)>(
+            pairs, np, port, family, stype, proto, flags, context->query_name,
+            &AllocAddrInfoExW);
+        status = records == nullptr ? EAI_MEMORY : 0;
+      } else if (routed == EAI_NONAME) {
+        status = EAI_NONAME;
+      } else {
+        status = routed;
+      }
+    }
+  }
+  CompleteAddrInfoAsync(context, status, records, native_records);
+  return 0;
+}
+
+static INT WSAAPI HookGetAddrInfoExCancel(LPHANDLE handle) {
+  DWORD err = GetLastError();
+  if (handle == nullptr || *handle == nullptr) {
+    SetLastError(err);
+    return WSA_INVALID_HANDLE;
+  }
+  AcquireSRWLockExclusive(&g_addr_info_async_lock);
+  EnvBoxAddrInfoAsyncContext* context =
+      FindAddrInfoAsyncByTokenLocked(*handle);
+  if (context == nullptr) {
+    ReleaseSRWLockExclusive(&g_addr_info_async_lock);
+    if (g_view_active) {
+      // Every VirtualView GetAddrInfoEx async entrypoint is either owned by
+      // this map or rejected before calling the native provider (ExA async
+      // arguments and ExW namespace/provider inputs).  Passing an unknown
+      // token through here could therefore cancel an operation whose DNS
+      // view we do not control.  Host mode never installs this detour and
+      // keeps the native cancellation contract unchanged.
+      EnvBoxAuditEvent("GetAddrInfoExCancel", 0, "dns-virtual-stale");
+      SetLastError(err);
+      return WSA_INVALID_HANDLE;
+    }
+    INT status = TrueGetAddrInfoExCancel(handle);
+    SetLastError(err);
+    return status;
+  }
+  if (context->completion_started || context->completed) {
+    ReleaseSRWLockExclusive(&g_addr_info_async_lock);
+    EnvBoxAuditEvent("GetAddrInfoExCancel", 0, "dns-virtual-completed");
+    SetLastError(err);
+    return WSA_INVALID_HANDLE;
+  }
+  InterlockedExchange(&context->cancel_requested, 1);
+  BOOL signaled = SetEvent(context->cancel_event);
+  ReleaseSRWLockExclusive(&g_addr_info_async_lock);
+  EnvBoxAuditEvent("GetAddrInfoExCancel", signaled ? 1 : 0,
+                   signaled ? "dns-virtual-cancel" : "dns-virtual-cancel-failed");
+  SetLastError(err);
+  return signaled ? NO_ERROR : WSAEINTR;
+}
+
 static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
                                   const ADDRINFOA* hints, PADDRINFOA* result,
                                   const char* api) {
@@ -1412,6 +1719,11 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
   int family = hints ? hints->ai_family : AF_UNSPEC;
   int stype = hints ? hints->ai_socktype : 0;
   int proto = hints ? hints->ai_protocol : 0;
+  if (!AddrInfoFlagsSupported(flags)) {
+    EnvBoxAuditEvent(api, 1, "dns-unsupported-flags");
+    SetLastError(err);
+    return WSAEOPNOTSUPP;
+  }
 
   // Numeric, local-machine and service-only inputs do not need a DNS route.
   if (node && !IsAsciiNameA(node) && !IsLocalMachineDnsNameA(node)) {
@@ -1488,6 +1800,11 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
   int family = hints ? hints->ai_family : AF_UNSPEC;
   int stype = hints ? hints->ai_socktype : 0;
   int proto = hints ? hints->ai_protocol : 0;
+  if (!AddrInfoFlagsSupported(flags)) {
+    EnvBoxAuditEvent(api, 1, "dns-unsupported-flags");
+    SetLastError(err);
+    return WSAEOPNOTSUPP;
+  }
 
   if (node == nullptr || node[0] == L'\0' || (flags & AI_NUMERICHOST) ||
       IsNumericNodeW(node) || IsLocalMachineDnsNameW(node)) {
@@ -1628,7 +1945,8 @@ static INT WSAAPI HookGetAddrInfoExA(
     SetLastError(err);
     return WSAEOPNOTSUPP;
   }
-  // Async completion is out of scope: Fail Open to the original API.
+  // This is the Host-mode/native path; VirtualView async input was rejected
+  // above before a provider could create an unowned pending operation.
   if (overlapped != nullptr || completion != nullptr) {
     INT r = TrueGetAddrInfoExA(name, service, dw_name_space, nlp_id, hints,
                                result, timeout, overlapped, completion,
@@ -1659,6 +1977,11 @@ static INT WSAAPI HookGetAddrInfoExA(
   int family = hints ? hints->ai_family : AF_UNSPEC;
   int stype = hints ? hints->ai_socktype : 0;
   int proto = hints ? hints->ai_protocol : 0;
+  if (!AddrInfoFlagsSupported(flags)) {
+    EnvBoxAuditEvent("GetAddrInfoExA", 1, "dns-unsupported-flags");
+    SetLastError(err);
+    return WSAEOPNOTSUPP;
+  }
 
   if (name && !IsAsciiNameA(name) && !IsLocalMachineDnsNameA(name)) {
     EnvBoxAuditEvent("GetAddrInfoExA", 1, "dns-unsupported-name");
@@ -1721,6 +2044,146 @@ static INT WSAAPI HookGetAddrInfoExA(
   return 0;
 }
 
+static INT StartGetAddrInfoExWAsync(
+    PCWSTR name, PCWSTR service, DWORD dw_name_space, LPGUID nlp_id,
+    const ADDRINFOEXW* hints, PADDRINFOEXW* result, struct timeval* timeout,
+    LPOVERLAPPED overlapped,
+    LPLOOKUPSERVICE_COMPLETION_ROUTINE completion, LPHANDLE name_handle) {
+  if (result != nullptr) *result = nullptr;
+  if (name_handle != nullptr) *name_handle = nullptr;
+  if (nlp_id != nullptr ||
+      (dw_name_space != 0 && dw_name_space != NS_ALL &&
+       dw_name_space != NS_DNS)) {
+    return WSAEOPNOTSUPP;
+  }
+  if (result == nullptr || overlapped == nullptr ||
+      (completion == nullptr && overlapped->hEvent == nullptr) ||
+      (completion != nullptr && overlapped->hEvent != nullptr)) {
+    return WSAEINVAL;
+  }
+  if (timeout != nullptr &&
+      (timeout->tv_sec < 0 || timeout->tv_usec < 0 ||
+       timeout->tv_usec >= 1000000)) {
+    return WSAEINVAL;
+  }
+  if (name == nullptr || name[0] == L'\0') {
+    return EAI_NONAME;
+  }
+
+  const size_t name_len = wcsnlen_s(name, kAddrInfoAsyncNameCapacity);
+  if (name_len >= kAddrInfoAsyncNameCapacity) {
+    return WSAEINVAL;
+  }
+  size_t service_len = 0;
+  if (service != nullptr && service[0] != L'\0') {
+    service_len = wcsnlen_s(service, kAddrInfoAsyncServiceCapacity);
+    if (service_len >= kAddrInfoAsyncServiceCapacity) {
+      return WSAEINVAL;
+    }
+  }
+  if (hints != nullptr &&
+      (hints->ai_addrlen != 0 || hints->ai_canonname != nullptr ||
+       hints->ai_addr != nullptr || hints->ai_blob != nullptr ||
+       hints->ai_bloblen != 0 || hints->ai_provider != nullptr ||
+       hints->ai_next != nullptr)) {
+    return WSANO_RECOVERY;
+  }
+  if (hints != nullptr && !AddrInfoFlagsSupported(hints->ai_flags)) {
+    return WSAEOPNOTSUPP;
+  }
+
+  char name_u8[256] = {};
+  if (!WideToUtf8(name, name_u8, ARRAYSIZE(name_u8)) ||
+      !IsAsciiNameA(name_u8)) {
+    return EAI_FAIL;
+  }
+  const RuntimeProfile* profile = EnvBoxProfile();
+  if (profile == nullptr || profile->dns_mode != 1 ||
+      DnsUpstreamCount(profile) <= 0) {
+    return WSAEOPNOTSUPP;
+  }
+
+  EnvBoxAddrInfoAsyncContext* context =
+      static_cast<EnvBoxAddrInfoAsyncContext*>(HeapAlloc(
+          GetProcessHeap(), HEAP_ZERO_MEMORY,
+          sizeof(EnvBoxAddrInfoAsyncContext)));
+  if (context == nullptr) return WSA_NOT_ENOUGH_MEMORY;
+  context->completion = completion;
+  context->overlapped = overlapped;
+  context->result = result;
+  context->name_space = dw_name_space;
+  context->query_deadline = GetTickCount64() + kDnsTotalBudgetMs;
+  if (timeout != nullptr) {
+    const ULONGLONG requested_ms =
+        static_cast<ULONGLONG>(timeout->tv_sec) * 1000ULL +
+        (static_cast<ULONGLONG>(timeout->tv_usec) + 999ULL) / 1000ULL;
+    const ULONGLONG accepted_at = GetTickCount64();
+    const ULONGLONG profile_deadline = accepted_at + kDnsTotalBudgetMs;
+    if (requested_ms < kDnsTotalBudgetMs) {
+      context->query_deadline = accepted_at + requested_ms;
+    } else {
+      context->query_deadline = profile_deadline;
+    }
+  }
+  memcpy(context->query_name, name, (name_len + 1) * sizeof(wchar_t));
+  if (service_len > 0) {
+    memcpy(context->service, service, (service_len + 1) * sizeof(wchar_t));
+  }
+  if (hints != nullptr) {
+    context->hints = *hints;
+    context->hints.ai_canonname = nullptr;
+    context->hints.ai_addr = nullptr;
+    context->hints.ai_blob = nullptr;
+    context->hints.ai_provider = nullptr;
+    context->hints.ai_next = nullptr;
+    context->has_hints = 1;
+  }
+  context->cancel_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (context->cancel_event == nullptr) {
+    HeapFree(GetProcessHeap(), 0, context);
+    return WSA_NOT_ENOUGH_MEMORY;
+  }
+  if (completion == nullptr && overlapped->hEvent != nullptr &&
+      !DuplicateHandle(GetCurrentProcess(), overlapped->hEvent,
+                       GetCurrentProcess(), &context->notify_event, 0, FALSE,
+                       DUPLICATE_SAME_ACCESS)) {
+    DWORD error = GetLastError();
+    CloseHandle(context->cancel_event);
+    HeapFree(GetProcessHeap(), 0, context);
+    if (error == ERROR_INVALID_HANDLE) return WSA_INVALID_HANDLE;
+    if (error == ERROR_ACCESS_DENIED) return WSAEACCES;
+    if (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY)
+      return WSA_NOT_ENOUGH_MEMORY;
+    return WSASYSCALLFAILURE;
+  }
+  context->cancel_token = AddrInfoAsyncToken(NextAddrInfoAsyncGeneration());
+  if (!RegisterAddrInfoAsync(context)) {
+    if (context->notify_event != nullptr) {
+      CloseHandle(context->notify_event);
+      context->notify_event = nullptr;
+    }
+    CloseHandle(context->cancel_event);
+    HeapFree(GetProcessHeap(), 0, context);
+    return WSA_NOT_ENOUGH_MEMORY;
+  }
+  if (name_handle != nullptr) *name_handle = context->cancel_token;
+  // The submission API returns WSA_IO_PENDING, while its result helper reports
+  // WSAEINPROGRESS until completion (the native provider uses this state too).
+  overlapped->Internal = WSAEINPROGRESS;
+  overlapped->InternalHigh = 0;
+  overlapped->Pointer = nullptr;
+  if (!QueueUserWorkItem(AddrInfoAsyncWorker, context, WT_EXECUTEDEFAULT)) {
+    if (name_handle != nullptr && *name_handle == context->cancel_token) {
+      *name_handle = nullptr;
+    }
+    UnregisterAddrInfoAsync(context);
+    ReleaseAddrInfoAsyncRef(context);
+    return WSA_NOT_ENOUGH_MEMORY;
+  }
+  EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-virtual-async-worker");
+  return WSA_IO_PENDING;
+}
+
 static INT WSAAPI HookGetAddrInfoExW(
     PCWSTR name, PCWSTR service, DWORD dw_name_space, LPGUID nlp_id,
     const ADDRINFOEXW* hints, PADDRINFOEXW* result, struct timeval* timeout,
@@ -1729,11 +2192,21 @@ static INT WSAAPI HookGetAddrInfoExW(
   DWORD err = GetLastError();
   const ULONGLONG accepted_at = GetTickCount64();
   ULONGLONG query_deadline = accepted_at + kDnsTotalBudgetMs;
-  if (g_view_active && (overlapped != nullptr || completion != nullptr ||
-      name_handle != nullptr || nlp_id != nullptr ||
-      (dw_name_space != 0 && dw_name_space != NS_ALL && dw_name_space != NS_DNS))) {
+  const int asynchronous = overlapped != nullptr || completion != nullptr ||
+                           name_handle != nullptr;
+  if (g_view_active && asynchronous) {
+    INT status = StartGetAddrInfoExWAsync(
+        name, service, dw_name_space, nlp_id, hints, result, timeout,
+        overlapped, completion, name_handle);
+    SetLastError(err);
+    return status;
+  }
+  if (g_view_active &&
+      (nlp_id != nullptr ||
+       (dw_name_space != 0 && dw_name_space != NS_ALL &&
+        dw_name_space != NS_DNS))) {
     if (result != nullptr) *result = nullptr;
-    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-unsupported-provider-or-async");
+    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-unsupported-provider");
     SetLastError(err);
     return WSAEOPNOTSUPP;
   }
@@ -1777,6 +2250,11 @@ static INT WSAAPI HookGetAddrInfoExW(
   int family = hints ? hints->ai_family : AF_UNSPEC;
   int stype = hints ? hints->ai_socktype : 0;
   int proto = hints ? hints->ai_protocol : 0;
+  if (!AddrInfoFlagsSupported(flags)) {
+    EnvBoxAuditEvent("GetAddrInfoExW", 1, "dns-unsupported-flags");
+    SetLastError(err);
+    return WSAEOPNOTSUPP;
+  }
 
   if (name == nullptr || name[0] == L'\0' || (flags & AI_NUMERICHOST) ||
       IsNumericNodeW(name) || IsLocalMachineDnsNameW(name)) {
@@ -1891,6 +2369,7 @@ struct EnvBoxDnsAsyncContext {
   ULONGLONG cancel_generation;
   unsigned char original_cancel[sizeof(DNS_QUERY_CANCEL)];
   int cancel_token_written;
+  int completed;
   wchar_t query_name[256];
   char name_u8[256];
   volatile LONG cancel_requested;
@@ -1930,6 +2409,8 @@ static ULONGLONG NextDnsAsyncGeneration() {
   return (ULONGLONG)generation;
 }
 
+// All token access is serialized with publication, completion and cancellation
+// under g_dns_async_lock; callers may cancel concurrently with callback reentry.
 static int ReadDnsAsyncToken(PDNS_QUERY_CANCEL cancel_handle,
                              ULONGLONG* generation) {
   if (cancel_handle == nullptr || generation == nullptr) {
@@ -1958,13 +2439,24 @@ static void WriteDnsAsyncToken(PDNS_QUERY_CANCEL cancel_handle,
 }
 
 static void RestoreDnsAsyncCancelToken(EnvBoxDnsAsyncContext* context) {
-  if (context == nullptr || context->cancel_handle == nullptr ||
-      !context->cancel_token_written) {
+  if (context == nullptr) {
     return;
   }
-  memcpy(context->cancel_handle, context->original_cancel,
-         sizeof(context->original_cancel));
-  context->cancel_token_written = 0;
+  // The caller may reuse the same DNS_QUERY_CANCEL storage from inside the
+  // completion callback.  Restore only while our exact generation is still
+  // published; otherwise a reentrant request has already installed a newer
+  // token and the old context must leave it untouched.
+  AcquireSRWLockExclusive(&g_dns_async_lock);
+  if (context->cancel_handle != nullptr && context->cancel_token_written) {
+    ULONGLONG generation = 0;
+    if (ReadDnsAsyncToken(context->cancel_handle, &generation) &&
+        generation == context->cancel_generation) {
+      memcpy(context->cancel_handle, context->original_cancel,
+             sizeof(context->original_cancel));
+      context->cancel_token_written = 0;
+    }
+  }
+  ReleaseSRWLockExclusive(&g_dns_async_lock);
 }
 
 static int RegisterDnsAsync(EnvBoxDnsAsyncContext* context) {
@@ -2063,7 +2555,17 @@ static void CompleteDnsAsync(EnvBoxDnsAsyncContext* context, DNS_STATUS status,
   if (context == nullptr) {
     return;
   }
-  if (DnsAsyncCancelled(context)) {
+  AcquireSRWLockExclusive(&g_dns_async_lock);
+  const int cancelled = DnsAsyncCancelled(context);
+  context->completed = 1;
+  // Keep the opaque token as a local stale-token tombstone. Restoring original
+  // bytes before callback would send a callback-side cancel to the Windows
+  // provider; restoring after callback could overwrite a reentrant request or
+  // access storage the callback freed. This context relinquishes write ownership
+  // before notifying and never accesses that borrowed storage again.
+  context->cancel_token_written = 0;
+  ReleaseSRWLockExclusive(&g_dns_async_lock);
+  if (cancelled) {
     if (records != nullptr) {
       FreeDnsAsyncRecords(records);
       records = nullptr;
@@ -2071,12 +2573,12 @@ static void CompleteDnsAsync(EnvBoxDnsAsyncContext* context, DNS_STATUS status,
     status = ERROR_CANCELLED;
   }
   if (context->results != nullptr) {
-    InterlockedExchange(
-        reinterpret_cast<volatile LONG*>(&context->results->QueryStatus),
-        static_cast<LONG>(status));
     context->results->QueryOptions = context->query_options;
     context->results->pQueryRecords = records;
     context->results->Reserved = nullptr;
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&context->results->QueryStatus),
+        static_cast<LONG>(status));
   }
   // Keep the context registered while caller code runs. A callback may reuse
   // the same DNS_QUERY_CANCEL storage for another request; that request gets
@@ -2107,6 +2609,7 @@ static DWORD WINAPI DnsAsyncWorker(PVOID parameter) {
 
 static DNS_STATUS WINAPI HookDnsCancelQuery(PDNS_QUERY_CANCEL cancel_handle) {
   DWORD err = GetLastError();
+  AcquireSRWLockExclusive(&g_dns_async_lock);
   if (cancel_handle != nullptr) {
     ULONGLONG generation = 0;
     if (ReadDnsAsyncToken(cancel_handle, &generation)) {
@@ -2114,10 +2617,9 @@ static DNS_STATUS WINAPI HookDnsCancelQuery(PDNS_QUERY_CANCEL cancel_handle) {
       // completed. In particular, never pass a copied/stale token to the
       // native API where it could be interpreted as an unrelated provider
       // handle.
-      AcquireSRWLockExclusive(&g_dns_async_lock);
       EnvBoxDnsAsyncContext* context =
           generation == 0 ? nullptr : FindDnsAsyncLocked(generation);
-      if (context != nullptr) {
+      if (context != nullptr && !context->completed) {
         InterlockedExchange(&context->cancel_requested, 1);
         BOOL signaled = context->cancel_event == nullptr ||
                         SetEvent(context->cancel_event);
@@ -2134,7 +2636,7 @@ static DNS_STATUS WINAPI HookDnsCancelQuery(PDNS_QUERY_CANCEL cancel_handle) {
       return ERROR_INVALID_PARAMETER;
     }
   }
-
+  ReleaseSRWLockExclusive(&g_dns_async_lock);
   DNS_STATUS status = TrueDnsCancelQuery(cancel_handle);
   EnvBoxAuditEvent("DnsCancelQuery", 0, "dns-host-or-unowned");
   SetLastError(err);
@@ -2291,8 +2793,10 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
     context->query_options = (DWORD)request->QueryOptions;
     context->query_deadline = query_deadline;
     if (cancel != nullptr) {
+      AcquireSRWLockExclusive(&g_dns_async_lock);
       memcpy(context->original_cancel, cancel,
              sizeof(context->original_cancel));
+      ReleaseSRWLockExclusive(&g_dns_async_lock);
       context->cancel_generation = NextDnsAsyncGeneration();
     }
     memcpy(context->query_name, request->QueryName,
@@ -2325,8 +2829,10 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
         reinterpret_cast<volatile LONG*>(&results->QueryStatus),
         DNS_REQUEST_PENDING);
     if (cancel != nullptr) {
+      AcquireSRWLockExclusive(&g_dns_async_lock);
       WriteDnsAsyncToken(cancel, context->cancel_generation);
       context->cancel_token_written = 1;
+      ReleaseSRWLockExclusive(&g_dns_async_lock);
     }
     if (!QueueUserWorkItem(DnsAsyncWorker, context, WT_EXECUTEDEFAULT)) {
       InterlockedExchange(
@@ -2566,7 +3072,17 @@ int EnvBoxInstallDnsHooks() {
   const int resolver_w = free_w && EnvBoxAttach(&TrueGetAddrInfoW, HookGetAddrInfoW);
   const int resolver_ex_a = free_ex_a && EnvBoxAttach(&TrueGetAddrInfoExA, HookGetAddrInfoExA);
   const int resolver_ex_w = free_ex_w && EnvBoxAttach(&TrueGetAddrInfoExW, HookGetAddrInfoExW);
-  ok += resolver_a + resolver_w + resolver_ex_a + resolver_ex_w;
+  const int resolver_ex_cancel = EnvBoxAttach(&TrueGetAddrInfoExCancel,
+                                              HookGetAddrInfoExCancel);
+  // Windows implements GetAddrInfoExOverlappedResult as the documented
+  // OVERLAPPED status read.  On current x64 ws2_32 its exported prologue is
+  // intentionally too short for a Detours trampoline; our worker publishes
+  // Internal/InternalHigh/Pointer before signaling, so the native helper is
+  // the correct ABI path and remains available without a detour.
+  const int resolver_ex_overlapped = 1;
+  // Report every installed detour. The status-only result helper is native,
+  // while the newly attached async cancel hook contributes to the actual count.
+  ok += resolver_a + resolver_w + resolver_ex_a + resolver_ex_w + resolver_ex_cancel;
   // Native dnsapi records can always be released by the original DnsFree.
   const int query_a = EnvBoxAttach(&TrueDnsQuery_A, HookDnsQuery_A);
   const int query_w = EnvBoxAttach(&TrueDnsQuery_W, HookDnsQuery_W);
@@ -2585,7 +3101,8 @@ int EnvBoxInstallDnsHooks() {
   ok += raw;
   g_dns_hooks_ready = network_params && adapters && free_a && free_w &&
       free_ex_a && free_ex_w && resolver_a && resolver_w && resolver_ex_a &&
-      resolver_ex_w && query_a && query_w && query_utf8 && query_ex &&
-      g_dns_cancel_hook_attached && (!raw_required || raw);
+      resolver_ex_w && resolver_ex_cancel && resolver_ex_overlapped && query_a &&
+      query_w && query_utf8 && query_ex && g_dns_cancel_hook_attached &&
+      (!raw_required || raw);
   return ok;
 }
