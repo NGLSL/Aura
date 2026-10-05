@@ -35,3 +35,5 @@ A05、A15、F06。本票完成仅代表该切片；总目标只有全部最终�
 ## 当前实施记录
 
 2026-10-04：已实施并验证可独立交付的切片；完整验收尚未全部通过，本票未关闭。实际运行、静态检查、失败来源和剩余缺口见 [实施进度](../evidence/implementation-progress.md)。不得从 claimed 或某组测试通过推断整票/完整 Container 完成。
+
+后续增量：schema 3 逐成员 Runtime 身份已实现，双向 mixed GUI 树/root live 或 exit 每例两次真实恢复共四例通过；旧 schema 2 兼容/保守拒绝三例通过。未知 conhost companion 仍 Lost，OS reboot/NoJob 仍未验；见 [混合恢复证据](../evidence/mixed-recovery.md)。

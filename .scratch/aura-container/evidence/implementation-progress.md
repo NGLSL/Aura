@@ -11,7 +11,21 @@ Branch: `dev`
 
 工作区已有 DNS 全 QTYPE 修复、Probe/CLI DNS 测试、Rust 1.99 toolchain、三份 CI workflows 与 README 修改；容器规格、研究及 DNS transports 规格也已存在。实施不得回退它们。Review 区分此前 DNS 工作与本轮 Container 新实现，不把原有改动当作未知作者的废弃文件。
 
-## 最新实施切片
+## 本轮增量：混合架构恢复与 DoH 底座
+
+上次交付为 `9919ad1`；用户明确优先补混合架构恢复，再推进 DoH。完整 P0–P8 仍未完成，本轮新增结果如下。
+
+| 范围 | 已实现及实际证据 | 剩余门槛 |
+| --- | --- | --- |
+| 12 mixed recovery | schema 3 逐成员 generation/实际 Runtime path+SHA/configSHA/version；成员增长认证后原子记录；两个架构方向 × root live/exit 四例各两次真实 crash/restart通过；旧 schema 2 两例恢复、旧 mixed 拒绝接管，共 7 native 实例通过 | OS console companion 未有 Runtime identity，实际 conhost 场景仍 Lost；NoJob/未知完整树、OS reboot 未闭 |
+| 18 DoH 候选 | Tokio literal SocketAddr + Rustls + Hyper h1/h2；本地 physical trust/CRL/Disallowed cached signature-hash；x64/WOW64 56 个 HTTP/TLS 场景通过，修后 10 个 deadline/cancel/positive场景通过；两架构 product-feature-off C++ DLL 真正链接和调用 | 整体 No-Go：原生 ROOT/CRL 公共目标正向、IPv6、其他 OS 与完整系统观测未证；19 未接线，产品 dns_doh=0/Core 拒绝仍保留 |
+| Broker lifecycle | 全套发现 stop nudge 早于下一 pipe 创建的 lost-wakeup，程序已退出但 CLI join 永久等；确定性 RED 0.26 秒，发布后重验 stop 修复；Broker 5/5 与真实 auth 7/7 GREEN | 首轮人为 once-nudge 才继续，明确为 assisted，不冒充无缺陷全绿 |
+
+最终 **388 passed / 0 failed / 33 ignored**，未注入 WMI Host 10452，无额外唤醒，81.21 秒，`target/workspace-mixed-doh-head.log` 与 result JSON；最终 locked workspace build 通过。新增 ignored 包含显式 native fixtures，不计通过；所列 7 个恢复场景和原型证据另行真实运行。Standards/Spec 最后分别 0 个未处理 actionable finding。
+
+详见 [恢复证据](mixed-recovery.md)、[DoH 原型](doh-rustls-prototype.md)、[研究设计](doh-rustls-design.md)、[本轮统一 review](mixed-doh-review.md)。下面保留上次交付的事实，不把历史 378 项结果当作本轮最终检查。
+
+## 前次交付切片（9919ad1）
 
 用户已明确没有测试 VM，先完成可独立实现的部分。以下是新增实现及实际证据；各票仍有未验证验收，不预先关闭，也不表示完整轻量容器已完成。
 

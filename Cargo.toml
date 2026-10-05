@@ -6,11 +6,13 @@ members = [
     "crates/envbox-launcher",
     "crates/envbox-broker",
     "crates/envbox-supervisor",
+    "crates/envbox-dns-doh",
     "crates/envbox-cli",
     "crates/envbox-app",
     "tools/envbox-probe",
     "tools/envbox-browser-probe",
     "tools/envbox-suspended-helper",
+    "tools/envbox-dns-doh-fixture",
 ]
 
 [workspace.package]

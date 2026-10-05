@@ -52,6 +52,8 @@ pub struct RunResult {
     pub inherit_children: bool,
     #[serde(default)]
     pub known_members: Vec<ProcessIdentity>,
+    #[serde(default)]
+    pub member_runtimes: Vec<MemberRuntimeIdentity>,
     pub creation_time: u64,
     pub mode: String,
     pub entry_guarantee: String,
@@ -65,6 +67,18 @@ pub struct RunResult {
 pub struct ProcessIdentity {
     pub pid: u32,
     pub creation_time: u64,
+}
+
+/// Facts authenticated by the instance broker for one actual Job member.
+/// These are sealed before recovery can reuse that member's Runtime bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberRuntimeIdentity {
+    pub pid: u32,
+    pub creation_time: u64,
+    pub module_path: PathBuf,
+    pub module_sha256: String,
+    pub config_sha256: String,
+    pub runtime_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

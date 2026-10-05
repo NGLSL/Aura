@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox-recovery-parent LANGUAGES CXX)
+add_executable(envbox-recovery-parent parent.cpp)
+target_compile_options(envbox-recovery-parent PRIVATE /GS- /Zl)
+target_link_options(envbox-recovery-parent PRIVATE /NODEFAULTLIB /ENTRY:FixtureEntry /SUBSYSTEM:WINDOWS)
+target_link_libraries(envbox-recovery-parent PRIVATE kernel32)

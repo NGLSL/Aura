@@ -1,4 +1,6 @@
-use crate::{ManagedTarget, ProcessIdentity, RunCommand, RunResult, RunView};
+use crate::{
+    ManagedTarget, MemberRuntimeIdentity, ProcessIdentity, RunCommand, RunResult, RunView,
+};
 use envbox_core::{ConsoleHost, ContainerMode, LaunchTarget, RunSnapshot};
 use envbox_launcher::{
     start_session_in_named_job_gated, InstanceJob, SessionHandle, SessionStartRequest,
@@ -195,11 +197,6 @@ impl Runs {
                     run.job.take();
                 }
                 Ok(stats) => {
-                    if run.result.state != "Stopping"
-                        && run.result.entry_guarantee == "verified_pe_entry_no_tls"
-                    {
-                        run.result.state = "Running".into();
-                    }
                     let members: Vec<_> = stats
                         .process_ids
                         .into_iter()
@@ -227,8 +224,51 @@ impl Runs {
                                 creation_time: member.creation_time,
                             })
                             .collect();
-                        if known != run.result.known_members {
-                            run.result.known_members = known;
+                        let facts = match member_facts(run, &run.members) {
+                            Ok(facts) => facts,
+                            Err(error) => {
+                                if run.result.state != "Stopping" {
+                                    run.result.state = "TrackingLost".into();
+                                }
+                                run.result.error =
+                                    Some(format!("member Runtime verification: {error}"));
+                                continue;
+                            }
+                        };
+                        let verified_job = match job.stats() {
+                            Ok(stats) => stats,
+                            Err(error) => {
+                                run.result.state = "TrackingLost".into();
+                                run.result.error = Some(error.to_string());
+                                continue;
+                            }
+                        };
+                        if verified_job.process_ids.len() != run.members.len()
+                            || run.members.iter().any(|member| {
+                                !verified_job.process_ids.contains(&member.pid)
+                                    || ManagedTarget::observe(member.pid).ok() != Some(*member)
+                            })
+                        {
+                            run.result.state = "TrackingLost".into();
+                            run.result.error =
+                                Some("Job membership changed while sealing Runtime facts".into());
+                            continue;
+                        }
+                        let next_state = if run.result.state == "Stopping" {
+                            "Stopping"
+                        } else {
+                            "Running"
+                        };
+                        if known != run.result.known_members
+                            || facts != run.result.member_runtimes
+                            || run.result.state != next_state
+                        {
+                            let mut next = run.result.clone();
+                            next.record_schema = 3;
+                            next.known_members = known;
+                            next.member_runtimes = facts;
+                            next.state = next_state.into();
+                            next.error = None;
                             let path = self
                                 .store
                                 .root()
@@ -236,9 +276,13 @@ impl Runs {
                                 .join(run.command.container_id.to_string())
                                 .join("runs")
                                 .join(format!("{}.json", run.command.instance_id));
-                            if let Err(error) = atomic_record(&path, &run.result) {
-                                run.result.error =
-                                    Some(format!("membership journal persistence: {error}"));
+                            match atomic_record(&path, &next) {
+                                Ok(()) => run.result = next,
+                                Err(error) => {
+                                    run.result.state = "TrackingLost".into();
+                                    run.result.error =
+                                        Some(format!("membership journal persistence: {error}"));
+                                }
                             }
                         }
                     }
@@ -461,7 +505,7 @@ impl Runs {
             .join(format!("{}.json", command.instance_id));
         std::fs::create_dir_all(record.parent().unwrap())?;
         let pending = RunResult {
-            record_schema: 2,
+            record_schema: 3,
             request_id: request_id.into(),
             supervisor_generation: self.generation.clone(),
             job_name: name.clone(),
@@ -477,6 +521,7 @@ impl Runs {
             audit: application.audit,
             inherit_children: true,
             known_members: vec![],
+            member_runtimes: vec![],
             root_pid: 0,
             creation_time: 0,
             mode: "compatibility".into(),
@@ -542,10 +587,18 @@ impl Runs {
             let result = RunResult {
                 root_pid: identity.pid,
                 creation_time: identity.creation_time,
-                runtime_module_path: observed.identity.module_path.into(),
-                runtime_module_sha256: observed.module_sha256,
-                runtime_config_sha256: observed.config_sha256,
-                runtime_version: observed.identity.runtime_version,
+                runtime_module_path: observed.identity.module_path.clone().into(),
+                runtime_module_sha256: observed.module_sha256.clone(),
+                runtime_config_sha256: observed.config_sha256.clone(),
+                runtime_version: observed.identity.runtime_version.clone(),
+                member_runtimes: vec![MemberRuntimeIdentity {
+                    pid: identity.pid,
+                    creation_time: identity.creation_time,
+                    module_path: observed.identity.module_path.clone().into(),
+                    module_sha256: observed.module_sha256.clone(),
+                    config_sha256: observed.config_sha256.clone(),
+                    runtime_version: observed.identity.runtime_version.clone(),
+                }],
                 known_members: vec![ProcessIdentity {
                     pid: identity.pid,
                     creation_time: identity.creation_time,
@@ -694,6 +747,136 @@ fn control_status(results: &[RunView]) -> &'static str {
     }
 }
 
+fn member_facts(
+    run: &OwnedRun,
+    members: &[ManagedTarget],
+) -> io::Result<Vec<MemberRuntimeIdentity>> {
+    use sha2::{Digest, Sha256};
+    if members.is_empty()
+        || members.len() > 256
+        || run.result.entry_guarantee != "verified_pe_entry_no_tls"
+    {
+        return Err(io::Error::other(
+            "Job member evidence is incomplete or exceeds bounded capacity",
+        ));
+    }
+    let profile = &run
+        ._snapshot
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing immutable Profile"))?
+        .effective_profile;
+    let expected = envbox_launcher::ipc::profile_to_message_with_flags(
+        profile,
+        &run.command.instance_id.to_string(),
+        run.result.inherit_children,
+        run.result.audit,
+    );
+    let config_sha256 = format!("{:x}", Sha256::digest(expected.encode_line().as_bytes()));
+    let broker = run
+        .session
+        .as_ref()
+        .and_then(|session| session.broker.as_ref())
+        .or(run._recovered_broker.as_ref())
+        .ok_or_else(|| io::Error::other("instance identity broker is unavailable"))?;
+    let table = broker.table();
+    let registry = table
+        .lock()
+        .map_err(|_| io::Error::other("instance registry poisoned"))?;
+    let mut facts = Vec::with_capacity(members.len());
+    for member in members {
+        let observed = registry
+            .validate_runtime(member.pid)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if observed.identity.creation_time != member.creation_time
+            || observed.identity.runtime_version != env!("CARGO_PKG_VERSION")
+            || observed.config_sha256 != config_sha256
+            || envbox_launcher::IpcMessage::decode_line(&observed.identity.actual_profile)
+                .map_err(|error| io::Error::other(error.to_string()))?
+                != expected
+            || ManagedTarget::observe(member.pid).ok() != Some(*member)
+        {
+            return Err(io::Error::other(
+                "actual member generation, version or full Profile does not match its instance",
+            ));
+        }
+        facts.push(MemberRuntimeIdentity {
+            pid: member.pid,
+            creation_time: member.creation_time,
+            module_path: observed.identity.module_path.clone().into(),
+            module_sha256: observed.module_sha256.clone(),
+            config_sha256: observed.config_sha256.clone(),
+            runtime_version: observed.identity.runtime_version.clone(),
+        });
+    }
+    facts.sort_by_key(|fact| (fact.pid, fact.creation_time));
+    Ok(facts)
+}
+
+fn sealed_member_facts(
+    result: &RunResult,
+    members: &[ManagedTarget],
+) -> io::Result<Vec<MemberRuntimeIdentity>> {
+    if members.is_empty()
+        || members.len() > 256
+        || result.known_members.len() > 256
+        || result.member_runtimes.len() > 256
+    {
+        return Err(io::Error::other(
+            "sealed Job member evidence exceeds bounded capacity",
+        ));
+    }
+    let mut known_pids = HashSet::new();
+    if result.known_members.iter().any(|member| {
+        member.pid == 0 || member.creation_time == 0 || !known_pids.insert(member.pid)
+    }) {
+        return Err(io::Error::other(
+            "invalid or duplicate sealed process identity",
+        ));
+    }
+    if result.record_schema == 2 {
+        // The old root bundle is only a candidate. request_runtime_reconnect
+        // still proves this exact file is already loaded in each actual Job
+        // member. Opposite-architecture members cannot pass that proof.
+        return Ok(members
+            .iter()
+            .map(|member| MemberRuntimeIdentity {
+                pid: member.pid,
+                creation_time: member.creation_time,
+                module_path: result.runtime_module_path.clone(),
+                module_sha256: result.runtime_module_sha256.clone(),
+                config_sha256: result.runtime_config_sha256.clone(),
+                runtime_version: result.runtime_version.clone(),
+            })
+            .collect());
+    }
+    let mut proof_pids = HashSet::new();
+    if result.member_runtimes.iter().any(|fact| {
+        fact.pid == 0
+            || fact.creation_time == 0
+            || !proof_pids.insert(fact.pid)
+            || !result.known_members.contains(&ProcessIdentity {
+                pid: fact.pid,
+                creation_time: fact.creation_time,
+            })
+    }) || result.member_runtimes.len() != result.known_members.len()
+    {
+        return Err(io::Error::other(
+            "sealed member Runtime proofs are missing, duplicate or generation-conflicting",
+        ));
+    }
+    members
+        .iter()
+        .map(|member| {
+            result
+                .member_runtimes
+                .iter()
+                .find(|fact| fact.pid == member.pid && fact.creation_time == member.creation_time)
+                .cloned()
+                .ok_or_else(|| io::Error::other("actual Job member has no sealed Runtime identity"))
+        })
+        .collect()
+}
+
 /// Recovery grants control only after reopening the original kernel Job and
 /// challenging every still-live sealed member through the original pipe.
 fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -> io::Result<()> {
@@ -704,7 +887,7 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         ._snapshot
         .as_ref()
         .ok_or_else(|| io::Error::other("missing sealed snapshot"))?;
-    if result.record_schema != 2
+    if !matches!(result.record_schema, 2 | 3)
         || result.root_pid == 0
         || !result.inherit_children
         || result.mode != "compatibility"
@@ -732,8 +915,6 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
     );
     if format!("{:x}", Sha256::digest(expected.encode_line().as_bytes()))
         != result.runtime_config_sha256
-        || bounded_bundle_hash(&result.runtime_module_path, deadline)?
-            != result.runtime_module_sha256
     {
         return Err(io::Error::other(
             "sealed Runtime bundle or configuration hash changed",
@@ -768,6 +949,29 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
             "Job members are not fully sealed or their process generations changed",
         ));
     }
+    let sealed = sealed_member_facts(result, &members)?;
+    let mut checked_bundles: HashMap<std::path::PathBuf, String> = HashMap::new();
+    for fact in &sealed {
+        if fact.config_sha256 != result.runtime_config_sha256
+            || fact.runtime_version != env!("CARGO_PKG_VERSION")
+        {
+            return Err(io::Error::other(
+                "sealed member configuration or Runtime version is unsupported",
+            ));
+        }
+        let hash = if let Some(hash) = checked_bundles.get(&fact.module_path) {
+            hash.clone()
+        } else {
+            let hash = bounded_bundle_hash(&fact.module_path, deadline)?;
+            checked_bundles.insert(fact.module_path.clone(), hash.clone());
+            hash
+        };
+        if hash != fact.module_sha256 {
+            return Err(io::Error::other(
+                "sealed member Runtime bundle hash changed",
+            ));
+        }
+    }
     let mut table = SessionTable::new();
     table.set_instance_id(&run.command.instance_id.to_string());
     table.register_profile_flags(
@@ -775,10 +979,10 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         result.inherit_children,
         result.audit,
     );
-    for member in &members {
-        table.bind_pid(member.pid, &result.profile_id.to_string());
+    for fact in &sealed {
+        table.bind_pid(fact.pid, &result.profile_id.to_string());
         table
-            .expect_runtime(member.pid, &result.runtime_module_path)
+            .expect_runtime(fact.pid, &fact.module_path)
             .map_err(|error| io::Error::other(error.to_string()))?;
     }
     let table = Arc::new(Mutex::new(table));
@@ -786,7 +990,7 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         table.clone(),
         session_pipe_name(&run.command.instance_id.to_string()),
     )?;
-    for member in &members {
+    for fact in &sealed {
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
             .filter(|duration| duration.as_millis() >= 1)
@@ -794,10 +998,10 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
                 io::Error::new(io::ErrorKind::TimedOut, "bounded recovery budget exhausted")
             })?;
         request_runtime_reconnect(
-            member.pid,
-            member.creation_time,
-            &result.runtime_module_path,
-            &result.runtime_module_sha256,
+            fact.pid,
+            fact.creation_time,
+            &fact.module_path,
+            &fact.module_sha256,
             remaining.min(std::time::Duration::from_secs(3)),
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -805,13 +1009,13 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
             .lock()
             .map_err(|_| io::Error::other("recovery registry poisoned"))?;
         let observed = registry
-            .validate_runtime(member.pid)
+            .validate_runtime(fact.pid)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        if !registry.runtime_reconfirmed(member.pid)
-            || observed.identity.creation_time != member.creation_time
-            || observed.module_sha256 != result.runtime_module_sha256
-            || observed.config_sha256 != result.runtime_config_sha256
-            || observed.identity.runtime_version != result.runtime_version
+        if !registry.runtime_reconfirmed(fact.pid)
+            || observed.identity.creation_time != fact.creation_time
+            || observed.module_sha256 != fact.module_sha256
+            || observed.config_sha256 != fact.config_sha256
+            || observed.identity.runtime_version != fact.runtime_version
             || envbox_launcher::IpcMessage::decode_line(&observed.identity.actual_profile)
                 .map_err(|error| io::Error::other(error.to_string()))?
                 != expected
@@ -837,6 +1041,15 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
     run.result.state = "Running".into();
     run.result.supervisor_generation = generation.into();
     run.result.error = None;
+    run.result.record_schema = 3;
+    run.result.member_runtimes = sealed;
+    run.result.known_members = members
+        .iter()
+        .map(|member| ProcessIdentity {
+            pid: member.pid,
+            creation_time: member.creation_time,
+        })
+        .collect();
     run.members = members;
     run.job = Some(job);
     run._recovered_broker = Some(broker);
@@ -963,7 +1176,7 @@ pub(crate) fn failed(command: &RunCommand, error: &str) -> (String, RunResult) {
     (
         "Failed".into(),
         RunResult {
-            record_schema: 2,
+            record_schema: 3,
             request_id: String::new(),
             supervisor_generation: String::new(),
             job_name: String::new(),
@@ -979,6 +1192,7 @@ pub(crate) fn failed(command: &RunCommand, error: &str) -> (String, RunResult) {
             audit: false,
             inherit_children: false,
             known_members: vec![],
+            member_runtimes: vec![],
             root_pid: 0,
             creation_time: 0,
             mode: "unverified".into(),
@@ -989,4 +1203,103 @@ pub(crate) fn failed(command: &RunCommand, error: &str) -> (String, RunResult) {
             state: "Failed".into(),
         },
     )
+}
+
+#[cfg(test)]
+mod member_evidence_tests {
+    use super::*;
+    fn record(schema: u32) -> RunResult {
+        let command = RunCommand {
+            container_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            application_id: Uuid::new_v4(),
+        };
+        let mut result = failed(&command, "fixture").1;
+        result.record_schema = schema;
+        result.runtime_module_path = "D:/fixture/envbox-runtime64.dll".into();
+        result.runtime_module_sha256 = "root-sha".into();
+        result.runtime_config_sha256 = "config-sha".into();
+        result.runtime_version = env!("CARGO_PKG_VERSION").into();
+        result.known_members = vec![
+            ProcessIdentity {
+                pid: 1,
+                creation_time: 11,
+            },
+            ProcessIdentity {
+                pid: 2,
+                creation_time: 22,
+            },
+        ];
+        result.member_runtimes = result
+            .known_members
+            .iter()
+            .map(|member| MemberRuntimeIdentity {
+                pid: member.pid,
+                creation_time: member.creation_time,
+                module_path: if member.pid == 1 {
+                    "D:/fixture/envbox-runtime64.dll"
+                } else {
+                    "D:/fixture/envbox-runtime32.dll"
+                }
+                .into(),
+                module_sha256: format!("sha-{}", member.pid),
+                config_sha256: "config-sha".into(),
+                runtime_version: env!("CARGO_PKG_VERSION").into(),
+            })
+            .collect();
+        result
+    }
+    #[test]
+    fn surviving_child_uses_its_sealed_module_after_root_exit() {
+        let result = record(3);
+        let child = ManagedTarget {
+            pid: 2,
+            creation_time: 22,
+        };
+        let sealed = sealed_member_facts(&result, &[child]).unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(
+            sealed[0].module_path,
+            std::path::PathBuf::from("D:/fixture/envbox-runtime32.dll")
+        );
+        assert_eq!(sealed[0].module_sha256, "sha-2");
+    }
+    #[test]
+    fn missing_duplicate_changed_generation_and_unknown_member_are_refused() {
+        let child = ManagedTarget {
+            pid: 2,
+            creation_time: 22,
+        };
+        let mut missing = record(3);
+        missing.member_runtimes.pop();
+        assert!(sealed_member_facts(&missing, &[child]).is_err());
+        let mut duplicate = record(3);
+        duplicate.member_runtimes[1] = duplicate.member_runtimes[0].clone();
+        assert!(sealed_member_facts(&duplicate, &[child]).is_err());
+        let mut changed = record(3);
+        changed.member_runtimes[1].creation_time += 1;
+        assert!(sealed_member_facts(&changed, &[child]).is_err());
+        assert!(sealed_member_facts(
+            &record(3),
+            &[ManagedTarget {
+                pid: 3,
+                creation_time: 33
+            }]
+        )
+        .is_err());
+    }
+    #[test]
+    fn schema_two_retains_exact_root_candidate_without_guessing_a_sibling() {
+        let result = record(2);
+        let sealed = sealed_member_facts(
+            &result,
+            &[ManagedTarget {
+                pid: 2,
+                creation_time: 22,
+            }],
+        )
+        .unwrap();
+        assert_eq!(sealed[0].module_path, result.runtime_module_path);
+        assert_eq!(sealed[0].module_sha256, result.runtime_module_sha256);
+    }
 }

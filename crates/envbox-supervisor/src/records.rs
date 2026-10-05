@@ -134,7 +134,7 @@ pub(crate) fn scan(store: &ConfigStore) -> io::Result<Vec<Record>> {
                     let snapshot = store.load_run_snapshot(container_id, instance_id);
                     let reason = match &snapshot {
                         Err(error) => Some(format!("immutable snapshot unavailable: {error}")),
-                        Ok(_) if result.record_schema != 2 => {
+                        Ok(_) if !matches!(result.record_schema, 2 | 3) => {
                             Some("unsupported Run record schema; explicit upgrade required".into())
                         }
                         Ok(snapshot)

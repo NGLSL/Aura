@@ -164,7 +164,7 @@ fn control_command(args: &[String]) -> Result<(), String> {
             })
             .map_err(|error| error.to_string())?;
         println!(
-            "status\t{}\nrequest_id\t{}\ncontainer_id\t{}\nscope\tcurrent_supervisor_generation\nrestart_recovery\tverified_job_and_runtime_only\nrecovery_limit\tmixed_architecture_or_missing_job_reports_tracking_lost",
+            "status\t{}\nrequest_id\t{}\ncontainer_id\t{}\nscope\tcurrent_supervisor_generation\nrestart_recovery\tverified_job_and_runtime_only\nrecovery_limit\tunknown_members_or_missing_job_reports_tracking_lost",
             response.status, request_id, container_id
         );
         println!("instance_id\tapplication_id\tstate\troot_pid\tactive_members\tmode\tstorage_policy_enforced");

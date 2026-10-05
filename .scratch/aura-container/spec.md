@@ -3,7 +3,7 @@
 Status: ready-for-agent
 Date: 2026-10-04
 Delivery scope: 完整轻量级 Container；V1 仅为首个交付阶段，不代表总目标完成
-Implementation status: 尚未实施
+Implementation status: 已交付部分独立切片；完整 P0–P8 尚未完成，见 [实施证据](evidence/implementation-progress.md)
 
 ## Problem Statement
 

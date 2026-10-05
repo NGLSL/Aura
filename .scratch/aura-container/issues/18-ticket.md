@@ -37,3 +37,5 @@ F03、F10。DNS 相关细节遵循 [DNS transports 规格](../../dns-transports/
 ## 当前实施记录
 
 2026-10-04：已实施并验证可独立交付的切片；完整验收尚未全部通过，本票未关闭。实际运行、静态检查、失败来源和剩余缺口见 [实施进度](../evidence/implementation-progress.md)。不得从 claimed 或某组测试通过推断整票/完整 Container 完成。
+
+后续增量：Rustls/Hyper 显式 socket 候选已完成本机双架构原型，56 个 HTTP/TLS 场景及原生 C++ FFI 验证通过；本地 native cached Disallowed/signature-hash 与严格离线 CRL 已实现。原生系统信任公共目标、IPv6、其他 OS 与完整系统观测尚未证，整体 No-Go 保留；见 [原型证据](../evidence/doh-rustls-prototype.md) 与 [研究设计](../evidence/doh-rustls-design.md)。本轮不解除 19 的门禁。

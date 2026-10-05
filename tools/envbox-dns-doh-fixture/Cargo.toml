@@ -1,0 +1,19 @@
+[package]
+name = "envbox-dns-doh-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+fixture-trust = ["envbox-dns-doh/fixture-trust"]
+
+[[bin]]
+name = "envbox-dns-doh-fixture"
+path = "src/main.rs"
+required-features = ["fixture-trust"]
+
+[dependencies]
+envbox-dns-doh = { path = "../../crates/envbox-dns-doh" }
+http = "1"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading"] }

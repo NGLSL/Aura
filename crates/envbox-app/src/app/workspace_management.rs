@@ -395,6 +395,7 @@ mod tests {
                 audit: false,
                 inherit_children: true,
                 known_members: vec![],
+                member_runtimes: vec![],
                 creation_time: 5,
                 mode: "compatibility".into(),
                 entry_guarantee: "verified_pe_entry_no_tls".into(),

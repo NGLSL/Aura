@@ -230,6 +230,8 @@ pub struct HostBroker {
     pipe_name: String,
     #[cfg(windows)]
     _owner: PipeOwner,
+    #[cfg(test)]
+    pause: Option<Arc<AcceptPause>>,
 }
 
 #[cfg(windows)]
@@ -284,6 +286,19 @@ impl HostBroker {
 
     /// Start on an explicit pipe path (per-session names avoid cross-test races).
     pub fn start_on(table: SharedTable, pipe_name: String) -> std::io::Result<Self> {
+        Self::start_on_impl(
+            table,
+            pipe_name,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn start_on_impl(
+        table: SharedTable,
+        pipe_name: String,
+        #[cfg(test)] pause: Option<Arc<AcceptPause>>,
+    ) -> std::io::Result<Self> {
         #[cfg(windows)]
         let owner = claim_pipe_name(&pipe_name)?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -296,9 +311,20 @@ impl HostBroker {
         // client can spend its first retry interval waiting for a server
         // thread that has not been scheduled yet.
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        #[cfg(test)]
+        let pause2 = pause.clone();
         let join = std::thread::Builder::new()
             .name("envbox-ipc-host".into())
-            .spawn(move || serve_loop(table2, stop2, name2, Some(ready_tx)))?;
+            .spawn(move || {
+                serve_loop(
+                    table2,
+                    stop2,
+                    name2,
+                    Some(ready_tx),
+                    #[cfg(test)]
+                    pause2,
+                )
+            })?;
 
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(())) => {}
@@ -333,6 +359,8 @@ impl HostBroker {
             pipe_name,
             #[cfg(windows)]
             _owner: owner,
+            #[cfg(test)]
+            pause,
         })
     }
 
@@ -349,10 +377,22 @@ impl HostBroker {
         self.stop.store(true, Ordering::SeqCst);
         // Nudge a blocked ConnectNamedPipe by opening the pipe as a client.
         nudge_pipe(&self.pipe_name);
+        #[cfg(test)]
+        if let Some(pause) = &self.pause {
+            let _ = pause.nudged.send(());
+        }
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
     }
+}
+
+#[cfg(test)]
+struct AcceptPause {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    published: std::sync::mpsc::SyncSender<()>,
+    nudged: std::sync::mpsc::Sender<()>,
 }
 
 impl Drop for HostBroker {
@@ -417,6 +457,7 @@ fn serve_loop(
     stop: Arc<AtomicBool>,
     pipe_name: String,
     mut ready: Option<std::sync::mpsc::SyncSender<std::io::Result<()>>>,
+    #[cfg(test)] pause: Option<Arc<AcceptPause>>,
 ) {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
@@ -440,7 +481,27 @@ fn serve_loop(
         }
     }
 
+    #[cfg(test)]
+    let mut iteration = 0;
     while !stop.load(Ordering::SeqCst) {
+        #[cfg(test)]
+        {
+            iteration += 1;
+            if iteration == 2 {
+                if let Some(pause) = &pause {
+                    let _ = pause.entered.send(());
+                    if pause
+                        .release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
         let name: Vec<u16> = std::ffi::OsStr::new(&pipe_name)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -481,8 +542,21 @@ fn serve_loop(
             continue;
         }
         let pipe = OwnedHandle(raw);
+        #[cfg(test)]
+        if iteration == 2 {
+            if let Some(pause) = &pause {
+                let _ = pause.published.send(());
+            }
+        }
         if let Some(tx) = ready.take() {
             let _ = tx.send(Ok(()));
+        }
+
+        // stop's nudge may run after the loop condition but before this
+        // instance exists. Once published, a later nudge can connect; an
+        // earlier one is covered by this check before the blocking accept.
+        if stop.load(Ordering::SeqCst) {
+            return;
         }
 
         match unsafe { ConnectNamedPipe(pipe.0, None) } {
@@ -496,7 +570,7 @@ fn serve_loop(
             }
         }
 
-        let _ = serve_connection(pipe.0, &table);
+        let _ = serve_connection(pipe.0, &table, &stop);
         unsafe {
             let _ = DisconnectNamedPipe(pipe.0);
         }
@@ -508,6 +582,7 @@ fn serve_loop(
 fn serve_connection(
     pipe: windows::Win32::Foundation::HANDLE,
     table: &SharedTable,
+    stop: &AtomicBool,
 ) -> std::io::Result<()> {
     use windows::Win32::Foundation::{GetLastError, ERROR_NO_DATA};
     use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -527,6 +602,9 @@ fn serve_connection(
     let mut acc = Vec::new();
     let mut deadline = std::time::Instant::now() + Duration::from_millis(750);
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let mut read = 0u32;
         let ok = unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) };
         if ok.is_err()
@@ -541,6 +619,9 @@ fn serve_connection(
         }
         acc.extend_from_slice(&buf[..read as usize]);
         while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             if pos > crate::ipc::IPC_IDENTITY_MAX_LINE_BYTES {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -577,7 +658,10 @@ fn serve_connection(
                 let mut out = rep.encode_line().into_bytes();
                 out.push(b'\n');
                 let mut offset = 0;
-                while offset < out.len() && std::time::Instant::now() < deadline {
+                while offset < out.len()
+                    && std::time::Instant::now() < deadline
+                    && !stop.load(Ordering::SeqCst)
+                {
                     let mut written = 0u32;
                     let result =
                         unsafe { WriteFile(pipe, Some(&out[offset..]), Some(&mut written), None) };
@@ -607,6 +691,7 @@ fn serve_loop(
     stop: Arc<AtomicBool>,
     _pipe_name: String,
     ready: Option<std::sync::mpsc::SyncSender<std::io::Result<()>>>,
+    #[cfg(test)] _pause: Option<Arc<AcceptPause>>,
 ) {
     if let Some(tx) = ready {
         let _ = tx.send(Ok(()));
@@ -617,7 +702,7 @@ fn serve_loop(
 }
 
 #[cfg(not(windows))]
-fn serve_connection(_pipe: (), _table: &SharedTable) -> std::io::Result<()> {
+fn serve_connection(_pipe: (), _table: &SharedTable, _stop: &AtomicBool) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -625,6 +710,65 @@ fn serve_connection(_pipe: (), _table: &SharedTable) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::ipc::FakeBroker;
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_before_next_pipe_publication_does_not_lose_wakeup() {
+        let name = session_pipe_name(&uuid::Uuid::new_v4().to_string());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        let (nudged_tx, nudged_rx) = std::sync::mpsc::channel();
+        let pause = Arc::new(AcceptPause {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            published: published_tx,
+            nudged: nudged_tx,
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_name = name.clone();
+        let worker = std::thread::spawn(move || {
+            let table = Arc::new(Mutex::new(SessionTable::new()));
+            let mut broker = HostBroker::start_on_impl(table, worker_name, Some(pause)).unwrap();
+            started_tx.send(broker.stop.clone()).unwrap();
+            stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            broker.stop();
+            done_tx.send(()).unwrap();
+        });
+        let stopped = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        nudge_pipe(&name);
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second accept reached unpublished boundary");
+        stop_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !stopped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(stopped.load(Ordering::SeqCst));
+        // stop's only nudge must finish while no pipe exists. The barrier
+        // gives the server no opportunity to publish during this interval.
+        nudged_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stop nudge finished before publication");
+        release_tx.send(()).unwrap();
+        published_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("next pipe published");
+        let completed = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        if !completed {
+            // RED cleanup connects after publication, so the owned broker
+            // can finish; never join its blocked accept without waking it.
+            nudge_pipe(&name);
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cleanup stop completed");
+        }
+        worker.join().unwrap();
+        assert!(completed, "stop lost its wakeup before pipe publication");
+    }
 
     #[test]
     fn shared_table_starts_and_stops() {

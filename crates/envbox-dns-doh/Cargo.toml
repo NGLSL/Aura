@@ -1,0 +1,28 @@
+[package]
+name = "envbox-dns-doh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# Standalone fixture only. Product builds must never enable this feature.
+fixture-trust = []
+
+[dependencies]
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+mime = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+sha1 = "0.10"
+sha2 = "0.10"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_System_Registry"] }
