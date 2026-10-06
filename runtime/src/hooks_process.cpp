@@ -15,6 +15,7 @@
 
 #include "audit.h"
 #include "ipc_bootstrap.h"
+#include "service_bootstrap.h"
 
 static bool g_controlled_startup = false;
 static bool g_startup_policy_latched = false;
@@ -423,6 +424,14 @@ static bool UpsertProfileKeys(std::vector<wchar_t>* block) {
   DWORD recovery_length = GetEnvironmentVariableW(L"ENVBOX_RECOVERY_JOB_NAME", recovery_job, 256);
   if (recovery_length >= 256 || (recovery_length == 0 && GetLastError() != ERROR_ENVVAR_NOT_FOUND)) return false;
   if (recovery_length > 0) upsert(L"ENVBOX_RECOVERY_JOB_NAME", recovery_job);
+  // Bootstrap trust follows the immutable parent mode, never mutable target
+  // environment or caller-supplied child values.
+  vars.erase(std::remove_if(vars.begin(), vars.end(), [](const auto& kv) {
+      return _wcsicmp(kv.first.c_str(), L"ENVBOX_TRUSTED_SERVICE_BOOTSTRAP") == 0;
+    }), vars.end());
+  if (EnvBoxServiceBootstrapRequired()) {
+    upsert(L"ENVBOX_TRUSTED_SERVICE_BOOTSTRAP", L"1");
+  }
   // A caller-supplied environment cannot silently remove a controlled
   // parent's entry gate from its child.
   if (ControlledStartup()) {

@@ -1,13 +1,15 @@
-param([string]$CMakePath = 'D:/Tools/VS2022BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe')
+param([string]$CMakePath = 'D:/Tools/VS2022BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe', [string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+$out = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $repo ('target/envbox-policy-fixture-' + [Guid]::NewGuid().ToString('N')) }
+New-Item -ItemType Directory -Path $out -Force | Out-Null
 $runtimeModules = @((Get-Process -Id $PID).Modules | Where-Object ModuleName -Match '^envbox-runtime')
 if ($runtimeModules.Count -ne 0) { throw 'Run fixture validation in a host process without an injected Runtime' }
 if (-not (Test-Path -LiteralPath $CMakePath)) { throw "CMake not found: $CMakePath" }
 $records = @()
 foreach ($arch in @('x64', 'Win32')) {
-    $build = Join-Path $repo "target/envbox-policy-$arch"
+    $build = Join-Path $out $arch
     New-Item -ItemType Directory -Path $build -Force | Out-Null
     & $CMakePath -S $PSScriptRoot -B $build -A $arch *> (Join-Path $build 'configure.log')
     if ($LASTEXITCODE -ne 0) { throw "Configure failed: $arch" }
@@ -24,5 +26,5 @@ foreach ($arch in @('x64', 'Win32')) {
     $records += [ordered]@{ architecture = $arch; exit_code = $run.ExitCode; output = $output; path = $exe; sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash; cxx_linkage_exit_code = $linkageRun.ExitCode }
 }
 $result = [ordered]@{ completed = (Get-Date).ToUniversalTime().ToString('o'); controller_pid = $PID; runtime_module_count = $runtimeModules.Count; scope = 'shared pure-C state machine; no driver loaded and no network filtering'; results = $records }
-$result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $repo 'target/envbox-policy-fixture-results.json') -Encoding utf8
+$result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'result.json') -Encoding utf8
 $result | ConvertTo-Json -Depth 6

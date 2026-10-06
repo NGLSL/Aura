@@ -15,6 +15,10 @@ pub mod launcher;
 pub mod package_discovery;
 pub mod process_tracker;
 pub mod recovery;
+#[cfg(windows)]
+mod service_bundle;
+#[cfg(windows)]
+pub mod service_start;
 pub mod session;
 
 pub use activation::{

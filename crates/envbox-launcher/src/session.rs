@@ -224,13 +224,13 @@ pub fn terminal_cancel_marker_path(instance_id: Uuid) -> PathBuf {
 /// Host (no profile): suspended plain create → Job → resume, no Runtime injection.
 /// Profile: activate → attach → resume (Win32) or activate → attach (Packaged).
 pub fn start_session(req: SessionStartRequest) -> Result<SessionHandle, SessionError> {
-    start_session_with_options(req, None, None, false, false)
+    start_session_with_options(req, None, None, false, false, None)
 }
 
 /// Explicit verified-entry startup. Unsupported executables fail closed in the
 /// Runtime; legacy Compatibility startup does not opt into this guarantee.
 pub fn start_session_gated(req: SessionStartRequest) -> Result<SessionHandle, SessionError> {
-    start_session_with_options(req, None, None, false, true)
+    start_session_with_options(req, None, None, false, true, None)
 }
 
 /// Start a GUI-selected shell with its own interactive console. This is only
@@ -239,7 +239,7 @@ pub fn start_session_gated(req: SessionStartRequest) -> Result<SessionHandle, Se
 pub fn start_session_in_new_console(
     req: SessionStartRequest,
 ) -> Result<SessionHandle, SessionError> {
-    start_session_with_options(req, None, None, true, false)
+    start_session_with_options(req, None, None, true, false, None)
 }
 
 /// Start a session in a Job Object that was created by another process.
@@ -259,6 +259,7 @@ pub fn start_session_in_named_job(
         Some(job_name.as_ref().to_string()),
         false,
         false,
+        None,
     )
 }
 
@@ -274,15 +275,18 @@ pub fn start_session_in_named_job_gated(
         Some(job_name.as_ref().to_string()),
         false,
         true,
+        None,
     )
 }
 
-fn start_session_with_options(
+pub(crate) fn start_session_with_options(
     req: SessionStartRequest,
     requested_instance_id: Option<Uuid>,
     requested_job_name: Option<String>,
     create_new_console: bool,
     entry_gate: bool,
+    #[cfg(windows)] mut service: Option<crate::service_start::ServiceStartOptions<'_>>,
+    #[cfg(not(windows))] _service: Option<()>,
 ) -> Result<SessionHandle, SessionError> {
     // Safety net: every caller (GUI/CLI/tests) gets Packaged for AUMID /
     // WindowsApps targets. Never CreateProcess a WindowsApps exe (package
@@ -359,6 +363,12 @@ fn start_session_with_options(
             .map_err(SessionError::Unsupported)?;
     }
 
+    #[cfg(windows)]
+    let mut host_env: HashMap<String, String> = match &service {
+        Some(options) => crate::service_start::environment(options.primary_token)?,
+        None => std::env::vars().collect(),
+    };
+    #[cfg(not(windows))]
     let mut host_env: HashMap<String, String> = std::env::vars().collect();
     host_env.retain(|key, _| {
         !key.eq_ignore_ascii_case("ENVBOX_STARTUP_GATE")
@@ -380,9 +390,17 @@ fn start_session_with_options(
     let mut broker = if host_mode || is_packaged {
         None
     } else {
-        match crate::ipc_server::HostBroker::start_on(
+        #[cfg(windows)]
+        let owner = service
+            .as_ref()
+            .map(|o| crate::service_start::TokenOwner::from_token(o.primary_token))
+            .transpose()?;
+        #[cfg(not(windows))]
+        let owner = None;
+        match crate::ipc_server::HostBroker::start_on_owned(
             shared.clone(),
             pipe_path.clone().expect("Win32 pipe path"),
+            owner,
         ) {
             Ok(b) => Some(b),
             Err(error) => {
@@ -407,6 +425,10 @@ fn start_session_with_options(
         // Point Runtime IPC Bootstrap at this session's Host pipe (Win32 only).
         if let Some(pipe_path) = &pipe_path {
             env.insert("ENVBOX_IPC_PIPE".into(), pipe_path.clone());
+        }
+        #[cfg(windows)]
+        if service.is_some() {
+            env.insert("ENVBOX_TRUSTED_SERVICE_BOOTSTRAP".into(), "1".into());
         }
         if entry_gate {
             env.insert("ENVBOX_STARTUP_GATE".into(), "1".into());
@@ -466,17 +488,43 @@ fn start_session_with_options(
     let runtime_dll = if host_mode {
         None
     } else {
-        let source = if is_packaged {
+        #[cfg(windows)]
+        let explicit = service
+            .as_ref()
+            .map(|options| {
+                let program =
+                    crate::launcher::activation_program(&req.launch, &req.arguments, &env)?;
+                let arch = crate::injection::pe_arch(&program).map_err(ActivateError::Inject)?;
+                crate::service_start::runtime_for_arch(options, arch)
+            })
+            .transpose()?;
+        #[cfg(not(windows))]
+        let explicit: Option<PathBuf> = None;
+        let source = if let Some(path) = explicit {
+            Ok(path)
+        } else if is_packaged {
             crate::injection::resolve_runtime_dll()
         } else {
             let program = crate::launcher::activation_program(&req.launch, &req.arguments, &env)?;
             crate::injection::resolve_runtime_dll_for_target(&program)
         }
         .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?;
-        Some(
-            crate::injection::stage_runtime_dll(&source, instance_id)
-                .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?,
-        )
+        #[cfg(windows)]
+        if service.is_some() {
+            Some(source)
+        } else {
+            Some(
+                crate::injection::stage_runtime_dll(&source, instance_id)
+                    .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            Some(
+                crate::injection::stage_runtime_dll(&source, instance_id)
+                    .map_err(|e| SessionError::Activate(ActivateError::Inject(e)))?,
+            )
+        }
     };
 
     if let (Some(runtime), Some(profile)) = (&runtime_dll, &req.profile) {
@@ -502,7 +550,14 @@ fn start_session_with_options(
     };
 
     let backend = backend_for(&req.launch);
+    #[cfg(windows)]
+    let token_guard = service
+        .as_ref()
+        .map(|o| crate::service_start::CreationTokenGuard::enter(o.primary_token))
+        .transpose()?;
     let activated: ActivatedTarget = backend.activate(&req.launch, &activation_req)?;
+    #[cfg(windows)]
+    drop(token_guard);
     let mut startup_cleanup = ActivationCleanup {
         target: &activated,
         armed: !is_packaged,
@@ -620,6 +675,19 @@ fn start_session_with_options(
             }
         }
     };
+
+    #[cfg(windows)]
+    if let Some(options) = service.as_mut() {
+        if let Err(error) = (options.before_resume)(
+            activated.process.0,
+            activated.pid,
+            activated_generation.expect("Profile generation"),
+        ) {
+            return Err(startup_cleanup.fail(SessionError::Unsupported(format!(
+                "trusted pre-resume binding failed: {error}"
+            ))));
+        }
+    }
 
     // Resume Win32 suspended root after attach.
     if activated.suspended {

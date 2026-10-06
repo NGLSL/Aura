@@ -4,3 +4,4 @@ EXPORTS
   EnvBoxRuntimeLoaded @2
   EnvBoxRuntimeReconnect @3
   EnvBoxRuntimeCapabilities @4 DATA
+  EnvBoxTrustedServiceBootstrapCapability @5 DATA

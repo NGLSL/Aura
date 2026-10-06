@@ -12,7 +12,7 @@ uuid = { workspace = true }
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp"] }
+windows = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp", "Win32_Security_Authorization"] }
 
 [dev-dependencies]
 envbox-core = { workspace = true }

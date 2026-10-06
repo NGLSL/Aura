@@ -892,7 +892,7 @@ fn spawn_suspended(
             &mut startup.info.StartupInfo,
             &mut pi,
             dll_ansi.as_ptr(),
-            std::ptr::null(),
+            crate::service_start::creation_routine(),
         );
         if ok == 0 {
             // Ticket 30/31: map elevation/integrity and bad-exe-format before return.

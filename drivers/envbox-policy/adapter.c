@@ -3,6 +3,7 @@
 #include "policy.h"
 #include "adapter.h"
 #include "service_identity.h"
+#include "wfp.h"
 
 #define EB_TAG 'pAbE'
 typedef struct eb_session {
@@ -16,6 +17,7 @@ typedef struct eb_device_state {
     eb_table table;
     PFILE_OBJECT active_file;
     uint64_t next_generation;
+    NTSTATUS initialization_failure;
     /* Every occupied slot owns exactly one callback-established reference. */
     PEPROCESS process_refs[EB_POLICY_CAPACITY];
     /* Keep disconnected controllers identifiable until OS exit, so they
@@ -25,7 +27,19 @@ typedef struct eb_device_state {
 static PDEVICE_OBJECT eb_device;
 static const GUID eb_class_guid = {0x2572be60,0xa87e,0x4dd5,{0xa5,0x38,0xba,0x3e,0x75,0x18,0x94,0x31}};
 static void lock_state(eb_device_state *s) { KeEnterCriticalRegion(); ExAcquirePushLockExclusive(&s->lock); }
-static void unlock_state(eb_device_state *s) { ExReleasePushLockExclusive(&s->lock); KeLeaveCriticalRegion(); }
+static void unlock_state(eb_device_state *s) {
+    eb_network_snapshot snapshot={0}; ULONG i;
+    /* Build scalar values while references and table are protected. Publish
+     * before dropping the state lock, and on exit before dereferencing. */
+    for(i=0;i<EB_POLICY_CAPACITY;i++) if(s->process_refs[i] && s->table.slots[i].occupied) {
+        snapshot.entries[i].endpoint_pid=(uint64_t)(ULONG_PTR)PsGetProcessId(s->process_refs[i]);
+        snapshot.entries[i].identity=s->table.slots[i].identity;
+        snapshot.entries[i].occupied=1; snapshot.entries[i].bound=s->table.slots[i].bound;
+        snapshot.entries[i].policy=s->table.slots[i].policy;
+    }
+    eb_network_publish(&snapshot);
+    ExReleasePushLockExclusive(&s->lock); KeLeaveCriticalRegion();
+}
 static NTSTATUS complete(PIRP irp,NTSTATUS status,ULONG_PTR information) {
     irp->IoStatus.Status=status; irp->IoStatus.Information=information;
     IoCompleteRequest(irp,IO_NO_INCREMENT); return status;
@@ -63,6 +77,9 @@ static BOOLEAN valid_requestor(PIRP irp) {
 }
 static NTSTATUS reject(PDEVICE_OBJECT device,PIRP irp) {
     UNREFERENCED_PARAMETER(device); return complete(irp,STATUS_INVALID_DEVICE_REQUEST,0);
+}
+static NTSTATUS not_ready(PDEVICE_OBJECT device,PIRP irp) {
+    UNREFERENCED_PARAMETER(device); return complete(irp,STATUS_DEVICE_NOT_READY,0);
 }
 static NTSTATUS create(PDEVICE_OBJECT device,PIRP irp) {
     PIO_STACK_LOCATION stack=IoGetCurrentIrpStackLocation(irp);
@@ -264,13 +281,28 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver,PUNICODE_STRING registry_path) {
     status=IoCreateDeviceSecure(driver,sizeof(eb_device_state),&name,FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN,FALSE,&sddl,&eb_class_guid,&eb_device);
     if(!NT_SUCCESS(status)) return status;
-    state=eb_device->DeviceExtension; ExInitializePushLock(&state->lock); eb_initialize(&state->table);
+    state=eb_device->DeviceExtension; ExInitializePushLock(&state->lock); eb_initialize(&state->table); eb_network_initialize();
     status=IoCreateSymbolicLink(&link,&name);
     if(!NT_SUCCESS(status)) { IoDeleteDevice(eb_device); eb_device=NULL; return status; }
-    /* Register last: no fallible initialization remains after a callback can
-     * run. Failed registration cannot leave a callback in an unloaded image. */
     status=PsSetCreateProcessNotifyRoutineEx(process_notify,FALSE);
     if(!NT_SUCCESS(status)) { IoDeleteSymbolicLink(&link); IoDeleteDevice(eb_device); eb_device=NULL; return status; }
+    status=eb_wfp_start(eb_device);
+    if(!NT_SUCCESS(status)) {
+        NTSTATUS removed=PsSetCreateProcessNotifyRoutineEx(process_notify,TRUE);
+        if(!NT_SUCCESS(removed) || !eb_wfp_rollback_complete()) {
+            /* DriverEntry failure permits image disposal. A still-registered
+             * callback must instead pin this disabled, non-unloadable image.
+             * No CREATE/session/APPLY can report usable control in this state. */
+            state->initialization_failure=status;
+            for(i=0;i<=IRP_MJ_MAXIMUM_FUNCTION;i++) driver->MajorFunction[i]=not_ready;
+            DbgPrintEx(DPFLTR_IHVNETWORK_ID,DPFLTR_ERROR_LEVEL,
+                "AuraPolicy disabled retained image: setup=%08lx notify-remove=%08lx WFP-drained=%u\n",
+                (ULONG)status,(ULONG)removed,(unsigned)eb_wfp_rollback_complete());
+            eb_device->Flags&=~DO_DEVICE_INITIALIZING;
+            return STATUS_SUCCESS;
+        }
+        IoDeleteSymbolicLink(&link); IoDeleteDevice(eb_device); eb_device=NULL; return status;
+    }
     eb_device->Flags|=DO_BUFFERED_IO; eb_device->Flags&=~DO_DEVICE_INITIALIZING;
     return STATUS_SUCCESS;
 }

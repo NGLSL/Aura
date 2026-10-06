@@ -38,6 +38,15 @@ fn export_rva(
     export_name: &[u8],
     executable: bool,
 ) -> Result<(u32, u32, u16, usize), RecoveryError> {
+    export_rva_length(bytes, export_name, executable, 256)
+}
+
+fn export_rva_length(
+    bytes: &[u8],
+    export_name: &[u8],
+    executable: bool,
+    data_len: usize,
+) -> Result<(u32, u32, u16, usize), RecoveryError> {
     let u16at = |at: usize| {
         bytes
             .get(at..at.checked_add(2).ok_or_else(|| refused("PE overflow"))?)
@@ -133,7 +142,20 @@ fn export_rva(
         if rva == 0 || rva >= image_size {
             return Err(refused("bad reconnect RVA"));
         }
-        let file_offset = map(rva, if executable { 1 } else { 256 }, executable)?;
+        if !executable {
+            for section in 0..sections {
+                let at = section_start + section * 40;
+                let va = u32at(at + 12)?;
+                let size = u32at(at + 16)?;
+                if rva >= va
+                    && u64::from(rva - va) < u64::from(size)
+                    && u32at(at + 36)? & 0x20000000 != 0
+                {
+                    return Err(refused("DATA export points into executable section"));
+                }
+            }
+        }
+        let file_offset = map(rva, if executable { 1 } else { data_len }, executable)?;
         return Ok((rva, image_size, machine, file_offset));
     }
     Err(refused("old Runtime has no reconnect export"))
@@ -437,6 +459,37 @@ mod tests {
         assert!(export_rva(&bytes[..0x320], b"EnvBoxRuntimeCapabilities\0", false).is_err());
         assert!(export_rva(&bytes, b"EnvBoxRuntimeReconnect\0", true).is_err());
     }
+    #[cfg(windows)]
+    #[test]
+    fn trusted_service_preflight_requires_exact_nonforwarded_data_capability() {
+        let path = std::env::temp_dir().join(format!(
+            "aura-service-capability-{}.dll",
+            uuid::Uuid::new_v4()
+        ));
+        let mut bytes = image();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(validate_trusted_service_bootstrap(&path).is_err());
+        let name = b"EnvBoxTrustedServiceBootstrapCapability\0";
+        bytes[0x280..0x2c0].fill(0);
+        bytes[0x280..0x280 + name.len()].copy_from_slice(name);
+        bytes[0x300..0x304].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(validate_trusted_service_bootstrap(&path).is_ok());
+        for version in [0u32, 2, u32::MAX] {
+            bytes[0x300..0x304].copy_from_slice(&version.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(validate_trusted_service_bootstrap(&path).is_err());
+        }
+        bytes[0x300..0x304].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0x188 + 36..0x188 + 40].copy_from_slice(&0x60000020u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(validate_trusted_service_bootstrap(&path).is_err());
+        bytes[0x188 + 36..0x188 + 40].copy_from_slice(&0x40000040u32.to_le_bytes());
+        bytes[0x240..0x244].copy_from_slice(&0x1080u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(validate_trusted_service_bootstrap(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
     #[test]
     fn offline_capabilities_reject_unknown_and_unterminated_data() {
         let path = std::env::temp_dir().join(format!(
@@ -484,4 +537,22 @@ mod tests {
         assert!(read_runtime_capabilities(&path).is_err());
         std::fs::remove_file(path).unwrap();
     }
+}
+
+/// Service startup requires a qualified Runtime's dedicated immutable DATA export.
+#[cfg(windows)]
+pub(crate) fn validate_trusted_service_bootstrap(path: &Path) -> Result<(), RecoveryError> {
+    let bytes = read_image(path)?;
+    let (_, _, _, offset) = export_rva_length(
+        &bytes,
+        b"EnvBoxTrustedServiceBootstrapCapability\0",
+        false,
+        4,
+    )?;
+    if bytes[offset..offset + 4] != 1u32.to_le_bytes() {
+        return Err(refused(
+            "Runtime lacks trusted service bootstrap capability",
+        ));
+    }
+    Ok(())
 }

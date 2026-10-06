@@ -5,8 +5,10 @@ compiled into the future kernel identity/WFP adapter. The host fixture compiles
 **this same source**, rather than a separate model. This directory also has a
 source-only WDM identity adapter (`adapter.c`), described in [ADAPTER.md](ADAPTER.md).
 The adapter has been compiled and linked, never loaded or exercised in kernel
-mode. There is no WFP callout or Windows service. It must not enable Container
-mode or advertise functioning network isolation.
+mode. A source-only IPv4 ALE callout and transactional WFP registration path
+now compile into the SYS; trusted service/startup integration and all kernel
+qualification remain separate requirements. It must not enable Container mode
+or advertise functioning network isolation.
 
 The adapter's child-creation rejection covers only paths that actually invoke
 its process callback. Native clone and PSS VA clone coverage is unverified and
@@ -72,7 +74,10 @@ The caller owns a bounded 64-slot table, allocates it from appropriately residen
 kernel memory (not a large kernel-stack local), and serializes **every** call,
 including classification, with its own suitable lock. The core has no internal
 lock, allocation, OS call or background work. The adapter must define legal
-IRQLs, rundown and callback ordering before using it from WFP.
+IRQLs, rundown and callback ordering before using it from WFP. The new callout
+uses the separate fixed resident snapshot under a KSPIN_LOCK instead of calling
+this table under its PASSIVE_LEVEL lock. See ADAPTER.md for identity lookup,
+cleanup failure, BFE and existing-flow limitations.
 
 Bindings contain immutable Container UUID, Instance UUID, configuration digest
 and policy. Equal binds are idempotent; changes are conflicts. Revocation

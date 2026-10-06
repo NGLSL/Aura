@@ -32,6 +32,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/audit.cpp
   src/runtime_profile.cpp
   src/ipc_bootstrap.cpp
+  src/service_bootstrap.cpp
   src/startup_gate.cpp
   src/hooks_time.cpp
   src/hooks_winrt_time.cpp

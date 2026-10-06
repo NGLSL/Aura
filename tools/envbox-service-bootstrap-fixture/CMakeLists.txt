@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox-service-bootstrap-fixture LANGUAGES CXX)
+add_executable(service-bootstrap-fixture main.cpp ../../runtime/src/service_bootstrap.cpp)
+target_compile_features(service-bootstrap-fixture PRIVATE cxx_std_17)
+target_compile_options(service-bootstrap-fixture PRIVATE /W4 /WX)
+target_link_libraries(service-bootstrap-fixture PRIVATE advapi32)
+set_property(TARGET service-bootstrap-fixture PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)

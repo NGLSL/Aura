@@ -76,6 +76,21 @@ pub struct JobAssignment<'a> {
 }
 
 impl InstanceJob {
+    /// Query the exact referenced process against this retained Job. Callers
+    /// must retain the process handle; this never opens or adopts a raw PID.
+    #[cfg(windows)]
+    pub fn contains_process(
+        &self,
+        process: windows::Win32::Foundation::HANDLE,
+    ) -> Result<bool, JobError> {
+        let mut member = windows::Win32::Foundation::BOOL::default();
+        unsafe {
+            windows::Win32::System::JobObjects::IsProcessInJob(process, self.handle.0, &mut member)
+        }
+        .map_err(|_| JobError::Query(last_error()))?;
+        Ok(member.as_bool())
+    }
+
     /// Recovery accepts only the unmodified tracking Job policy used by this launcher.
     pub fn verify_tracking_limits(&self) -> Result<(), JobError> {
         #[cfg(windows)]
@@ -423,6 +438,14 @@ mod tests {
             .spawn()
             .expect("spawn child");
         handoff.assign_pid(child.id()).expect("assign child");
+        use std::os::windows::io::AsRawHandle;
+        let actual_process = windows::Win32::Foundation::HANDLE(child.as_raw_handle());
+        assert!(owner.contains_process(actual_process).unwrap());
+        let unrelated = InstanceJob::create().unwrap();
+        assert!(!unrelated.contains_process(actual_process).unwrap());
+        assert!(owner
+            .contains_process(windows::Win32::Foundation::HANDLE::default())
+            .is_err());
         let stats = owner.stats().expect("query named job");
         assert!(stats.process_ids.contains(&child.id()));
         owner.close().expect("stop named job");

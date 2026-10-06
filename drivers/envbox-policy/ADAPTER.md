@@ -71,10 +71,11 @@ identity. Metadata/strategy recovery and normal user app support are unverified.
 Creation registration is an identity mechanism, **not a verified launch gate**.
 The future dedicated service must create suspended, bind, attach other required
 resources, independently confirm the startup contract, then Resume. No actual
-service/gate path has been tested. There is no WFP filtering, so Pending/Deny in
-the table does not presently block network traffic or prove a first-packet
-boundary. Host/Deny classification is currently exercised only in the host core
-fixture. Inbound/listening, Allowlist/TTL, child inheritance and storage filters
+service/gate path has been tested. A real ALE_AUTH_CONNECT_V4 callout and dynamic
+filter registration path now exist in `wfp.c`, but have never run in a kernel;
+neither a first-packet boundary nor actual isolation is proven. Host/Deny
+classification is exercised in the host fixture. Inbound/listening,
+Allowlist/TTL, child inheritance and storage filters
 remain unsupported. IPv6 is deferred independently of this source work.
 
 Native process cloning and PSS VA cloning are a separate mandatory qualification
@@ -99,18 +100,50 @@ Token queries and dispatch are PASSIVE_LEVEL. EX_PUSH_LOCK in a critical region
 serializes core calls and reference tables; token queries and user-handle
 resolution occur outside that lock, then session/generation are checked again.
 Process callbacks run at PASSIVE_LEVEL. The source has no asynchronous work or
-queued IRPs. A future DISPATCH_LEVEL WFP callout cannot use this passive lock
-unchanged; it needs a separately reviewed resident classification/read-lifetime
-design.
+queued IRPs. `unlock_state` publishes a fixed resident scalar snapshot under a
+short KSPIN_LOCK before releasing the passive lock. Lock order is passive state
+lock -> snapshot spin lock, never the reverse. Classify only scans the snapshot
+under its spin lock; no allocations, pageable APIs, passive locks, process lookup
+or object dereference occurs. Exit removes the snapshot before dropping the
+callback-held process reference. WFP's endpoint PID is only the lookup index
+published from that referenced object; object key and creation time originate
+from the callback and never the wire. No raw PID adoption is available.
+
+The IPv4 connect callout handles TCP connect and initial UDP authorization,
+including loopback; all known protected members using other IPv4 protocols are
+blocked. Pending, revoked and Deny entries block; Host and unknown entries return
+CONTINUE, preserving other Windows firewall rules. It does not force PERMIT.
+When ACTION_WRITE is absent, Deny/Pending still veto an existing PERMIT by
+returning BLOCK; other existing actions are preserved. Host/unknown change to
+CONTINUE only with ACTION_WRITE. The real shared action helper has host coverage
+for hard-PERMIT veto and preserving prior actions without write rights.
+Without PROCESS_ID metadata there is no reliable protected lookup and the
+callout continues; actual metadata availability and process-ID reuse ordering
+are mandatory isolated qualification cases, not claimed coverage. ALE initial
+authorization alone is not packet filtering of every existing flow: revoke
+needs independently proven reauthorization/drain before it can claim to cut off
+already established Host connections. Kernel-delegated networking, inherited
+endpoints and process clones likewise remain qualification blockers.
+
+Registration uses a dynamic engine session and transaction for sublayer,
+management callout and filter. Startup fails if BFE is unavailable. Transaction
+failure aborts; rollback closes the session (removing filters) before unregistering
+the runtime callout. No flow context or async operation is associated. BFE
+stop/restart removes dynamic policy and is not recovered: no production binding
+or Container enablement is permitted until that lifecycle is enforced.
 
 The driver deliberately sets `DriverUnload = NULL`. A void WDM unload callback
 cannot reject unload after protection exists, and there is no verified safe
 drain/recovery protocol. This prototype is **not eligible for loading**, including
 on the current host. A formal backend must implement qualified stop/drain,
 callback rundown, reference cleanup, recovery and safe update/unload before
-any approved VM runtime experiment. DriverEntry performs all fallible device
-and symlink work before callback registration; failed registration deletes
-those objects, and no fallible setup remains after a callback can run.
+any approved VM runtime experiment. Setup failure removes process notification
+and WFP registration before device disposal. If callback removal or WFP rollback
+unexpectedly fails, DriverEntry returns success solely to keep the image resident:
+all IRP handlers return STATUS_DEVICE_NOT_READY, the original failure is retained
+in the device state and debugger output, and no session or launch can succeed.
+That exceptional pin is not a usable backend or successful protection. Fault
+injection of these actual DDIs and callback rundown has not been performed.
 
 ## Build and proof
 
@@ -121,9 +154,9 @@ those objects, and no fallible setup remains after a callback can run.
 
 The independent driver build performs `/kernel /W4 /WX /Zl /X` compilation,
 links `/driver /subsystem:native /nodefaultlib /integritycheck`, verifies x64
-PE32+, native subsystem and FORCE_INTEGRITY, and permits only ntoskrnl/HAL imports.
-Current linked output imports only `ntoskrnl.exe`. Logs and SYS hash are in
-`target/envbox-policy-driver/result.json`. Build success proves source/DDI/link
+PE32+, native subsystem and FORCE_INTEGRITY, and permits only ntoskrnl/HAL/fwpkclnt imports.
+Current linked output imports `ntoskrnl.exe` and `fwpkclnt.sys`. Logs and SYS hash
+are in unique `target/envbox-policy-wfp-<id>/result.json`. Build success proves source/DDI/link
 compatibility only. Host tests prove wire/state/SID/SDDL and C/C++ linkage,
 not kernel authentication or filtering. Tickets 22/23 remain unaccepted.
 
@@ -137,6 +170,12 @@ Primary sources used for these contracts:
 - [Process callback IRQL](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pcreate_process_notify_routine_ex)
 - [PS_CREATE_NOTIFY_INFO: parent versus creator, image object and rejection status](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_ps_create_notify_info)
 - [Legacy CreateProcessNotifyEx: clone notification exclusion](https://learn.microsoft.com/en-us/previous-versions/ff542860%28v%3Dvs.85%29)
+- [ALE layer authorization semantics](https://learn.microsoft.com/en-us/windows/win32/fwp/ale-layers)
+- [WFP actions: UNKNOWN permits BLOCK and CONTINUE](https://learn.microsoft.com/en-us/windows/win32/api/fwpstypes/ns-fwpstypes-fwps_action0)
+- [Filter arbitration: hard-PERMIT veto without ACTION_WRITE](https://learn.microsoft.com/en-us/windows/win32/fwp/filter-arbitration)
+- [Kernel callout registration and filter behavior](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nf-fwpsk-fwpscalloutregister1)
+- [Runtime unregister errors and flow lifetime](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nf-fwpsk-fwpscalloutunregisterbyid0)
+- [PsGetProcessId: documented any-IRQL API](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-psgetprocessid)
 
 The actual cached WDK headers and libraries were also inspected. No undocumented
 EPROCESS offsets, pattern scans or syscall interception are used.

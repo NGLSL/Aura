@@ -10,6 +10,7 @@
 // C++ never reads profiles.toml and never validates Profile business rules.
 
 #include "runtime_profile.h"
+#include "service_bootstrap.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -517,6 +518,7 @@ static int LoadFromEnvValues() {
 }
 
 int EnvBoxLoadProfile() {
+  if (!EnvBoxServiceBootstrapConfigurationValid()) return 0;
   if (g_loaded) {
     return 1;  // immutable after first successful init
   }
@@ -564,7 +566,7 @@ int EnvBoxLoadProfile() {
   }
 
   // Fallback: ENVBOX_* structured values (Win32 Environment Block). No TOML.
-  if (!loaded) {
+  if (!loaded && !EnvBoxServiceBootstrapRequired()) {
     if (LoadFromEnvValues()) {
       loaded = 1;
     }

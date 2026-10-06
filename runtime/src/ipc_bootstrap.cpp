@@ -4,6 +4,7 @@
 // enforced by the caller (EnvBoxLoadProfile), not by this module.
 
 #include "ipc_bootstrap.h"
+#include "service_bootstrap.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -187,6 +188,10 @@ int ReadLine(PipeReader* r, char* out, size_t cap, ULONGLONG deadline) {
 // Opens with FILE_FLAG_OVERLAPPED so reads can time out.
 // ---------------------------------------------------------------------------
 HANDLE ConnectPipePath(const wchar_t* path, DWORD timeout_ms) {
+  if (!EnvBoxServiceBootstrapConfigurationValid()) {
+    SetLastError(ERROR_INVALID_DATA);
+    return INVALID_HANDLE_VALUE;
+  }
   ULONGLONG deadline = GetTickCount64() + timeout_ms;
   for (;;) {
     // Wait briefly for an instance; ignore failure and still try CreateFileW.
@@ -197,9 +202,14 @@ HANDLE ConnectPipePath(const wchar_t* path, DWORD timeout_ms) {
       break;
     }
     WaitNamedPipeW(path, remaining < 100 ? remaining : 100);
-    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+    HANDLE h = CreateFileW(path, kEnvBoxPipeClientAccess, 0, nullptr,
                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
+      if (EnvBoxServiceBootstrapRequired() && !EnvBoxValidateTrustedServicePipe(h)) {
+        CloseHandle(h);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+      }
       DWORD mode = PIPE_READMODE_BYTE;
       SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
       return h;

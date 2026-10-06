@@ -9,7 +9,7 @@ Run from the repository root:
 The script finds CMake at the default local VS Build Tools path; override it
 with `-CMakePath` if needed. It rejects an injected controller process, builds
 and runs MSVC x64 and Win32 executables, checks actual binary exit codes, and
-writes logs per architecture and `target/envbox-policy-fixture-results.json`
+writes logs per architecture and `target/envbox-policy-fixture-<id>/result.json`
 with binary hashes. No driver/service is installed and no network or trust
 settings change. See the [shared core contract](../../drivers/envbox-policy/README.md)
 for adapter requirements and unverified kernel behavior.
@@ -32,7 +32,18 @@ Independent source-only WDM SYS build and PE/import checks:
 ```
 
 This uses the same cached WDK, checks the dedicated service SID with read-only
-`sc.exe showsid`, and writes `target/envbox-policy-driver/result.json`. It does
+`sc.exe showsid`, and writes `target/envbox-policy-wfp-<id>/result.json`. It does
 not install/create a service, register a driver, sign a catalog or load anything.
 The prototype has no unload handler and is not eligible for loading. See the
 [adapter contract](../../drivers/envbox-policy/ADAPTER.md) for incomplete gates.
+
+The host fixture also exercises the real resident snapshot decision function:
+unknown Host, TCP/UDP Host/Deny, Pending/revoked, protected unsupported protocol,
+invalid identity, exact removal and reused endpoint index with a new identity.
+It also exercises the shared WFP action helper: Deny/Pending veto hard PERMIT
+without ACTION_WRITE, unknown Host preserves hard PERMIT, and existing actions
+without write rights remain intact when no veto is permitted.
+These checks do not test actual kernel spin locks, DDI failure cleanup, BFE
+restart, existing-flow revocation or packets. The SYS links the actual WFP
+registration source and verifies `fwpkclnt.sys` imports. Both scripts accept
+`-OutputDirectory` to preserve a specifically named evidence directory.

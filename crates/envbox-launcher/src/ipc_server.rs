@@ -49,7 +49,10 @@ pub(crate) fn process_creation_time(_pid: u32) -> Option<u64> {
 }
 
 #[cfg(windows)]
-fn authenticate_process(pid: u32) -> std::io::Result<AuthenticatedProcess> {
+fn authenticate_process(
+    pid: u32,
+    expected: Option<&crate::service_start::TokenOwner>,
+) -> std::io::Result<AuthenticatedProcess> {
     use crate::launcher::win::SafeHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{
@@ -113,6 +116,26 @@ fn authenticate_process(pid: u32) -> std::io::Result<AuthenticatedProcess> {
         }
         let level = unsafe { *GetSidSubAuthority(sid, u32::from(count - 1)) };
         Ok((sid_bytes, level))
+    }
+    if let Some(expected) = expected {
+        let process = crate::launcher::win::SafeHandle(unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+        }?);
+        let mut raw = HANDLE::default();
+        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut raw) }?;
+        let token = crate::launcher::win::SafeHandle(raw);
+        let peer = crate::service_start::TokenOwner::read(token.0, false)?;
+        if !expected.admits(&peer) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "bootstrap user/integrity/session mismatch",
+            ));
+        }
+        return Ok(AuthenticatedProcess {
+            pid,
+            creation_time: process_creation_time(pid)
+                .ok_or_else(|| std::io::Error::other("client generation unavailable"))?,
+        });
     }
     let client = unsafe { facts(pid) }?;
     let owner = unsafe { facts(std::process::id()) }?;
@@ -289,6 +312,22 @@ impl HostBroker {
         Self::start_on_impl(
             table,
             pipe_name,
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    pub(crate) fn start_on_owned(
+        table: SharedTable,
+        pipe_name: String,
+        #[cfg(windows)] expected: Option<crate::service_start::TokenOwner>,
+        #[cfg(not(windows))] expected: Option<()>,
+    ) -> std::io::Result<Self> {
+        Self::start_on_impl(
+            table,
+            pipe_name,
+            expected,
             #[cfg(test)]
             None,
         )
@@ -297,6 +336,8 @@ impl HostBroker {
     fn start_on_impl(
         table: SharedTable,
         pipe_name: String,
+        #[cfg(windows)] expected: Option<crate::service_start::TokenOwner>,
+        #[cfg(not(windows))] expected: Option<()>,
         #[cfg(test)] pause: Option<Arc<AcceptPause>>,
     ) -> std::io::Result<Self> {
         #[cfg(windows)]
@@ -320,6 +361,7 @@ impl HostBroker {
                     table2,
                     stop2,
                     name2,
+                    expected,
                     Some(ready_tx),
                     #[cfg(test)]
                     pause2,
@@ -456,6 +498,7 @@ fn serve_loop(
     table: SharedTable,
     stop: Arc<AtomicBool>,
     pipe_name: String,
+    expected: Option<crate::service_start::TokenOwner>,
     mut ready: Option<std::sync::mpsc::SyncSender<std::io::Result<()>>>,
     #[cfg(test)] pause: Option<Arc<AcceptPause>>,
 ) {
@@ -468,6 +511,20 @@ fn serve_loop(
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+
+    let security = expected
+        .as_ref()
+        .map(|owner| crate::service_start::PipeSecurity::new(&owner.sid_text))
+        .transpose();
+    let security = match security {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(tx) = ready.take() {
+                let _ = tx.send(Err(error));
+            }
+            return;
+        }
     };
 
     struct OwnedHandle(HANDLE);
@@ -521,7 +578,7 @@ fn serve_loop(
                 8192,
                 8192,
                 0,
-                None,
+                security.as_ref().map(|sd| &sd.attributes as *const _),
             )
         };
         if raw.is_invalid() {
@@ -570,7 +627,7 @@ fn serve_loop(
             }
         }
 
-        let _ = serve_connection(pipe.0, &table, &stop);
+        let _ = serve_connection(pipe.0, &table, &stop, expected.as_ref());
         unsafe {
             let _ = DisconnectNamedPipe(pipe.0);
         }
@@ -583,6 +640,7 @@ fn serve_connection(
     pipe: windows::Win32::Foundation::HANDLE,
     table: &SharedTable,
     stop: &AtomicBool,
+    expected: Option<&crate::service_start::TokenOwner>,
 ) -> std::io::Result<()> {
     use windows::Win32::Foundation::{GetLastError, ERROR_NO_DATA};
     use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -592,7 +650,7 @@ fn serve_connection(
 
     let mut client_pid = 0;
     unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) }?;
-    let client = authenticate_process(client_pid)?;
+    let client = authenticate_process(client_pid, expected)?;
     // Bounded, nonblocking connection I/O: a client that keeps a pipe open
     // without reading/writing must not hang broker teardown or bootstrap.
     let mode = PIPE_NOWAIT;
@@ -690,6 +748,7 @@ fn serve_loop(
     _table: SharedTable,
     stop: Arc<AtomicBool>,
     _pipe_name: String,
+    _expected: Option<()>,
     ready: Option<std::sync::mpsc::SyncSender<std::io::Result<()>>>,
     #[cfg(test)] _pause: Option<Arc<AcceptPause>>,
 ) {
@@ -731,7 +790,8 @@ mod tests {
         let worker_name = name.clone();
         let worker = std::thread::spawn(move || {
             let table = Arc::new(Mutex::new(SessionTable::new()));
-            let mut broker = HostBroker::start_on_impl(table, worker_name, Some(pause)).unwrap();
+            let mut broker =
+                HostBroker::start_on_impl(table, worker_name, None, Some(pause)).unwrap();
             started_tx.send(broker.stop.clone()).unwrap();
             stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             broker.stop();

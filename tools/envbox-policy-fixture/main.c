@@ -5,6 +5,7 @@
 #include <sddl.h>
 #include "adapter.h"
 #include "service_identity.h"
+#include "network_snapshot.h"
 typedef char sdk_group_enabled[(EB_GROUP_ENABLED==SE_GROUP_ENABLED)?1:-1];
 typedef char sdk_group_deny_only[(EB_GROUP_DENY_ONLY==SE_GROUP_USE_FOR_DENY_ONLY)?1:-1];
 typedef char sdk_process_access[(EB_PROCESS_BIND_ACCESS==(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SUSPEND_RESUME))?1:-1];
@@ -24,6 +25,29 @@ int main(void) {
     eb_table t, before; eb_message m, original;
     uint8_t p[EB_POLICY_WIRE_SIZE], owner[32], other[32];
     eb_identity a={100,1000}, b={101,1000}, reused={100,2000}, host={102,1000}; unsigned i;
+    { eb_network_snapshot n={0}; eb_network_entry *e=&n.entries[0];
+      CHECK(eb_network_classify(&n,99,6)==EB_HOST);
+      e->occupied=1; e->endpoint_pid=99; e->identity=a;
+      CHECK(eb_network_classify(&n,99,6)==EB_PENDING_DENY);
+      e->bound=1; e->policy=EB_POLICY_DENY;
+      CHECK(eb_network_classify(&n,99,6)==EB_DENY); CHECK(eb_network_classify(&n,99,17)==EB_DENY);
+      e->policy=EB_POLICY_HOST;
+      CHECK(eb_network_classify(&n,99,6)==EB_HOST); CHECK(eb_network_classify(&n,99,17)==EB_HOST);
+      CHECK(eb_network_classify(&n,99,1)==EB_DENY); CHECK(eb_network_classify(&n,100,1)==EB_HOST);
+      e->bound=2; CHECK(eb_network_classify(&n,99,6)==EB_PENDING_DENY);
+      e->bound=1; e->identity.creation_time=0; CHECK(eb_network_classify(&n,99,6)==EB_PENDING_DENY);
+      memset(e,0,sizeof(*e)); CHECK(eb_network_classify(&n,99,6)==EB_HOST);
+      e->occupied=1; e->endpoint_pid=99; e->identity=reused; e->bound=1; e->policy=EB_POLICY_DENY;
+      CHECK(eb_network_classify(&n,99,6)==EB_DENY);
+      CHECK(eb_network_resolve_action(eb_network_classify(&n,99,6),0,1)==EB_ACTION_BLOCK);
+      CHECK(eb_network_resolve_action(eb_network_classify(&n,100,6),0,1)==EB_ACTION_PRESERVE);
+      CHECK(eb_network_resolve_action(eb_network_classify(&n,99,6),0,0)==EB_ACTION_PRESERVE);
+      CHECK(eb_network_resolve_action(EB_PENDING_DENY,0,1)==EB_ACTION_BLOCK);
+      CHECK(eb_network_resolve_action(EB_DENY,1,0)==EB_ACTION_BLOCK);
+      CHECK(eb_network_resolve_action(EB_PENDING_DENY,1,0)==EB_ACTION_BLOCK);
+      CHECK(eb_network_resolve_action(EB_HOST,1,1)==EB_ACTION_CONTINUE);
+      CHECK(eb_network_resolve_action(EB_HOST,0,0)==EB_ACTION_PRESERVE);
+    }
     { PSID sid=NULL; PSECURITY_DESCRIPTOR sd=NULL; PACL acl=NULL; BOOL present=FALSE,defaulted=FALSE; PVOID ace=NULL;
       CHECK(ConvertStringSidToSidW(EB_SERVICE_SID,&sid)); CHECK(GetLengthSid(sid)==sizeof(eb_service_sid)); CHECK(memcmp(sid,eb_service_sid,sizeof(eb_service_sid))==0);
       CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(EB_DEVICE_SDDL,SDDL_REVISION_1,&sd,NULL));
