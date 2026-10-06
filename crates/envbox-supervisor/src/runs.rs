@@ -53,8 +53,69 @@ fn is_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & 0x0000_0400 != 0
 }
 
-fn open_stable_bundle(path: &std::path::Path) -> io::Result<(std::fs::File, FileIdentity)> {
+fn check_bundle_budget(deadline: std::time::Instant) -> io::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Runtime bundle recovery budget exhausted",
+        ));
+    }
+    Ok(())
+}
+
+fn check_local_bundle_path(path: &std::path::Path, deadline: std::time::Instant) -> io::Result<()> {
+    use std::path::{Component, Prefix};
+    use windows::{core::PCWSTR, Win32::Storage::FileSystem::GetDriveTypeW};
+    check_bundle_budget(deadline)?;
+    let mut components = path.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => return Err(io::Error::other("Runtime bundle must be a local disk file")),
+        },
+        _ => return Err(io::Error::other("Runtime bundle must be a local disk file")),
+    };
+    if components.next() != Some(Component::RootDir)
+        || components.any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(io::Error::other(
+            "Runtime bundle path must be absolute without parent traversal",
+        ));
+    }
+    let root: Vec<u16> = format!("{}:\\", char::from(drive))
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    check_bundle_budget(deadline)?;
+    if !matches!(drive_type, 2 | 3) {
+        return Err(io::Error::other(
+            "Runtime bundle cannot use a network or unknown disk",
+        ));
+    }
+    // Reject junctions/symlinks in the directories too, before canonicalize
+    // could follow one onto a network path.
+    let ancestors: Vec<_> = path.ancestors().collect();
+    for ancestor in ancestors.into_iter().rev() {
+        check_bundle_budget(deadline)?;
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        check_bundle_budget(deadline)?;
+        if is_reparse(&metadata) {
+            return Err(io::Error::other(
+                "Runtime bundle path contains a reparse point",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_stable_bundle(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> io::Result<(std::fs::File, FileIdentity)> {
+    check_local_bundle_path(path, deadline)?;
     let before = std::fs::symlink_metadata(path)?;
+    check_bundle_budget(deadline)?;
     if is_reparse(&before) || !before.is_file() {
         return Err(io::Error::other(
             "Runtime bundle path is a reparse point or not a regular file",
@@ -63,9 +124,13 @@ fn open_stable_bundle(path: &std::path::Path) -> io::Result<(std::fs::File, File
     let file = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0x0000_0001)
+        .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT: never follow a replaced leaf.
         .open(path)?;
+    check_bundle_budget(deadline)?;
     let identity = handle_identity(&file)?;
+    check_bundle_budget(deadline)?;
     let opened = file.metadata()?;
+    check_bundle_budget(deadline)?;
     if is_reparse(&opened) || !opened.is_file() {
         return Err(io::Error::other(
             "opened Runtime bundle is not a bounded regular file",
@@ -78,9 +143,13 @@ fn open_stable_bundle(path: &std::path::Path) -> io::Result<(std::fs::File, File
     let probe = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0x0000_0001)
+        .custom_flags(0x0020_0000)
         .open(path)?;
+    check_bundle_budget(deadline)?;
     let probe_identity = handle_identity(&probe)?;
+    check_bundle_budget(deadline)?;
     let after = std::fs::symlink_metadata(path)?;
+    check_bundle_budget(deadline)?;
     if is_reparse(&after) || probe_identity != identity {
         return Err(io::Error::other(
             "Runtime bundle path identity changed during open",
@@ -89,44 +158,82 @@ fn open_stable_bundle(path: &std::path::Path) -> io::Result<(std::fs::File, File
     Ok((file, identity))
 }
 
-fn hash_bundle_handle(file: &mut std::fs::File) -> io::Result<String> {
-    use sha2::{Digest, Sha256};
+fn hash_bundle_handle(
+    file: &mut std::fs::File,
+    deadline: std::time::Instant,
+) -> io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 
+    check_bundle_budget(deadline)?;
     let metadata = file.metadata()?;
+    check_bundle_budget(deadline)?;
     if !metadata.is_file() || is_reparse(&metadata) || metadata.len() > MAX_BUNDLE_BYTES {
         return Err(io::Error::other(
             "Runtime bundle is not a bounded regular file",
         ));
     }
     file.seek(SeekFrom::Start(0))?;
-    let mut input = file.take(MAX_BUNDLE_BYTES + 1);
+    check_bundle_budget(deadline)?;
+    hash_bundle_stream(file.take(MAX_BUNDLE_BYTES + 1), deadline)
+}
+
+fn hash_bundle_stream(
+    mut input: impl std::io::Read,
+    deadline: std::time::Instant,
+) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
     let mut total = 0u64;
     loop {
+        check_bundle_budget(deadline)?;
         let count = input.read(&mut buffer)?;
+        check_bundle_budget(deadline)?;
         if count == 0 {
             break;
         }
         total = total.saturating_add(count as u64);
-        if total > MAX_BUNDLE_BYTES {
+        if total > 64 * 1024 * 1024 {
             return Err(io::Error::other("Runtime bundle exceeds 64 MiB"));
         }
         hash.update(&buffer[..count]);
+        check_bundle_budget(deadline)?;
     }
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// Cooperative budget checks surround synchronous local filesystem operations.
+/// Windows open/metadata/read calls cannot be interrupted by this deadline; an
+/// individual stalled OS call may return after it, at which point we fail closed.
 fn retain_bundles(
     leases: &mut Vec<BundleLease>,
     facts: &[MemberRuntimeIdentity],
+    deadline: std::time::Instant,
 ) -> io::Result<()> {
+    retain_bundles_with_canonicalize(leases, facts, deadline, |path| std::fs::canonicalize(path))
+}
+
+fn retain_bundles_with_canonicalize(
+    leases: &mut Vec<BundleLease>,
+    facts: &[MemberRuntimeIdentity],
+    deadline: std::time::Instant,
+    mut canonicalize: impl FnMut(&std::path::Path) -> io::Result<PathBuf>,
+) -> io::Result<()> {
+    check_bundle_budget(deadline)?;
     for fact in facts {
-        let path = std::fs::canonicalize(&fact.module_path)?;
+        // Pin the authenticated path before resolving aliases: canonicalization
+        // must never silently switch ownership to a different file with equal bytes.
+        let (mut file, identity) = open_stable_bundle(&fact.module_path, deadline)?;
+        let path = canonicalize(&fact.module_path)?;
+        check_bundle_budget(deadline)?;
+        let (_probe, canonical_identity) = open_stable_bundle(&path, deadline)?;
+        if canonical_identity != identity {
+            return Err(io::Error::other(
+                "Runtime bundle identity changed during canonicalization",
+            ));
+        }
         if let Some(lease) = leases.iter().find(|lease| lease.path == path) {
-            let (_probe, identity) = open_stable_bundle(&fact.module_path)?;
             if identity != lease.identity {
                 return Err(io::Error::other(
                     "Runtime bundle path identity changed while retained",
@@ -144,8 +251,7 @@ fn retain_bundles(
         // both a live instance's exact bundle from becoming delete-pending and
         // a concurrent writer from replacing its bytes while its Runtime may
         // still be mapped in a target process.
-        let (mut file, identity) = open_stable_bundle(&fact.module_path)?;
-        let sha256 = hash_bundle_handle(&mut file)?;
+        let sha256 = hash_bundle_handle(&mut file, deadline)?;
         if sha256 != fact.module_sha256 {
             return Err(io::Error::other(
                 "Runtime bundle hash does not match authenticated Runtime identity",
@@ -236,6 +342,7 @@ fn sealed_member_evidence_complete(result: &RunResult) -> bool {
 }
 
 struct OwnedRun {
+    stop_failed: bool,
     retry_recovery: bool,
     _snapshot: Option<RunSnapshot>,
     _recovered_broker: Option<envbox_launcher::HostBroker>,
@@ -338,6 +445,7 @@ impl Runs {
                 }
             }
             let mut run = OwnedRun {
+                stop_failed: false,
                 retry_recovery: false,
                 _snapshot: record.snapshot,
                 _recovered_broker: None,
@@ -406,9 +514,21 @@ impl Runs {
             let Some(job) = run.job.as_ref() else {
                 continue;
             };
+            let path = self
+                .store
+                .root()
+                .join("containers")
+                .join(run.command.container_id.to_string())
+                .join("runs")
+                .join(format!("{}.json", run.command.instance_id));
             match job.stats() {
-                Err(_) => {
-                    run.result.state = "TrackingLost".into();
+                Err(error) => {
+                    persist_tracking_loss(
+                        &path,
+                        &mut run.result,
+                        format!("Job inspection failed: {error}"),
+                        false,
+                    );
                 }
                 Ok(stats) if stats.active_processes == 0 => {
                     if run.result.state != "Stopping" {
@@ -438,6 +558,11 @@ impl Runs {
                     run.job.take();
                 }
                 Ok(stats) => {
+                    // Only an explicit successful Stop retry or fresh recovery can
+                    // clear a failed termination; membership alone proves no control.
+                    if run.stop_failed {
+                        continue;
+                    }
                     let members: Vec<_> = stats
                         .process_ids
                         .into_iter()
@@ -445,7 +570,19 @@ impl Runs {
                         .collect();
                     // Re-read membership so a PID observed after an exit/reuse is
                     // never registered as an owned target solely from a stale list.
-                    if let Ok(confirmed) = job.stats() {
+                    let confirmed = match job.stats() {
+                        Ok(confirmed) => confirmed,
+                        Err(error) => {
+                            persist_tracking_loss(
+                                &path,
+                                &mut run.result,
+                                format!("Job membership confirmation failed: {error}"),
+                                false,
+                            );
+                            continue;
+                        }
+                    };
+                    {
                         let members: Vec<_> = members
                             .into_iter()
                             .filter(|member| confirmed.process_ids.contains(&member.pid))
@@ -468,27 +605,37 @@ impl Runs {
                         let facts = match member_facts(run, &run.members) {
                             Ok(facts) => facts,
                             Err(error) => {
-                                if run.result.state != "Stopping" {
-                                    run.result.state = "TrackingLost".into();
-                                }
-                                run.result.error =
-                                    Some(format!("member Runtime verification: {error}"));
+                                persist_tracking_loss(
+                                    &path,
+                                    &mut run.result,
+                                    format!("member Runtime verification: {error}"),
+                                    true,
+                                );
                                 continue;
                             }
                         };
-                        if let Err(error) = retain_bundles(&mut run._bundle_leases, &facts) {
-                            if run.result.state != "Stopping" {
-                                run.result.state = "TrackingLost".into();
-                            }
-                            run.result.error =
-                                Some(format!("Runtime bundle retention failed: {error}"));
+                        if let Err(error) = retain_bundles(
+                            &mut run._bundle_leases,
+                            &facts,
+                            std::time::Instant::now() + std::time::Duration::from_secs(4),
+                        ) {
+                            persist_tracking_loss(
+                                &path,
+                                &mut run.result,
+                                format!("Runtime bundle retention failed: {error}"),
+                                true,
+                            );
                             continue;
                         }
                         let verified_job = match job.stats() {
                             Ok(stats) => stats,
                             Err(error) => {
-                                run.result.state = "TrackingLost".into();
-                                run.result.error = Some(error.to_string());
+                                persist_tracking_loss(
+                                    &path,
+                                    &mut run.result,
+                                    format!("Job Runtime sealing inspection failed: {error}"),
+                                    false,
+                                );
                                 continue;
                             }
                         };
@@ -498,9 +645,12 @@ impl Runs {
                                     || ManagedTarget::observe(member.pid).ok() != Some(*member)
                             })
                         {
-                            run.result.state = "TrackingLost".into();
-                            run.result.error =
-                                Some("Job membership changed while sealing Runtime facts".into());
+                            persist_tracking_loss(
+                                &path,
+                                &mut run.result,
+                                "Job membership changed while sealing Runtime facts".into(),
+                                false,
+                            );
                             continue;
                         }
                         let next_state = if run.result.state == "Stopping" {
@@ -528,9 +678,12 @@ impl Runs {
                             match atomic_record(&path, &next) {
                                 Ok(()) => run.result = next,
                                 Err(error) => {
-                                    run.result.state = "TrackingLost".into();
-                                    run.result.error =
-                                        Some(format!("membership journal persistence: {error}"));
+                                    persist_tracking_loss(
+                                        &path,
+                                        &mut run.result,
+                                        format!("membership journal persistence: {error}"),
+                                        false,
+                                    );
                                 }
                             }
                         }
@@ -545,6 +698,19 @@ impl Runs {
         operation: &str,
         container: Option<Uuid>,
         command: Option<&RunCommand>,
+    ) -> (String, Vec<RunView>) {
+        self.control_with_terminate(request_id, operation, container, command, |job| {
+            job.terminate()
+                .map_err(|error| io::Error::other(error.to_string()))
+        })
+    }
+    fn control_with_terminate(
+        &mut self,
+        request_id: &str,
+        operation: &str,
+        container: Option<Uuid>,
+        command: Option<&RunCommand>,
+        mut terminate: impl FnMut(&InstanceJob) -> io::Result<()>,
     ) -> (String, Vec<RunView>) {
         if let Some(container) = container {
             self.retry_scope(container);
@@ -634,13 +800,29 @@ impl Runs {
             for id in &selected {
                 let run = self.running.get_mut(id).unwrap();
                 if let Some(job) = run.job.as_ref() {
-                    match job.terminate() {
+                    match terminate(job) {
                         Ok(()) => {
+                            if run.stop_failed {
+                                run.result.error = None;
+                            }
+                            run.stop_failed = false;
                             run.result.state = "Stopping".into();
                         }
                         Err(error) => {
-                            run.result.state = "TrackingLost".into();
-                            run.result.error = Some(error.to_string());
+                            run.stop_failed = true;
+                            let path = self
+                                .store
+                                .root()
+                                .join("containers")
+                                .join(run.command.container_id.to_string())
+                                .join("runs")
+                                .join(format!("{}.json", run.command.instance_id));
+                            persist_tracking_loss(
+                                &path,
+                                &mut run.result,
+                                format!("Job termination failed: {error}"),
+                                false,
+                            );
                         }
                     }
                 }
@@ -878,7 +1060,11 @@ impl Runs {
             }
         };
         let mut bundle_leases = Vec::new();
-        if let Err(error) = retain_bundles(&mut bundle_leases, &result.member_runtimes) {
+        if let Err(error) = retain_bundles(
+            &mut bundle_leases,
+            &result.member_runtimes,
+            std::time::Instant::now() + std::time::Duration::from_secs(4),
+        ) {
             return Err(self.cleanup_failed_start(
                 command,
                 &snapshot,
@@ -893,6 +1079,7 @@ impl Runs {
         self.running.insert(
             command.instance_id,
             OwnedRun {
+                stop_failed: false,
                 retry_recovery: false,
                 _snapshot: Some(snapshot),
                 _recovered_broker: None,
@@ -914,12 +1101,35 @@ impl Runs {
         &mut self,
         command: &RunCommand,
         snapshot: &RunSnapshot,
-        mut pending: RunResult,
+        pending: RunResult,
         job: InstanceJob,
         record: &std::path::Path,
         cause: String,
     ) -> io::Error {
-        let terminated = job.terminate();
+        self.cleanup_failed_start_with_terminate(
+            command,
+            snapshot,
+            pending,
+            job,
+            record,
+            cause,
+            |job| {
+                job.terminate()
+                    .map_err(|error| io::Error::other(error.to_string()))
+            },
+        )
+    }
+    fn cleanup_failed_start_with_terminate(
+        &mut self,
+        command: &RunCommand,
+        snapshot: &RunSnapshot,
+        mut pending: RunResult,
+        job: InstanceJob,
+        record: &std::path::Path,
+        cause: String,
+        terminate: impl FnOnce(&InstanceJob) -> io::Result<()>,
+    ) -> io::Error {
+        let terminated = terminate(&job);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let empty = loop {
             match job.stats() {
@@ -934,18 +1144,20 @@ impl Runs {
             let _ = std::fs::remove_file(record);
             return io::Error::other(cause);
         }
-        pending.state = "TrackingLost".into();
         pending.entry_guarantee = "unverified".into();
-        pending.error = Some(format!(
-            "{cause}; startup cleanup could not confirm empty Job"
-        ));
-        let _ = atomic_record(record, &pending);
+        persist_tracking_loss(
+            record,
+            &mut pending,
+            format!("{cause}; startup cleanup could not confirm empty Job"),
+            false,
+        );
         let error = pending.error.clone().unwrap();
         // Keep the exclusive Job owner available for a subsequent explicit Stop.
         // Neither a failed cleanup nor a disconnected client releases live ownership.
         self.running.insert(
             command.instance_id,
             OwnedRun {
+                stop_failed: terminated.is_err(),
                 retry_recovery: false,
                 _snapshot: Some(snapshot.clone()),
                 _recovered_broker: None,
@@ -1250,7 +1462,6 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         ));
     }
     let sealed = sealed_member_facts(&result, &members)?;
-    let mut checked_bundles: HashMap<std::path::PathBuf, String> = HashMap::new();
     for fact in &sealed {
         if fact.config_sha256 != result.runtime_config_sha256
             || fact.runtime_version != env!("CARGO_PKG_VERSION")
@@ -1259,24 +1470,12 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
                 "sealed member configuration or Runtime version is unsupported",
             ));
         }
-        let hash = if let Some(hash) = checked_bundles.get(&fact.module_path) {
-            hash.clone()
-        } else {
-            let hash = bounded_bundle_hash(&fact.module_path, deadline)?;
-            checked_bundles.insert(fact.module_path.clone(), hash.clone());
-            hash
-        };
-        if hash != fact.module_sha256 {
-            return Err(io::Error::other(
-                "sealed member Runtime bundle hash changed",
-            ));
-        }
     }
     // Acquire the leases before reconnecting any target. If a later
     // reconnection check fails, the run remains TrackingLost but its exact
     // bundle paths stay protected while the original process generations are
     // still present.
-    retain_bundles(&mut run._bundle_leases, &sealed)?;
+    retain_bundles(&mut run._bundle_leases, &sealed, deadline)?;
     let mut table = SessionTable::new();
     table.set_instance_id(&run.command.instance_id.to_string());
     table.register_profile_flags(
@@ -1361,58 +1560,27 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
     Ok(())
 }
 
-fn bounded_bundle_hash(path: &std::path::Path, deadline: std::time::Instant) -> io::Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::os::windows::fs::MetadataExt;
-    use std::{
-        io::Read,
-        path::{Component, Prefix},
-    };
-    if std::time::Instant::now() >= deadline {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "bounded recovery budget exhausted",
+/// Keep the last sealed member identities; failed verification must not seal
+/// newly observed members as recoverable ownership evidence.
+fn persist_tracking_loss(
+    path: &std::path::Path,
+    result: &mut RunResult,
+    reason: String,
+    preserve_stopping: bool,
+) {
+    if !preserve_stopping || result.state != "Stopping" {
+        result.state = "TrackingLost".into();
+    }
+    result.error = Some(reason);
+    if let Err(error) = atomic_record(path, result) {
+        result.error = Some(format!(
+            "{}; ownership loss journal persistence failed: {error}",
+            result
+                .error
+                .as_deref()
+                .unwrap_or("ownership tracking failed")
         ));
     }
-    if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
-    {
-        return Err(io::Error::other(
-            "Runtime bundle must be a local disk file within recovery budget",
-        ));
-    }
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || metadata.file_attributes() & 0x400 != 0
-        || metadata.len() > 64 * 1024 * 1024
-    {
-        return Err(io::Error::other(
-            "Runtime bundle is not a bounded plain PE file",
-        ));
-    }
-    let mut file = std::fs::File::open(path)?.take(64 * 1024 * 1024 + 1);
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 65536];
-    let mut total = 0usize;
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Runtime bundle hash exceeded recovery budget",
-            ));
-        }
-        let size = file.read(&mut buffer)?;
-        if size == 0 {
-            break;
-        }
-        total += size;
-        if total > 64 * 1024 * 1024 {
-            return Err(io::Error::other(
-                "Runtime bundle exceeds bounded image size",
-            ));
-        }
-        hash.update(&buffer[..size]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn atomic_record(path: &std::path::Path, result: &RunResult) -> io::Result<()> {
@@ -1513,6 +1681,543 @@ pub(crate) fn failed(command: &RunCommand, error: &str) -> (String, RunResult) {
 #[cfg(test)]
 mod member_evidence_tests {
     use super::*;
+
+    #[test]
+    fn bundle_resolution_is_bound_to_the_original_stable_file_identity() {
+        use sha2::Digest;
+        let root = std::env::temp_dir().join(format!("aura-lease-resolution-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let original = root.join("original.dll");
+        let replacement = root.join("replacement.dll");
+        std::fs::write(&original, b"same fixture bytes").unwrap();
+        std::fs::write(&replacement, b"same fixture bytes").unwrap();
+        let mut fact = record(3).member_runtimes.remove(0);
+        fact.module_path = original.clone();
+        fact.module_sha256 = format!("{:x}", sha2::Sha256::digest(b"same fixture bytes"));
+        let mut leases = Vec::new();
+        let error = retain_bundles_with_canonicalize(
+            &mut leases,
+            &[fact],
+            std::time::Instant::now() + std::time::Duration::from_secs(4),
+            |path| {
+                assert_eq!(path, original);
+                assert!(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&original)
+                        .is_err(),
+                    "original must be pinned before resolution"
+                );
+                assert!(
+                    std::fs::remove_file(&original).is_err(),
+                    "original must deny replacement before resolution"
+                );
+                // A resolver/directory race returns another actual file containing
+                // the same bytes. A matching hash cannot authorize its different ID.
+                std::fs::canonicalize(&replacement)
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("identity changed during canonicalization"));
+        assert!(leases.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_stop_is_persisted_and_stays_lost_until_an_explicit_retry() {
+        use std::os::windows::process::CommandExt;
+        use windows::{
+            core::PCWSTR,
+            Win32::{
+                Foundation::{CloseHandle, HANDLE},
+                System::JobObjects::{OpenJobObjectW, TerminateJobObject},
+            },
+        };
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct QueryHandle(HANDLE);
+        impl Drop for QueryHandle {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+        let root = std::env::temp_dir().join(format!("aura-stop-failure-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&root);
+        let mut result = record(3);
+        result.state = "Running".into();
+        result.error = None;
+        let command = RunCommand {
+            container_id: result.container_id,
+            instance_id: result.instance_id,
+            application_id: result.application_id,
+        };
+        let path = root
+            .join("containers")
+            .join(command.container_id.to_string())
+            .join("runs")
+            .join(format!("{}.json", command.instance_id));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        atomic_record(&path, &result).unwrap();
+        let child = Child(
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 60",
+                ])
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .unwrap(),
+        );
+        let name = format!("Local\\AuraStopTest-{}", Uuid::new_v4());
+        let mut job = InstanceJob::create_named_exclusive(&name).unwrap();
+        job.assign_pid(child.0.id()).unwrap();
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let query_only =
+            QueryHandle(unsafe { OpenJobObjectW(0x0004, false, PCWSTR(wide.as_ptr())).unwrap() });
+        let mut runs = Runs {
+            recovery_error: None,
+            generation: "fixture".into(),
+            store,
+            targets: Arc::new(Mutex::new(HashSet::new())),
+            running: HashMap::new(),
+            requests: HashMap::new(),
+            control_requests: HashMap::new(),
+        };
+        runs.running.insert(
+            command.instance_id,
+            OwnedRun {
+                stop_failed: false,
+                retry_recovery: false,
+                _snapshot: None,
+                _recovered_broker: None,
+                _bundle_leases: vec![],
+                command: command.clone(),
+                result,
+                session: None,
+                job: Some(job),
+                members: vec![],
+            },
+        );
+        let response = runs.control_with_terminate(
+            "denied-stop",
+            "Stop",
+            Some(command.container_id),
+            Some(&command),
+            |_| {
+                unsafe { TerminateJobObject(query_only.0, 1) }
+                    .map_err(|_| io::Error::last_os_error())
+            },
+        );
+        assert_eq!(response.0, "Partial");
+        let sealed: RunResult = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(sealed.state, "TrackingLost");
+        assert!(sealed
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Job termination failed"));
+        runs.refresh();
+        assert_eq!(
+            runs.running[&command.instance_id].result.error, sealed.error,
+            "refresh must retain the termination failure"
+        );
+        assert_eq!(
+            runs.control(
+                "denied-stop",
+                "Stop",
+                Some(command.container_id),
+                Some(&command)
+            )
+            .0,
+            "Partial"
+        );
+        // The same real access-denied termination also exercises startup cleanup.
+        // Locking the journal makes its atomic replacement fail on Windows.
+        let owned = runs.running.remove(&command.instance_id).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let profile = envbox_core::EnvironmentProfile {
+            id: Uuid::new_v4(),
+            name: "cleanup fixture".into(),
+            locale: envbox_core::LocaleProfile {
+                locale_name: "en-US".into(),
+                ui_language: "en-US".into(),
+                region: "US".into(),
+            },
+            timezone: envbox_core::TimezoneProfile {
+                windows_id: "Pacific Standard Time".into(),
+                iana_id: "America/Los_Angeles".into(),
+            },
+            dns: Default::default(),
+            environment: Default::default(),
+            registry: Default::default(),
+            browser: Default::default(),
+        };
+        let mut container = envbox_core::Container::new("cleanup", profile.id);
+        container.id = command.container_id;
+        let snapshot = RunSnapshot::new(&container, &profile, command.instance_id).unwrap();
+        let cleanup_error = runs.cleanup_failed_start_with_terminate(
+            &command,
+            &snapshot,
+            owned.result,
+            owned.job.unwrap(),
+            &path,
+            "startup failed".into(),
+            |_| {
+                unsafe { TerminateJobObject(query_only.0, 1) }
+                    .map_err(|_| io::Error::last_os_error())
+            },
+        );
+        assert!(cleanup_error
+            .to_string()
+            .contains("ownership loss journal persistence failed"));
+        assert!(runs.running[&command.instance_id]
+            .result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("ownership loss journal persistence failed"));
+        drop(held);
+        let unchanged: RunResult = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            unchanged.error, sealed.error,
+            "failed cleanup write must preserve the previous sealed journal"
+        );
+        assert_eq!(
+            runs.control(
+                "retry-stop",
+                "Stop",
+                Some(command.container_id),
+                Some(&command)
+            )
+            .0,
+            "Ok"
+        );
+        assert_eq!(runs.running[&command.instance_id].result.state, "Stopped");
+        drop(runs);
+        drop(query_only);
+        drop(child);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundle_budget_expiry_refuses_retention_before_path_access() {
+        let mut leases = Vec::new();
+        let mut fact = record(3).member_runtimes.remove(0);
+        fact.module_path = r"\\unreachable.invalid\share\bundle.dll".into();
+        let error = retain_bundles(&mut leases, &[fact], std::time::Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn bundle_paths_refuse_network_device_relative_and_parent_traversal() {
+        for path in [
+            r"\\unreachable.invalid\share\bundle.dll",
+            r"\\?\UNC\unreachable.invalid\share\bundle.dll",
+            r"\\.\PIPE\bundle",
+            r"bundle.dll",
+            r"C:bundle.dll",
+            r"C:\fixture\..\bundle.dll",
+        ] {
+            let error = check_local_bundle_path(
+                std::path::Path::new(path),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other, "{path}");
+            assert!(
+                error.to_string().contains("local disk")
+                    || error
+                        .to_string()
+                        .contains("absolute without parent traversal")
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_paths_refuse_directory_junction_before_canonicalization() {
+        use std::os::windows::process::CommandExt;
+        let root = std::env::temp_dir().join(format!("aura-lease-junction-{}", Uuid::new_v4()));
+        let target = root.join("plain");
+        let junction = root.join("redirect");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("bundle.dll"), b"fixture bundle").unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg(format!(
+                "/D /C mklink /J \"{}\" \"{}\"",
+                junction.display(),
+                target.display()
+            ))
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let error = check_local_bundle_path(
+            &junction.join("bundle.dll"),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reparse point"));
+        std::fs::remove_dir(&junction).unwrap();
+        assert!(target.join("bundle.dll").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundle_read_that_returns_after_short_deadline_is_not_accepted() {
+        struct DelayedRead;
+        impl std::io::Read for DelayedRead {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                output[0] = 1;
+                Ok(1)
+            }
+        }
+        let error = hash_bundle_stream(
+            DelayedRead,
+            std::time::Instant::now() + std::time::Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn refresh_persists_unverified_member_loss_before_restart() {
+        use std::os::windows::process::CommandExt;
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = std::env::temp_dir().join(format!("aura-refresh-loss-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&root);
+        let mut result = record(3);
+        result.state = "Running".into();
+        result.error = None;
+        let command = RunCommand {
+            container_id: result.container_id,
+            instance_id: result.instance_id,
+            application_id: result.application_id,
+        };
+        let path = root
+            .join("containers")
+            .join(command.container_id.to_string())
+            .join("runs")
+            .join(format!("{}.json", command.instance_id));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        atomic_record(&path, &result).unwrap();
+        let mut child = Child(
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 60",
+                ])
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .unwrap(),
+        );
+        let mut job =
+            InstanceJob::create_named_exclusive(&format!("Local\\AuraLossTest-{}", Uuid::new_v4()))
+                .unwrap();
+        job.assign_pid(child.0.id()).unwrap();
+        let targets = Arc::new(Mutex::new(HashSet::new()));
+        let mut runs = Runs {
+            recovery_error: None,
+            generation: "fixture-generation".into(),
+            store: store.clone(),
+            targets: targets.clone(),
+            running: HashMap::new(),
+            requests: HashMap::new(),
+            control_requests: HashMap::new(),
+        };
+        runs.running.insert(
+            command.instance_id,
+            OwnedRun {
+                stop_failed: false,
+                retry_recovery: false,
+                _snapshot: None,
+                _recovered_broker: None,
+                _bundle_leases: vec![],
+                command: command.clone(),
+                result,
+                session: None,
+                job: Some(job),
+                members: vec![],
+            },
+        );
+        let mut other = record(3);
+        other.state = "Running".into();
+        other.error = None;
+        let other_command = RunCommand {
+            container_id: other.container_id,
+            instance_id: other.instance_id,
+            application_id: other.application_id,
+        };
+        let other_path = root
+            .join("containers")
+            .join(other.container_id.to_string())
+            .join("runs")
+            .join(format!("{}.json", other.instance_id));
+        std::fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+        atomic_record(&other_path, &other).unwrap();
+        runs.running.insert(
+            other.instance_id,
+            OwnedRun {
+                stop_failed: false,
+                retry_recovery: false,
+                _snapshot: None,
+                _recovered_broker: None,
+                _bundle_leases: vec![],
+                command: other_command.clone(),
+                result: other,
+                session: None,
+                job: Some(InstanceJob::create().unwrap()),
+                members: vec![],
+            },
+        );
+        runs.refresh();
+        let sealed: RunResult = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            sealed.state, "TrackingLost",
+            "loss must reach the journal immediately"
+        );
+        assert!(sealed
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("member Runtime verification"));
+        assert_eq!(
+            sealed.known_members,
+            runs.running[&command.instance_id].result.known_members
+        );
+        assert_eq!(runs.query(&other_command).0, "Exited");
+        assert_eq!(
+            runs.control(
+                "stop-other",
+                "Stop",
+                Some(other_command.container_id),
+                Some(&other_command)
+            )
+            .0,
+            "Ok"
+        );
+        let sealed_other: RunResult =
+            serde_json::from_slice(&std::fs::read(&other_path).unwrap()).unwrap();
+        assert_eq!(
+            sealed_other.state, "Exited",
+            "A loss must not overwrite B's terminal journal"
+        );
+        drop(runs);
+        let mut restarted = Runs::new(store, targets, "next-generation".into());
+        assert_eq!(
+            restarted.running[&command.instance_id].result.state,
+            "TrackingLost"
+        );
+        assert!(restarted.running[&command.instance_id].job.is_none());
+        assert_eq!(
+            restarted
+                .control(
+                    "stop-unknown",
+                    "Stop",
+                    Some(command.container_id),
+                    Some(&command)
+                )
+                .0,
+            "NotControlled"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "restart must not terminate an unknown member"
+        );
+        drop(restarted);
+        drop(child);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loss_journal_write_failure_is_visible_and_keeps_the_last_sealed_record() {
+        let root = std::env::temp_dir().join(format!("aura-loss-write-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("run.json");
+        let mut result = record(3);
+        result.state = "Running".into();
+        result.error = None;
+        atomic_record(&path, &result).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        persist_tracking_loss(
+            &path,
+            &mut result,
+            "member generation changed".into(),
+            false,
+        );
+        assert_eq!(result.state, "TrackingLost");
+        let reason = result.error.as_deref().unwrap();
+        assert!(reason.contains("member generation changed"));
+        assert!(reason.contains("ownership loss journal persistence failed"));
+        drop(held);
+        let sealed: RunResult = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            sealed.state, "Running",
+            "failed write must not corrupt the sealed record"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "failed atomic writes must clean their temporary files"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn member_failure_during_stop_preserves_stopping_and_persists_the_reason() {
+        let root = std::env::temp_dir().join(format!("aura-stopping-loss-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("run.json");
+        let mut result = record(3);
+        result.state = "Stopping".into();
+        persist_tracking_loss(
+            &path,
+            &mut result,
+            "Runtime bundle retention failed".into(),
+            true,
+        );
+        let sealed: RunResult = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(sealed.state, "Stopping");
+        assert_eq!(sealed.error, result.error);
+        assert!(sealed
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Runtime bundle retention failed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn record(schema: u32) -> RunResult {
         let command = RunCommand {
             container_id: Uuid::new_v4(),
@@ -1668,6 +2373,7 @@ mod member_evidence_tests {
                 config_sha256: String::new(),
                 runtime_version: String::new(),
             }],
+            std::time::Instant::now() + std::time::Duration::from_secs(4),
         )
         .unwrap();
         assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
@@ -1685,6 +2391,7 @@ mod member_evidence_tests {
                 config_sha256: String::new(),
                 runtime_version: String::new(),
             }],
+            std::time::Instant::now() + std::time::Duration::from_secs(4),
         )
         .is_err());
         std::fs::remove_file(&path).unwrap();

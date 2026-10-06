@@ -36,6 +36,13 @@ static int InstallAllHooks() {
   }
   ok += g_hook_counts[7] = EnvBoxInstallRegistryHooks();
   ok += g_hook_counts[8] = EnvBoxInstallProcessHooks();
+  if (g_hook_counts[8] < 0 ||
+      (EnvBoxControlledStartup() && g_hook_counts[8] != 4)) {
+    // Controlled child paths include an explicit WithToken refusal. Losing
+    // any process hook must fail initialization before application entry.
+    DetourTransactionAbort();
+    return 0;
+  }
   // Strict Network Guard is NOT Fail Open: incomplete attach must abort the
   // process (Startup Fail Policy) instead of silently running without UDP deny.
   if (!(g_hook_counts[9] = EnvBoxInstallNetworkHooks())) {

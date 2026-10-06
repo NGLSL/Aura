@@ -90,10 +90,18 @@ The script builds x64 and Win32/i686 product static libraries in an isolated tar
 This is a positive/negative native policy probe with process-local API tripwires, not global packet capture. A Standard success demonstrates the configured literal endpoint, URL identity and production trust for this Windows installation. StrictOffline `revocation_unknown` is an expected policy negative here. Other typed failures retain their reasons. The result does not prove every Cryptnet/AFD path is absent and does not establish an OS-version matrix.
 
 The separate CMake target `config-policy-probe` compiles the production Runtime
-DNS configuration decoder directly. Run its Release executable in a fresh,
-uninjected process after building that target for x64 or Win32. Its seven cases
+DNS configuration decoder directly. `run.ps1` now executes it automatically
+for both architectures in the fresh WMI worker and requires its successful
+exit and all seven assertions. Its path, SHA-256, exit and raw log are recorded
+under `cases[].config_policy`; `config_policy_pass` is a required harness gate.
+It can also be run independently in a fresh, uninjected process. Its seven cases
 check complete Standard/StrictOffline wire roundtrips, rejection of missing or
 unknown TLS policy, rejection of VirtualView `strict=0` and `false`, and Host
 mode compatibility. It returns nonzero on any failed assertion; it does not
-contact DNS services or load a Runtime DLL. This configuration test is separate
-from the public native transport acceptance results.
+contact DNS services or load a Runtime DLL.
+
+IPv6 network tests are deferred by default and do not block the current IPv4
+scope. `ipv6_deferred=true` and four explicit deferred records distinguish this
+from a pass. `-IncludeIPv6` opts into the later IPv6 diagnostic scope. The
+selected-scope `wire_positive` result does not replace the separate whole-host
+observation gate, which still requires its own evidence.

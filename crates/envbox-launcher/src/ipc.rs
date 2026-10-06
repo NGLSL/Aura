@@ -1210,7 +1210,9 @@ impl SessionTable {
             ("language", 6),
             ("registry", 7),
             ("dns", if dns_mode { 15 } else { 2 }),
-            ("process", 3),
+            // W/A, AsUser and the controlled WithToken refusal are required.
+            // An old three-hook bundle cannot claim this child boundary.
+            ("process", 4),
             ("network_policy", 1),
         ] {
             let counts: Vec<_> = id.hooks.iter().filter(|(name, _)| name == group).collect();
@@ -1820,6 +1822,43 @@ mod tests {
             profile.registry.whitelist_paths
         );
         assert_eq!(decoded.browser.webrtc, profile.browser.webrtc);
+    }
+
+    #[test]
+    fn runtime_without_with_token_boundary_cannot_be_accepted() {
+        let mut observed = ObservedRuntimeIdentity {
+            identity: RuntimeIdentity {
+                pid: 1,
+                creation_time: 1,
+                protocol: RUNTIME_IDENTITY_PROTOCOL,
+                runtime_version: env!("CARGO_PKG_VERSION").into(),
+                module_path: "fixture-runtime.dll".into(),
+                actual_profile: "PROFILE profile_id=p instance_id=i locale_name=en-US ui_language=en-US region=US tz_windows=UTC tz_iana=Etc/UTC inherit_children=1 audit=0 webrtc=host dns_mode=0".into(),
+                config_complete: true,
+                hooks: [
+                    ("time", 8), ("geo", 2), ("locale", 14), ("language", 6),
+                    ("registry", 7), ("dns", 2), ("process", 3),
+                    ("network_policy", 1),
+                ].into_iter().map(|(name, count)| (name.into(), count)).collect(),
+            },
+            module_sha256: "fixture".into(),
+            config_sha256: "fixture".into(),
+        };
+        let rejected = SessionTable::validate_observation(&observed).unwrap_err();
+        assert!(rejected
+            .to_string()
+            .contains("required hook set incomplete: process"));
+        observed
+            .identity
+            .hooks
+            .iter_mut()
+            .find(|(name, _)| name == "process")
+            .unwrap()
+            .1 = 4;
+        assert!(SessionTable::validate_observation(&observed).is_ok());
+        // Duplicating a count does not establish another attached API.
+        observed.identity.hooks.push(("process".into(), 4));
+        assert!(SessionTable::validate_observation(&observed).is_err());
     }
 
     #[test]

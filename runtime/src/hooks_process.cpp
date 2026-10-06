@@ -16,9 +16,16 @@
 #include "audit.h"
 #include "ipc_bootstrap.h"
 
+static bool g_controlled_startup = false;
+static bool g_startup_policy_latched = false;
+static bool g_startup_policy_valid = false;
+
+bool EnvBoxControlledStartup() {
+  return g_controlled_startup;
+}
+
 static bool ControlledStartup() {
-  wchar_t value[8] = {};
-  return GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE", value, 8) == 1 && value[0] == L'1';
+  return EnvBoxControlledStartup();
 }
 
 // --- Browser / Network Guard (ticket 54): Child Guard decision table ----------
@@ -418,8 +425,7 @@ static bool UpsertProfileKeys(std::vector<wchar_t>* block) {
   if (recovery_length > 0) upsert(L"ENVBOX_RECOVERY_JOB_NAME", recovery_job);
   // A caller-supplied environment cannot silently remove a controlled
   // parent's entry gate from its child.
-  wchar_t gate[8] = {};
-  if (GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE", gate, 8) == 1 && gate[0] == L'1') {
+  if (ControlledStartup()) {
     upsert(L"ENVBOX_STARTUP_GATE", L"1");
   }
 
@@ -567,8 +573,7 @@ static BOOL SpawnInjected(
   // for its Profile during DllMain, so notifying after ResumeThread races and
   // can return an empty Profile.
   if (lpProcessInformation != nullptr) {
-    wchar_t gate[8] = {};
-    bool controlled = GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE", gate, 8) == 1 && gate[0] == L'1';
+    bool controlled = ControlledStartup();
     // A complete broker Profile requires a sealed child DLL expectation even
     // without an entry gate: its loader must receive a real identity ACK.
     bool requires_binding = controlled || EnvBoxProfileEnvironmentComplete();
@@ -695,6 +700,32 @@ static BOOL WINAPI HookCreateProcessAsUserW(
       CreateProcessAsUserAdapter, "CreateProcessAsUserW");
 }
 
+static decltype(&CreateProcessWithTokenW) TrueCreateProcessWithTokenW =
+    CreateProcessWithTokenW;
+
+static BOOL WINAPI HookCreateProcessWithTokenW(
+    HANDLE token, DWORD logon_flags, LPCWSTR app, LPWSTR cmd, DWORD flags,
+    LPVOID environment, LPCWSTR current_directory, LPSTARTUPINFOW startup,
+    LPPROCESS_INFORMATION process_info) {
+  // WithToken uses the Secondary Logon service. Its creation/Job/injection
+  // ordering is not the AsUser contract, so a controlled instance must reject
+  // it before invoking Windows or creating a child.
+  if (EnvBoxProfile() != nullptr && ControlledStartup()) {
+    EnvBoxAuditEvent("CreateProcessWithTokenW", 0,
+                     "controlled-with-token-child-unsupported");
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+  }
+  BOOL created = TrueCreateProcessWithTokenW(
+      token, logon_flags, app, cmd, flags, environment, current_directory,
+      startup, process_info);
+  DWORD error = GetLastError();
+  EnvBoxAuditEvent("CreateProcessWithTokenW", 0,
+                   "compatibility-with-token-plain");
+  SetLastError(error);
+  return created;
+}
+
 static BOOL WINAPI HookCreateProcessA(
     LPCSTR lpApplicationName, LPSTR lpCommandLine,
     LPSECURITY_ATTRIBUTES lpProcessAttributes,
@@ -742,9 +773,22 @@ static BOOL WINAPI HookCreateProcessA(
 }
 
 int EnvBoxInstallProcessHooks() {
+  if (!g_startup_policy_latched) {
+    wchar_t value[8] = {};
+    SetLastError(ERROR_SUCCESS);
+    DWORD length = GetEnvironmentVariableW(L"ENVBOX_STARTUP_GATE", value, 8);
+    DWORD error = GetLastError();
+    g_controlled_startup = length == 1 && value[0] == L'1';
+    g_startup_policy_valid = g_controlled_startup ||
+        (length == 0 && error == ERROR_ENVVAR_NOT_FOUND);
+    g_startup_policy_latched = true;
+  }
+  // Unknown, empty, oversized, or unreadable flags are not Compatibility.
+  if (!g_startup_policy_valid) return -1;
   int ok = 0;
   ok += EnvBoxAttach(&TrueCreateProcessW, HookCreateProcessW);
   ok += EnvBoxAttach(&TrueCreateProcessA, HookCreateProcessA);
   ok += EnvBoxAttach(&TrueCreateProcessAsUserW, HookCreateProcessAsUserW);
+  ok += EnvBoxAttach(&TrueCreateProcessWithTokenW, HookCreateProcessWithTokenW);
   return ok;
 }

@@ -2,6 +2,8 @@
 
 Stage: P2
 Status: claimed
+
+2026-10-06 增量：bundle retention 在最终稳定 lease handle 单次读取摘要，使用恢复共享 cooperative deadline；拒绝网络/device/relative/reparse 路径并重验实际 file identity。实际 junction、写/delete 共享拒绝和慢读超时测试通过；同步 Windows I/O 不可硬取消的边界保留，见 [本轮证据](../evidence/nonvm-completion-followup.md)。
 Blocked by: [12: Supervisor 崩溃恢复与 TrackingLost](12-ticket.md)、[08: 工作区运行和 GUI/CLI 能力展示](08-ticket.md)
 Parent: [总规格](../spec.md) · [完整实施规划](../implementation-plan.md)
 

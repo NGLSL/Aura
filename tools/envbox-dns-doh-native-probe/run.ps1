@@ -1,6 +1,7 @@
 param(
     [switch]$HostWorker,
-    [string]$RunId
+    [string]$RunId,
+    [switch]$IncludeIPv6
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,6 +70,7 @@ if (-not $HostWorker) {
     & (Join-Path $PSScriptRoot 'build.ps1')
     if ($LASTEXITCODE -ne 0) { throw 'Native probe build failed' }
     $command = 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -HostWorker -RunId ' + $RunId
+    if ($IncludeIPv6) { $command += ' -IncludeIPv6' }
     $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$command; CurrentDirectory=$repo}
     if ($created.ReturnValue -ne 0) { throw ('WMI Create failed: ' + $created.ReturnValue) }
     $result = Wait-RunResult
@@ -94,7 +96,7 @@ if (-not $HostWorker) {
     if ($result.completed -ne $true -or $result.worker_exit -ne 0) {
         throw ('Native probe worker failed; run_id=' + $RunId)
     }
-    if ($result.native_ipv4_pass -ne $true -or $result.policy_negative_pass -ne $true -or $result.process_api_pass -ne $true) {
+    if ($result.native_ipv4_pass -ne $true -or $result.policy_negative_pass -ne $true -or $result.process_api_pass -ne $true -or $result.config_policy_pass -ne $true) {
         throw ('Native DoH IPv4/policy/process API validation failed; run_id=' + $RunId + '; inspect ' + $resultPath)
     }
     exit 0
@@ -113,9 +115,20 @@ try {
     $nativeIpv4Pass = $true
     $policyNegativePass = $true
     $processApiPass = $true
+    $configPolicyPass = $true
     $ipv6Unexecuted = @()
     $workerExit = 0
     foreach ($bits in @('64', '32')) {
+        $configProbe = Join-Path $repo "target/doh-native-acceptance$bits/Release/config-policy-probe.exe"
+        $configLog = Join-Path $target ("doh-native-config-policy-{0}-{1}.log" -f $RunId, $bits)
+        & $configProbe *> $configLog
+        $configExit = $LASTEXITCODE
+        $configLines = @(Get-Content -LiteralPath $configLog)
+        $configPassed = $configExit -eq 0 -and
+            @($configLines | Where-Object { $_ -match '^case=\S+ result=PASS$' }).Count -eq 7 -and
+            @($configLines | Where-Object { $_ -match '^failures=0$' }).Count -eq 1 -and
+            @($configLines | Where-Object { $_ -match '^probe_pid=\d+ runtime_modules=0$' }).Count -eq 1
+        if (-not $configPassed) { $configPolicyPass = $false; $workerExit = 1 }
         $exe = Join-Path $repo "target/doh-native-acceptance$bits/Release/doh-native-probe-host.exe"
         $dll = Join-Path $repo "target/doh-native-acceptance$bits/Release/doh-native-probe.dll"
         $log = Join-Path $repo ("target/doh-native-acceptance-{0}-{1}.log" -f $RunId, $bits)
@@ -125,6 +138,10 @@ try {
         # case therefore gets a separate host process and a fresh snapshot.
         $architectureCases = @()
         for ($index = 0; $index -lt 7; $index++) {
+            if (-not $IncludeIPv6 -and $index -in @(1, 3)) {
+                $ipv6Unexecuted += "bits=$bits case=$index executed=0 reason=deferred_by_user"
+                continue
+            }
             $caseLog = Join-Path $repo ("target/doh-native-acceptance-{0}-{1}-case{2}.log" -f $RunId, $bits, $index)
             & $exe $dll $index $trap *> $caseLog
             $code = $LASTEXITCODE
@@ -152,7 +169,13 @@ try {
             if ($counters.installed -ne $true -or $forbidden.Count -ne 0 -or $counters.connects_denied -ne 0 -or $counters.extension_denied -ne 0) { $processApiPass = $false }
             if ($index -eq 6 -and ($counters.connects_allowed -ne 0 -or @($counters.apis | Where-Object { $_.calls -ne 0 }).Count -ne 0)) { $policyNegativePass = $false }
         }
-        $records += [ordered]@{bits=$bits; log=$log; cases=$architectureCases}
+        $records += [ordered]@{
+            bits=$bits; log=$log; cases=$architectureCases
+            config_policy=[ordered]@{
+                path=$configProbe; sha256=(Get-FileHash -LiteralPath $configProbe).Hash
+                exit=$configExit; pass=$configPassed; log=$configLog
+            }
+        }
     }
 
     # A direct endpoint result is useful evidence, but it is not a whole-host
@@ -170,6 +193,8 @@ try {
         native_ipv4_pass=$nativeIpv4Pass
         policy_negative_pass=$policyNegativePass
         process_api_pass=$processApiPass
+        config_policy_pass=$configPolicyPass
+        ipv6_deferred=(-not $IncludeIPv6)
         observation_scope='current_process_24_API_tripwire_single_literal_TCP_endpoint_no_global_packet_capture'
         ipv6_unexecuted=$ipv6Unexecuted
         typed_errors=$typedErrors

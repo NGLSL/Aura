@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox_dns_unified_fixture LANGUAGES CXX)
+add_executable(envbox-dns-unified-harness harness.cpp)
+target_compile_features(envbox-dns-unified-harness PRIVATE cxx_std_17)
+target_compile_definitions(envbox-dns-unified-harness PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(envbox-dns-unified-harness PRIVATE dnsapi psapi)

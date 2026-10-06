@@ -5,6 +5,8 @@ Status: claimed
 Blocked by: [11: GUI 重连与幂等 Stop/Stop all](11-ticket.md)
 Parent: [总规格](../spec.md) · [完整实施规划](../implementation-plan.md)
 
+2026-10-06 增量：refresh 身份/成员/Job/bundle 失败即时原子写 TrackingLost，保留最后 sealed identity。实际 Stop Job termination 失败持久化且普通 refresh 不覆盖 Running；失败重放 Partial，明确新 Stop 成功才清除原因。cleanup journal 写失败显式报告。真实 named Job、AccessDenied、journal 锁等定向测试 13/0。OS reboot/完整 conhost 等仍未验，见 [本轮证据](../evidence/nonvm-completion-followup.md)。
+
 **What to build:** 后台重启仅恢复可证明身份与控制的实例，其余显示 TrackingLost；A 失联不阻断独立 B。
 
 ## 负责模块与契约

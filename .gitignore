@@ -3,6 +3,7 @@
 *.suo
 .vs/
 CMakeUserPresets.json
+__pycache__/
 
 
 artifacts/

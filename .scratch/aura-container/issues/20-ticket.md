@@ -1,13 +1,15 @@
 # 20: 四种 DNS 传输实际注入验收
 
 Stage: P3
-Status: ready-for-agent
+Status: claimed
 Blocked by: [16: 严格解析所有入口与异步取消](16-ticket.md)、[17: DoT 传输及 TLS 校验](17-ticket.md)、[19: DoH 正式 transport 实现](19-ticket.md)、[11: GUI 重连与幂等 Stop/Stop all](11-ticket.md)
 Parent: [总规格](../spec.md) · [完整实施规划](../implementation-plan.md)
 
 **What to build:** 确认 UDP/TCP/DoT/DoH、任意 QTYPE、严格失败和父子解析在真实 Runtime 中工作，关闭 GUI 后保持相同行为。
 
 2026-10-06 排期更新：按用户决定，本票当前以 IPv4 上游连接验收；IPv6 网络路径延期，不是本票当前阻塞项。AAAA QTYPE 保持当前要求。DoH 已接线且公共 IPv4 双架构实际 Profile 验证通过，后续推进统一矩阵，不能继续以历史 DoH off 或 IPv6 未执行阻塞。
+
+2026-10-06 本轮：四传输/五 API/十一类 QTYPE 实际矩阵 460/464，四项公共 DoT deadline 原失败保留、带 provenance 复验 4/4 通过；最终资源 10/10、实际父子 8/8、取消 72/72。704 次 TXT 有一次公共 DoT deadline，整体 exit 1 保留。新增可复现统一 fixture；GUI 退出、独立 Host/global capture、其他 resolver 和生产长跑仍缺，不关闭整票。见 [本轮证据](../evidence/nonvm-completion-followup.md)。
 
 ## 负责模块与契约
 

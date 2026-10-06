@@ -26,7 +26,11 @@ int EnvBoxInstallLocaleHooks();
 // query calls remain untouched.
 int EnvBoxInstallCrtLocaleHooks();
 int EnvBoxInstallLanguageHooks();
+// Returns the attached count, or -1 for an invalid startup policy flag.
 int EnvBoxInstallProcessHooks();
+// Latched once during process-hook installation, before application entry.
+// Target mutations of ENVBOX_STARTUP_GATE cannot change this policy.
+bool EnvBoxControlledStartup();
 int EnvBoxInstallDnsHooks();
 int EnvBoxDnsHooksReady();
 int EnvBoxInstallRegistryHooks();

@@ -20,6 +20,8 @@ Blocked by: [21](./21-ticket.md)、[02](./02-ticket.md)、[03](./03-ticket.md)�
 
 开始条件：21的报告交付不等于实验资格通过。必须实际具备已指定隔离环境、可用构建/测试签名及恢复路径才能开始加载实验；缺失时保留条件阻塞，不能从报告推定驱动可用。
 
+源码准备的新增资格项（2026-10-06）：`PsSetCreateProcessNotifyRoutineEx` 的通知覆盖不能假定包含 Native process clone / PSS VA clone。adapter 对成员子进程的拒绝只覆盖收到通知的创建路径。克隆必须在隔离环境证明可信归属或实际拒绝，在此之前保持驱动无加载资格、Container/Strong 不启用；不能把未登记对象的 Host 分类当作完整进程树保证。见 [源码准备](../evidence/kernel-policy-preparation.md) 和 `drivers/envbox-policy/ADAPTER.md`。
+
 ## 验收标准
 
 - [ ] host/A/B同exe保持不同身份，PID与creation generation复用后旧策略不命中新进程。

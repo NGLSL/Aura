@@ -5,6 +5,8 @@ Status: claimed
 Blocked by: [04: 受支持子进程传播与身份确认](04-ticket.md)
 Parent: [总规格](../spec.md) · [完整实施规划](../implementation-plan.md)
 
+2026-10-06 增量：CreateProcessWithTokenW 在 Controlled 模式明确拒绝 ERROR_NOT_SUPPORTED；Compatibility/Host 对照保持原 API。受控 required process Hook 为四项，状态初始化时锁存。双架构普通边界 6/6、环境 mutation RED→GREEN 6/6；不是 WithToken 正向支持，Native/WMI/Packaged/真实浏览器等剩余验收保持未闭。见 [本轮证据](../evidence/nonvm-completion-followup.md)。
+
 **What to build:** GUI/CLI 可依据实测矩阵准确说明支持入口和应用覆盖，避免将部分注入显示为完整隔离。
 
 ## 负责模块与契约

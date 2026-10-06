@@ -9,6 +9,7 @@ use std::sync::Mutex;
 mod as_user;
 mod dns_rr;
 mod dns_strict;
+mod with_token;
 
 #[repr(C)]
 struct DnsQueryRequest {
@@ -288,6 +289,9 @@ fn main() -> ExitCode {
         return dns_rr::run(&args[index + 1..]);
     }
     let spawn_child = args.iter().any(|a| a == "--spawn-child");
+    if args.iter().any(|a| a == "--with-token-boundary") {
+        return with_token::run();
+    }
     let spawn_as_user_child = args.iter().any(|a| a == "--spawn-as-user-child");
     let is_child = args.iter().any(|a| a == "--child");
 

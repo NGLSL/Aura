@@ -11,10 +11,10 @@ Branch: `dev`
 
 - 已实现用户态工作区/不可变快照、Supervisor/Job 监管、受控启动与子进程传播、双架构及混合架构恢复；真实应用/特殊启动入口和故障恢复矩阵仍有未验项。
 - DNS 已接入 UDP/TCP/DoT/DoH、任意 QTYPE 与 strict 无 Host fallback；DoH 公共 IPv4 和最终 Runtime 双架构真实 Profile 验证通过。此前“18 No-Go / 19 off / dns_doh=0”是历史状态，已由提交 `5e8f929` 的修复取代。
-- 最新完整 Rust 1.99 工作区验证：418 passed / 0 failed / 34 ignored；实际范围见 [DoH 修复证据](doh-standard-tls-runtime.md)。忽略项不算通过。
+- 本轮 Rust 1.99 工作区验证：427 passed / 0 failed / 34 ignored，最终 latched 双架构 Runtime，fresh WMI 29096 / Runtime 0。随后审查发现 bundle 原路径与 canonical path 身份的竞态，补充修复及定向恢复验证单独记录；不把前一全套日志冒充修后全套。见 [本轮跟进](nonvm-completion-followup.md)，忽略项不算通过。
 - 2026-10-06 用户明确决定 **IPv6 延期，当前不实施，不作为当前阶段完成、IPv4 DNS 交付或后续独立工作的阻塞项**。既有未执行记录保留，只表示 IPv6 未验证，不表示 IPv4 实现失败。AAAA QTYPE 支持与 IPv6 上游连接是不同维度，不因延期删除 AAAA 解析。
-- 无 VM 可继续：20 号四传输统一验收、真实应用/管理/恢复缺口、资源长跑和用户态产品整合。未交付的新安装包不等于源码未完成，打包/安装/发布单独记录。
-- 完整轻量容器仍缺：有效 WFP 网络策略/进程归属后端、文件和 Registry 隔离后端、基于私有状态的数据管理、驱动签名/加载/Verifier/故障恢复及最终安装兼容性资格。当前只有空功能驱动构建证据；存储规则预检不是强制隔离。
+- 本轮新增四传输统一 fixture、实际父子与资源检查、TrackingLost/Stop 失败持久化、bundle lease 约束及受控 WithToken 明确拒绝。受控 UDP/TCP 和公共 DoH 通过；公共 DoT 的限时失败原始记录保留。GUI 退出、独立全局 capture、真实应用/管理/恢复缺口和生产长跑仍未闭，详见本轮证据。打包/安装/发布单独记录。
+- 完整轻量容器仍缺：有效 WFP 网络策略接线、真实可信控制服务、文件和 Registry 隔离后端、基于私有状态的数据管理、驱动签名/加载/Verifier/故障恢复及最终安装兼容性资格。本轮已新增 WDM 控制设备/实际进程对象归属 adapter 与策略核心，x64 SYS 编译链接通过；尚未加载、不提供实际过滤或完整 Container。Native clone/PSS 覆盖是正式加载资格门槛；存储规则预检不是强制隔离。见 [内核准备证据](kernel-policy-preparation.md)。
 
 以下各段按历史来源保留；当前 DoH 和 IPv6 排期以本摘要及最新证据为准，不从历史未通过状态重新阻塞已经交付的能力。
 
