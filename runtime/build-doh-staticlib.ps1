@@ -29,15 +29,24 @@ $arguments += @('--', '--print', 'native-static-libs')
 $quoted = $arguments | ForEach-Object { '"' + $_ + '"' }
 $process = Start-Process -FilePath 'cargo.exe' -ArgumentList $quoted -NoNewWindow -Wait -PassThru `
     -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-if ($process.ExitCode -ne 0) { throw "DoH staticlib build failed; see $stderr" }
+if ($process.ExitCode -ne 0) {
+    Get-Content -LiteralPath $stderr | ForEach-Object { Write-Host $_ }
+    throw "DoH staticlib build failed; see $stderr"
+}
 $line = Get-Content -LiteralPath $stderr | Where-Object { $_ -match 'native-static-libs:' } | Select-Object -Last 1
 if (!$line) { throw 'Rust native-static-libs output is missing' }
 $native = @(($line -replace '^.*native-static-libs:\s*','') -split '\s+' | Where-Object { $_ })
+# Restrict the dependency graph to the artifact target: a clean Windows build
+# has not downloaded unrelated Linux/macOS packages required by full metadata.
 $metadataStdout = Join-Path $BuildDirectory 'doh-metadata.json'
 $metadataStderr = Join-Path $BuildDirectory 'doh-metadata.stderr.log'
-$metadataProcess = Start-Process -FilePath 'cargo.exe' -ArgumentList @('+1.99.0','metadata','--format-version','1','--locked','--offline') `
+$metadataProcess = Start-Process -FilePath 'cargo.exe' -ArgumentList @('+1.99.0','metadata','--format-version','1','--locked','--offline',
+    '--filter-platform',$RustTarget) `
     -NoNewWindow -Wait -PassThru -RedirectStandardOutput $metadataStdout -RedirectStandardError $metadataStderr
-if ($metadataProcess.ExitCode -ne 0) { throw "Cargo metadata failed; see $metadataStderr" }
+if ($metadataProcess.ExitCode -ne 0) {
+    Get-Content -LiteralPath $metadataStderr | ForEach-Object { Write-Host $_ }
+    throw "Cargo metadata failed; see $metadataStderr"
+}
 $metadata = Get-Content -Raw -LiteralPath $metadataStdout | ConvertFrom-Json
 $packageName = if ($RustTarget -eq 'x86_64-pc-windows-msvc') { 'windows_x86_64_msvc' } else { 'windows_i686_msvc' }
 $package = $metadata.packages | Where-Object { $_.name -eq $packageName -and $_.version -eq '0.52.6' } | Select-Object -First 1
