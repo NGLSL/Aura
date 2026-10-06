@@ -29,8 +29,10 @@ jobs:
 
       - name: Install Rust 1.99.0
         run: |
-          rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+          rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal --target i686-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Rust toolchain/targets install failed" }
           rustup default 1.99.0-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Rust toolchain selection failed" }
 
       - name: Validate release tag and source version
         shell: pwsh
