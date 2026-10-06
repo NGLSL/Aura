@@ -77,3 +77,15 @@ the output records exact cache check and pulse counts. These cases require zero
 HTTP requests, canary connections, forbidden host API calls, and denied endpoint
 attempts. No cache or trust material is written. Both architectures now execute
 92 IPv4 cases; the 10 IPv6 cases still require the existing preflight.
+
+`--tls-revocation standard|strict_offline` selects the fixture TLS revocation
+policy; omission retains `strict_offline` for all original 92 cases. Standard
+TLS adds ten cases per architecture: missing leaf/CA revocation material may
+succeed, while known EE/CA revocation, untrusted issuer, wrong identity, expired
+certificate, invalid certificate signature, and explicit denial still fail.
+Selecting standard after `--native-cache true` must disable cache collection
+(`cache_checks=0`) while the valid fixture makes one HTTP request. All existing
+forbidden API, UDP, denied endpoint, and canary assertions remain active. An
+invalid policy is rejected before loading instrumentation or starting TLS.
+There are 112 IPv4 TLS cases plus two CLI rejection cases across both
+architectures; the optional ten IPv6 cases remain separately qualified.

@@ -731,7 +731,7 @@ int EnvBoxIpcAwaitStartupRelease() {
 // Dedicated remote-thread entry; never called during loader initialization.
 // No borrowed remote parameters, no new DLL load, and no profile mutation.
 extern "C" const char EnvBoxRuntimeCapabilities[256] =
-    "protocol=1;profile_dns_schema=1;entry_gate=1;reconnect=1;dns_udp=1;dns_tcp=1;dns_dot=1;dns_doh=0";
+    "protocol=1;profile_dns_schema=1;entry_gate=1;reconnect=1;dns_udp=1;dns_tcp=1;dns_dot=1;dns_doh=1";
 
 extern "C" DWORD WINAPI EnvBoxRuntimeReconnect(void* parameter) {
   if (parameter != nullptr || g_runtime_identity_wire.empty()) return ERROR_INVALID_PARAMETER;

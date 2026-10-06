@@ -5,7 +5,7 @@
 // wire-record decoder for all QTYPEs and returns Profile errors without Host
 // DNS fallback. The synchronous getaddrinfo routes retain their address-only
 // client and return Profile lookup errors without Host fallback.
-// Non-goals: WFP / LSP / DoH / port-53 redirect /
+// Non-goals: WFP / LSP / port-53 redirect /
 // system proxy. No new Process/Thread handles; sockets always closesocket.
 
 #pragma comment(lib, "dnsapi.lib")
@@ -148,8 +148,13 @@ static int DnsEndpoint(const RuntimeProfile* profile, int index, DnsTransportEnd
                    configured.server_name};
       return 1;
     }
-    // DoH remains unavailable until its bootstrap gate is proven. It is
-    // never silently substituted with an unconfigured plaintext transport.
+    if (configured.type == EnvBoxDnsDoh) {
+      *endpoint = {DnsTransportKind::Doh, nullptr, 0, nullptr,
+                   configured.url, configured.bootstrap_ips,
+                   configured.bootstrap_count,
+                   static_cast<unsigned>(configured.tls_revocation)};
+      return 1;
+    }
     if (configured.type != EnvBoxDnsUdp && configured.type != EnvBoxDnsTcp) return 0;
     *endpoint = {configured.type == EnvBoxDnsTcp ? DnsTransportKind::Tcp : DnsTransportKind::Udp,
                  configured.address, configured.port};

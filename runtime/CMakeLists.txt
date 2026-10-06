@@ -42,6 +42,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/hooks_dns.cpp
   src/dns_transport.cpp
   src/dns_dot.cpp
+  src/dns_doh.cpp
   src/dns_profile_config.cpp
   src/hooks_registry.cpp
   src/hooks_process.cpp
@@ -54,7 +55,45 @@ list(GET ENVBOX_VERSION_LINE 0 ENVBOX_VERSION_LINE)
 string(REGEX REPLACE "^version = \"([^\"]+)\"$" "\\1" ENVBOX_RUNTIME_VERSION "${ENVBOX_VERSION_LINE}")
 target_compile_definitions(${ENVBOX_RT_TARGET} PRIVATE ENVBOX_RUNTIME_VERSION="${ENVBOX_RUNTIME_VERSION}")
 set_target_properties(${ENVBOX_RT_TARGET} PROPERTIES OUTPUT_NAME "${ENVBOX_RT_NAME}")
+# Rust's MSVC staticlib uses the dynamic release CRT in both Cargo profiles.
+# Match it for C++ Debug too; retain debug symbols and disabled optimization.
+set_property(TARGET ${ENVBOX_RT_TARGET} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
 target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE advapi32 iphlpapi ws2_32 runtimeobject secur32 crypt32)
+
+# DoH is part of the shipped Runtime, not a separately enabled prototype. Each
+# CMake build tree owns its Rust target directory, avoiding concurrent installer
+# builds and loaded Runtime artifacts in the workspace target directory.
+if(NOT MSVC)
+  message(FATAL_ERROR "Runtime DoH integration requires MSVC")
+endif()
+find_program(ENVBOX_POWERSHELL NAMES powershell REQUIRED)
+if(ENVBOX_RT_ARCH EQUAL 64)
+  set(ENVBOX_DOH_RUST_TARGET x86_64-pc-windows-msvc)
+else()
+  set(ENVBOX_DOH_RUST_TARGET i686-pc-windows-msvc)
+endif()
+execute_process(COMMAND "${ENVBOX_POWERSHELL}" -NoProfile -NonInteractive
+  -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/build-doh-staticlib.ps1"
+  -BuildDirectory "${CMAKE_CURRENT_BINARY_DIR}" -RustTarget "${ENVBOX_DOH_RUST_TARGET}"
+  -Configuration Debug RESULT_VARIABLE ENVBOX_DOH_BUILD_STATUS)
+if(NOT ENVBOX_DOH_BUILD_STATUS EQUAL 0)
+  message(FATAL_ERROR "DoH staticlib configuration build failed")
+endif()
+include("${CMAKE_CURRENT_BINARY_DIR}/doh-native-libs.cmake")
+add_custom_target(envbox-doh-staticlib
+  COMMAND "${ENVBOX_POWERSHELL}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
+    -File "${CMAKE_CURRENT_SOURCE_DIR}/build-doh-staticlib.ps1"
+    -BuildDirectory "${CMAKE_CURRENT_BINARY_DIR}" -RustTarget "${ENVBOX_DOH_RUST_TARGET}"
+    -Configuration "$<CONFIG>"
+  BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/doh-product/${ENVBOX_DOH_RUST_TARGET}/debug/envbox_dns_doh.lib"
+             "${CMAKE_CURRENT_BINARY_DIR}/doh-product/${ENVBOX_DOH_RUST_TARGET}/release/envbox_dns_doh.lib"
+  VERBATIM)
+add_dependencies(${ENVBOX_RT_TARGET} envbox-doh-staticlib)
+target_include_directories(${ENVBOX_RT_TARGET} PRIVATE ../crates/envbox-dns-doh/include)
+target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE
+  "$<IF:$<CONFIG:Debug>,${CMAKE_CURRENT_BINARY_DIR}/doh-product/${ENVBOX_DOH_RUST_TARGET}/debug/envbox_dns_doh.lib,${CMAKE_CURRENT_BINARY_DIR}/doh-product/${ENVBOX_DOH_RUST_TARGET}/release/envbox_dns_doh.lib>"
+  ${ENVBOX_DOH_NATIVE_LIBS})
+target_link_options(${ENVBOX_RT_TARGET} PRIVATE ${ENVBOX_DOH_NATIVE_OPTIONS})
 
 if(ENVBOX_WITH_DETOURS)
   if(NOT DETOURS_ROOT)

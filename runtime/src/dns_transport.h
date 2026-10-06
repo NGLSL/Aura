@@ -4,12 +4,16 @@
 
 // Transport consumes DNS wire packets and an absolute deadline. It has no
 // QTYPE, record, cache, or Windows resolver semantics and never resolves IPs.
-enum class DnsTransportKind { Udp, Tcp, Dot };
+enum class DnsTransportKind { Udp, Tcp, Dot, Doh };
 struct DnsTransportEndpoint {
   DnsTransportKind kind;
   const char* address;
   unsigned short port;
   const char* server_name = nullptr; // DoT TLS identity; never resolved.
+  const char* url = nullptr;
+  const char (*bootstrap_ips)[64] = nullptr;
+  int bootstrap_count = 0;
+  unsigned tls_revocation = 0;
 };
 
 // >0 = complete packet length, 0 = transport failure, -1 = cancellation.

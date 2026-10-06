@@ -1,5 +1,6 @@
 #include "dns_transport.h"
 #include "dns_dot.h"
+#include "dns_doh.h"
 #include "audit.h"
 #include <ws2tcpip.h>
 
@@ -49,8 +50,11 @@ int DnsTransportExchange(const DnsTransportEndpoint& endpoint,
                          const unsigned char* query, int query_length,
                          unsigned char* response, int capacity,
                          ULONGLONG deadline, HANDLE cancel_event) {
-  if (!endpoint.address || !endpoint.port || !query || !response ||
+  if (!query || !response ||
       query_length < 12 || query_length > 65535 || capacity < 12) return 0;
+  if (endpoint.kind == DnsTransportKind::Doh)
+    return DnsDohExchange(endpoint, query, query_length, response, capacity, deadline, cancel_event);
+  if (!endpoint.address || !endpoint.port) return 0;
   if (endpoint.kind == DnsTransportKind::Dot) {
     DnsDotError error = DnsDotError::None;
     int result = DnsDotExchange(endpoint.address, endpoint.port, endpoint.server_name,

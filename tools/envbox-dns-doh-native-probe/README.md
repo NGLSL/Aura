@@ -1,8 +1,12 @@
 # Native DoH acceptance probe
 
-This probe links the product-default `envbox-dns-doh` static library (`--no-default-features`) into a small MSVC DLL and invokes the public C ABI from an independent executable. It uses the real Windows ROOT/CA/Disallowed stores and the real local CRL/cache snapshot. It does not install certificates, use the fixture trust feature, change the host DNS configuration, enable a proxy, or require elevation.
+This probe links the product-default `envbox-dns-doh` static library (`--no-default-features`) into a small MSVC DLL and invokes `envbox_doh_query_with_policy` from independent executables. Trust combines the pinned public root bundle with the read-only Windows ROOT/CA/Disallowed snapshot. Standard TLS checks chain/name/time/signatures and available CRLs without requiring complete offline revocation coverage. StrictOffline additionally requires known fresh revocation status and permits cache-only CRL lookup. No certificates are installed, no fixture trust is linked, and no host configuration is changed.
 
-The transport receives four explicit URL/bootstrap pairs: Cloudflare at `1.1.1.1` and `2606:4700:4700::1111`, and Google at `8.8.8.8` and `2001:4860:4860::8888`. It sends a minimal `example.com A IN` DNS query and records the typed error, returned length, message ID/QR/RCODE, and a complete wire-question comparison (case-insensitive QNAME plus exact QTYPE and QCLASS). IPv6 unavailability and native trust failure remain recorded outcomes; neither is silently promoted to a pass.
+Seven cases run separately for each architecture: four Standard URL/bootstrap pairs (Cloudflare and Google over IPv4/IPv6), the two IPv4 pairs with StrictOffline, and invalid policy value 2. A minimal `example.com A IN` query records typed error, returned length, message ID/QR/RCODE and the complete wire question (case-insensitive QNAME plus exact QTYPE/QCLASS). IPv6 is recorded as `executed=0` when no usable nonlocal address exists; it is never counted as a pass. The strict negative expectation on this host is `revocation_unknown`; invalid policy must return `argument` before network activity.
+
+Each case installs the existing architecture-matched fixture API trap before loading the product DLL. Its endpoint allowance is immutable, so one process is used per pair/policy. The trap blocks/counts 18 Host DNS/PAC/Windows chain APIs, UDP send APIs, unexpected TCP endpoints and unsupported socket extensions. Standard and StrictOffline must make zero forbidden calls. This instrumentation does not cover Cryptnet URL cache APIs, direct AFD/system calls, other processes or global packets; cache-only flags remain a separately verified source contract.
+
+The trap must first be built from `tools/envbox-dns-doh-fixture/trap` into `target/doh-api-trap64` (CMake architecture `x64`) and `target/doh-api-trap32` (`Win32`), using Release configuration. See the [trap instructions](../envbox-dns-doh-fixture/trap/README.md).
 
 Run from the repository root:
 
@@ -11,13 +15,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/envbox-dns-doh-nat
 Get-Content target/doh-native-acceptance-results.json -Raw
 ```
 
-Every invocation creates a fresh `run_id` and waits up to three minutes for
+Every invocation creates a fresh `run_id` and waits up to four minutes for
 that WMI worker's uniquely named result. The stable result/log paths above are
-copied only after the matching run has completed. A completed harness with
-typed certificate/network errors is recorded with `completed=true`,
-`harness_completed=true`, `gate=false`, and the top-level script exits nonzero
-when the positive acceptance gate is closed; it never treats an old result or
-an asynchronously launched worker as this run's pass.
+copied only after the matching run has completed. A completed harness records
+`completed=true` and `harness_completed=true`. `native_ipv4_pass`,
+`policy_negative_pass` and `process_api_pass` are independent checks; the script
+exits zero only when all three pass. The wider `gate=false` remains because
+this is not global observation or an OS matrix. `wire_positive` requires all
+four Standard pairs on both architectures and remains false when IPv6 is
+unexecuted. A stale result cannot satisfy this run.
 
 `-RunId` is an internal WMI-worker handoff parameter. Top-level invocations
 must omit it and always receive a newly generated GUID; a worker accepts only a
@@ -81,4 +87,13 @@ script exits nonzero.
 
 The script builds x64 and Win32/i686 product static libraries in an isolated target directory, checks that fixture symbols are absent, builds the native DLL/host, then uses `Win32_Process.Create` to execute a fresh hidden WMI worker. The worker clears inherited `ENVBOX_*` variables and verifies that no `envbox-runtime*` module is loaded. The raw per-architecture logs are `target/doh-native-acceptance-{64,32}.log`.
 
-This is intentionally a positive/negative native trust probe, not a global packet capture. A successful response demonstrates the configured literal endpoint, the URL identity and the default offline trust snapshot for this Windows installation. A typed `revocation_unknown`, `trust_snapshot`, `certificate` or `network` result is evidence of the precise production blocker. The result does not prove that every Host DNS/PAC/Cryptnet/AFD path is absent, nor does one Windows installation establish an OS-version matrix. Those observations remain required before enabling product DoH.
+This is a positive/negative native policy probe with process-local API tripwires, not global packet capture. A Standard success demonstrates the configured literal endpoint, URL identity and production trust for this Windows installation. StrictOffline `revocation_unknown` is an expected policy negative here. Other typed failures retain their reasons. The result does not prove every Cryptnet/AFD path is absent and does not establish an OS-version matrix.
+
+The separate CMake target `config-policy-probe` compiles the production Runtime
+DNS configuration decoder directly. Run its Release executable in a fresh,
+uninjected process after building that target for x64 or Win32. Its seven cases
+check complete Standard/StrictOffline wire roundtrips, rejection of missing or
+unknown TLS policy, rejection of VirtualView `strict=0` and `false`, and Host
+mode compatibility. It returns nonzero on any failed assertion; it does not
+contact DNS services or load a Runtime DLL. This configuration test is separate
+from the public native transport acceptance results.

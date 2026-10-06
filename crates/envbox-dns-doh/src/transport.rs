@@ -154,15 +154,20 @@ async fn exchange(
             .parse()
             .map_err(|_| Error::Argument)?
     };
-    let request = Request::builder()
+    let mut request = Request::builder()
         .method("POST")
         .uri(target)
-        .header(
+        .header(header::CONTENT_TYPE, "application/dns-message")
+        .header(header::ACCEPT, "application/dns-message");
+    // HTTP/2 derives :authority from the absolute URI. Sending a second Host
+    // field is rejected by some DoH servers with RST_STREAM(PROTOCOL_ERROR).
+    if !http2 {
+        request = request.header(
             header::HOST,
             uri.authority().ok_or(Error::Argument)?.as_str(),
-        )
-        .header(header::CONTENT_TYPE, "application/dns-message")
-        .header(header::ACCEPT, "application/dns-message")
+        );
+    }
+    let request = request
         .body(Full::new(Bytes::copy_from_slice(packet)))
         .map_err(|_| Error::Argument)?;
     if http2 {

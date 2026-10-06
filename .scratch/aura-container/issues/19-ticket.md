@@ -1,7 +1,7 @@
 # 19: DoH 正式 transport 实现
 
 Stage: P3
-Status: needs-info
+Status: claimed
 Blocked by: [18: DoH 无宿主 DNS bootstrap 选型原型](18-ticket.md)、[15: 统一任意 QTYPE Query Engine 与 UDP/TCP](15-ticket.md)
 Parent: [总规格](../spec.md) · [完整实施规划](../implementation-plan.md)
 
@@ -35,3 +35,7 @@ F03。DNS 相关细节遵循 [DNS transports 规格](../../dns-transports/spec.m
 ## 当前实施记录
 
 2026-10-04：前置资格未通过，未执行正式后端。19 等待 DoH bootstrap 隔离 Go；21 已完成只读预检，但无 WDK、隔离 VM 和相应测试材料。用户确认尚无 VM，先完成独立部分；不在宿主安装驱动。见 [实施进度](../evidence/implementation-progress.md)。
+
+2026-10-06 用户明确授权修复：拆开 DNS strict 与 TLS revocation，固定 Mozilla 公共根和标准证书验证成为缺省，StrictOffline 显式保留。当前 Windows x64/x86 公共 native IPv4 正反向/process API 分项资格通过后，Runtime 已必链接 Rust staticlib并接入 Query Engine，能力报告 dns_doh=1；GUI/CLI/IPC/immutable snapshot完整传递策略。最终实际 Profile 注入 16 项关键验收通过，涵盖Cloudflare/Google A/HTTPS65、严格失败、bootstrap重试/all-dead和受控取消；HTTP2/HTTP1、标准/严格fixture114通过。
+
+本票当前为 implemented / partial acceptance；缺少安装升级、其他目标OS/IPv6/global traffic完整证据，未认领整票或P0–P8全部完成。Blocked-by保留用于完整最终验收，当前机器可用性资格与更广Container保证分项记录。见 [本次修复证据](../evidence/doh-standard-tls-runtime.md)、[review](../evidence/doh-standard-tls-runtime-review.md)。

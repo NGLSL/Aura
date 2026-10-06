@@ -29,8 +29,28 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROPERTY: usize = 64 * 1024;
 const MAX_OIDS: usize = 128;
 
+/// Independent of DNS routing/fallback. Both modes verify TLS identity and chain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RevocationPolicy {
+    Standard = 0,
+    #[default]
+    StrictOffline = 1,
+}
+impl TryFrom<u32> for RevocationPolicy {
+    type Error = Error;
+    fn try_from(value: u32) -> Result<Self, Error> {
+        match value {
+            0 => Ok(Self::Standard),
+            1 => Ok(Self::StrictOffline),
+            _ => Err(Error::Argument),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Snapshot {
+    revocation_policy: RevocationPolicy,
     roots: Vec<CertificateDer<'static>>,
     intermediates: Vec<CertificateDer<'static>>,
     crls: Vec<CertificateRevocationListDer<'static>>,
@@ -226,7 +246,14 @@ fn signature_hash(der: &[u8]) -> Result<Vec<u8>, Error> {
 
 impl Snapshot {
     pub fn load(budget: Budget) -> Result<Self, Error> {
-        let mut snapshot = Self::default();
+        Self::load_with_policy(budget, RevocationPolicy::Standard)
+    }
+
+    pub fn load_with_policy(budget: Budget, policy: RevocationPolicy) -> Result<Self, Error> {
+        let mut snapshot = Self {
+            revocation_policy: policy,
+            ..Self::default()
+        };
         let mut limits = Limits::default();
         for location in [
             CERT_SYSTEM_STORE_CURRENT_USER,
@@ -263,7 +290,26 @@ impl Snapshot {
             }
         }
         snapshot.cached_disallowed_ctl(&mut limits, budget)?;
-        snapshot.use_url_cache = true;
+        // Fixed-version Mozilla roots are explicit application trust inputs.
+        // Full DER preserves local certificate/signature hash deny checks;
+        // no AuthRoot promotion or online root provider is involved.
+        for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+            limits.add(der.as_ref().len(), budget)?;
+            let certificate = Cert(unsafe {
+                CertCreateCertificateContext(
+                    X509_ASN_ENCODING,
+                    der.as_ref().as_ptr(),
+                    der.as_ref().len() as u32,
+                )
+            });
+            if certificate.0.is_null() {
+                return Err(Error::TrustSnapshot);
+            }
+            if unsafe { eligible(certificate.0, &mut limits, budget)? } {
+                snapshot.roots.push(der.clone());
+            }
+        }
+        snapshot.use_url_cache = policy == RevocationPolicy::StrictOffline;
         budget.check()?;
         Ok(snapshot)
     }
@@ -594,7 +640,10 @@ impl Snapshot {
         // rustls disables revocation with an empty list. Fixture snapshots must
         // reject it here; native verification defers acceptance until peer CDPs
         // supply usable cached CRLs, never accepting an unchecked result.
-        if self.crls.is_empty() && !self.use_url_cache {
+        if self.revocation_policy == RevocationPolicy::StrictOffline
+            && self.crls.is_empty()
+            && !self.use_url_cache
+        {
             return Err(Error::RevocationUnknown);
         }
         let mut roots = RootCertStore::empty();
@@ -618,7 +667,7 @@ impl Snapshot {
         }
         self.intermediates = candidates;
         let roots = Arc::new(roots);
-        let verifier = standard_verifier(roots.clone(), self.crls.clone())?;
+        let verifier = standard_verifier(roots.clone(), self.crls.clone(), self.revocation_policy)?;
         budget.check()?;
         let cache_budget = self
             .use_url_cache
@@ -700,6 +749,16 @@ impl Snapshot {
         self.use_url_cache = true;
         self
     }
+
+    /// Select the independent TLS policy for controlled fixture trust only.
+    #[cfg(any(test, feature = "fixture-trust"))]
+    pub fn with_fixture_revocation_policy(mut self, policy: RevocationPolicy) -> Self {
+        self.revocation_policy = policy;
+        if policy == RevocationPolicy::Standard {
+            self.use_url_cache = false;
+        }
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -713,13 +772,18 @@ struct OfflineVerifier {
 fn standard_verifier(
     roots: Arc<RootCertStore>,
     crls: Vec<CertificateRevocationListDer<'static>>,
+    policy: RevocationPolicy,
 ) -> Result<Arc<WebPkiServerVerifier>, Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    WebPkiServerVerifier::builder_with_provider(roots, provider)
-        .with_crls(crls)
-        .enforce_revocation_expiration()
-        .build()
-        .map_err(|_| Error::TrustSnapshot)
+    let builder = WebPkiServerVerifier::builder_with_provider(roots, provider).with_crls(crls);
+    let builder = match policy {
+        // Standard PKI verification: missing revocation material is not a
+        // prerequisite. Available CRLs still reject known revoked certificates.
+        // No URL-cache reads or online retrieval occur in this mode.
+        RevocationPolicy::Standard => builder.allow_unknown_revocation_status(),
+        RevocationPolicy::StrictOffline => builder.enforce_revocation_expiration(),
+    };
+    builder.build().map_err(|_| Error::TrustSnapshot)
 }
 
 fn missing_revocation_material(error: &rustls::Error) -> bool {
@@ -746,7 +810,9 @@ impl ServerCertVerifier for OfflineVerifier {
         candidates.extend(self.snapshot.intermediates.iter().cloned());
         // An empty CRL list disables revocation in rustls. Never accept that
         // result: native snapshots must first obtain usable cached material.
-        let result = if self.snapshot.crls.is_empty() {
+        let result = if self.snapshot.revocation_policy == RevocationPolicy::StrictOffline
+            && self.snapshot.crls.is_empty()
+        {
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownRevocationStatus,
             ))
@@ -791,7 +857,7 @@ impl ServerCertVerifier for OfflineVerifier {
         crls.extend(self.snapshot.crls.iter().cloned());
         // Cached DER is only a candidate. The standard verifier must check
         // issuer/signature, freshness, revocation, chain, purpose and name.
-        standard_verifier(self.roots.clone(), crls)
+        standard_verifier(self.roots.clone(), crls, self.snapshot.revocation_policy)
             .map_err(|error| rustls::Error::General(format!("offline CRL verifier: {error:?}")))?
             .verify_server_cert(end, &candidates, name, ocsp, now)
     }

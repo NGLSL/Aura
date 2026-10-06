@@ -428,6 +428,11 @@ fn dns_editor_view(app: &EnvBoxApp) -> Element<'_, Message> {
         Message::ProfileDnsTransport,
     ));
     if editor.draft.transport == TransportChoice::Doh {
+        content = content.push(pick_list(
+            envbox_core::DnsTlsRevocation::ALL,
+            Some(editor.draft.tls_revocation),
+            Message::ProfileDnsTlsRevocation,
+        ));
         content = content.push(
             text_input("https://resolver.example/dns-query", &editor.draft.url)
                 .on_input(Message::ProfileDnsUrl),

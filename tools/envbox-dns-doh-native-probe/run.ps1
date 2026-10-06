@@ -47,7 +47,7 @@ function Write-RunResult {
 }
 
 function Wait-RunResult {
-    param([int]$TimeoutSeconds = 180)
+    param([int]$TimeoutSeconds = 240)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         if (Test-Path -LiteralPath $resultPath) {
@@ -94,8 +94,8 @@ if (-not $HostWorker) {
     if ($result.completed -ne $true -or $result.worker_exit -ne 0) {
         throw ('Native probe worker failed; run_id=' + $RunId)
     }
-    if ($result.gate -ne $true) {
-        throw ('Native DoH positive gate=false; run_id=' + $RunId + '; inspect ' + $resultPath)
+    if ($result.native_ipv4_pass -ne $true -or $result.policy_negative_pass -ne $true -or $result.process_api_pass -ne $true) {
+        throw ('Native DoH IPv4/policy/process API validation failed; run_id=' + $RunId + '; inspect ' + $resultPath)
     }
     exit 0
 }
@@ -110,32 +110,49 @@ try {
     $records = @()
     $typedErrors = @()
     $wirePositive = $true
+    $nativeIpv4Pass = $true
+    $policyNegativePass = $true
+    $processApiPass = $true
+    $ipv6Unexecuted = @()
     $workerExit = 0
     foreach ($bits in @('64', '32')) {
         $exe = Join-Path $repo "target/doh-native-acceptance$bits/Release/doh-native-probe-host.exe"
         $dll = Join-Path $repo "target/doh-native-acceptance$bits/Release/doh-native-probe.dll"
         $log = Join-Path $repo ("target/doh-native-acceptance-{0}-{1}.log" -f $RunId, $bits)
-        & $exe $dll *> $log
-        $code = $LASTEXITCODE
-        $records += [ordered]@{bits=$bits; exit=$code; log=$log}
-        if ($code -ne 0) {
-            $wirePositive = $false
-            $workerExit = 1
-        }
-        if (Test-Path -LiteralPath $log) {
-            $caseLines = @(Get-Content -LiteralPath $log | Where-Object { $_ -match '^case=' } | ForEach-Object { [string]$_ })
-            if ($caseLines.Count -ne 4) { $wirePositive = $false }
-            foreach ($line in $caseLines) {
-                if ($line -notmatch 'error=0(?:\s|$)' -or $line -notmatch 'response_shape=1(?:\s|$)') {
-                    $wirePositive = $false
-                    $typedErrors += [string]$line
-                }
+        $trap = Join-Path $repo "target/doh-api-trap$bits/Release/envbox-doh-api-trap.dll"
+        if (-not (Test-Path -LiteralPath $trap)) { throw ('Build the process-local fixture API trap first: ' + $trap) }
+        # The existing trap has an immutable single endpoint allowance. Each
+        # case therefore gets a separate host process and a fresh snapshot.
+        $architectureCases = @()
+        for ($index = 0; $index -lt 7; $index++) {
+            $caseLog = Join-Path $repo ("target/doh-native-acceptance-{0}-{1}-case{2}.log" -f $RunId, $bits, $index)
+            & $exe $dll $index $trap *> $caseLog
+            $code = $LASTEXITCODE
+            $architectureCases += [ordered]@{index=$index; exit=$code; log=$caseLog}
+            Get-Content -LiteralPath $caseLog | Add-Content -LiteralPath $log
+            if ($code -ne 0) { $workerExit = 1 }
+            $lines = @(Get-Content -LiteralPath $caseLog)
+            $caseLines = @($lines | Where-Object { $_ -match '^case=' })
+            $trapLines = @($lines | Where-Object { $_ -match '^trap=' })
+            if ($caseLines.Count -ne 1 -or $trapLines.Count -ne 1 -or $code -ne 0) {
+                $nativeIpv4Pass = $false; $policyNegativePass = $false; $processApiPass = $false; $wirePositive = $false
+                continue
             }
-        } else {
-            $wirePositive = $false
-            $typedErrors += "missing_log=$log"
-            $workerExit = 1
+            $line = [string]$caseLines[0]
+            $executed = $line -match 'executed=1(?:\s|$)'
+            $positive = $executed -and $line -match 'error=0(?:\s|$)' -and $line -match 'response_shape=1(?:\s|$)' -and $line -match 'rcode=0(?:\s|$)'
+            if ($index -lt 4 -and -not $positive) { $wirePositive = $false }
+            if ($index -in @(0, 2) -and -not $positive) { $nativeIpv4Pass = $false }
+            if ($index -in @(1, 3) -and -not $executed) { $ipv6Unexecuted += "bits=$bits $line" }
+            if ($index -in @(4, 5) -and (-not $executed -or $line -notmatch 'error=7(?:\s|$)' -or $line -notmatch 'length=0(?:\s|$)')) { $policyNegativePass = $false }
+            if ($index -eq 6 -and (-not $executed -or $line -notmatch 'error=1(?:\s|$)' -or $line -notmatch 'length=0(?:\s|$)')) { $policyNegativePass = $false }
+            if (-not $positive -and $executed) { $typedErrors += $line }
+            $counters = ([string]$trapLines[0]).Substring(5) | ConvertFrom-Json
+            $forbidden = @($counters.apis | Where-Object { $_.name -notin @('connect', 'WSAConnect', 'WSAIoctl', 'ConnectEx') -and $_.calls -ne 0 })
+            if ($counters.installed -ne $true -or $forbidden.Count -ne 0 -or $counters.connects_denied -ne 0 -or $counters.extension_denied -ne 0) { $processApiPass = $false }
+            if ($index -eq 6 -and ($counters.connects_allowed -ne 0 -or @($counters.apis | Where-Object { $_.calls -ne 0 }).Count -ne 0)) { $policyNegativePass = $false }
         }
+        $records += [ordered]@{bits=$bits; log=$log; cases=$architectureCases}
     }
 
     # A direct endpoint result is useful evidence, but it is not a whole-host
@@ -150,6 +167,11 @@ try {
         runtime_modules=0
         cases=$records
         wire_positive=$wirePositive
+        native_ipv4_pass=$nativeIpv4Pass
+        policy_negative_pass=$policyNegativePass
+        process_api_pass=$processApiPass
+        observation_scope='current_process_24_API_tripwire_single_literal_TCP_endpoint_no_global_packet_capture'
+        ipv6_unexecuted=$ipv6Unexecuted
         typed_errors=$typedErrors
         acceptance_pass=$false
         gate=$false

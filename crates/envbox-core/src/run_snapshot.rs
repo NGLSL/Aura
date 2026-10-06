@@ -107,7 +107,7 @@ fn decode_effective_profile(
             let required = match upstream.get("type").and_then(serde_json::Value::as_str) {
                 Some("udp" | "tcp") => &["type", "address", "port"][..],
                 Some("dot") => &["type", "address", "port", "server_name"][..],
-                Some("doh") => &["type", "url", "bootstrap_ips"][..],
+                Some("doh") => &["type", "url", "bootstrap_ips", "tls_revocation"][..],
                 _ => return Err("unknown snapshot DNS transport".into()),
             };
             fields(upstream, required)?;

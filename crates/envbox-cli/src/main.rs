@@ -81,7 +81,7 @@ fn usage() -> ExitCode {
     eprintln!("  envbox container policy remove UUID --index N");
     eprintln!("  envbox container policy preview UUID --target file|registry --path P");
     eprintln!("  envbox profile list");
-    eprintln!("  envbox profile dns show UUID | add UUID --type udp|tcp|dot|doh [--address IP] [--port N] [--server-name NAME] [--url HTTPS_URL] [--bootstrap IP]...");
+    eprintln!("  envbox profile dns show UUID | add UUID --type udp|tcp|dot|doh [--address IP] [--port N] [--server-name NAME] [--url HTTPS_URL] [--bootstrap IP]... [--tls-revocation standard|strict_offline]");
     eprintln!("  envbox profile dns move UUID --from INDEX --to INDEX | remove UUID --index INDEX | set UUID [--mode host|virtual_view] [--strict true|false]");
     eprintln!("  envbox profile add --name N --locale L --ui-language U --region R \\");
     eprintln!("     --tz-windows W --tz-iana I [--dns-mode host|virtual_view] \\");

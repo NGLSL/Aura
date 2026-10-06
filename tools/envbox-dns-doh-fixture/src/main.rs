@@ -1,4 +1,4 @@
-use envbox_dns_doh::{trust::Snapshot, Budget, Error};
+use envbox_dns_doh::{trust::Snapshot, Budget, Error, RevocationPolicy};
 use std::{
     collections::HashMap,
     ffi::{c_void, CString},
@@ -49,6 +49,14 @@ fn main() {
         .chunks_exact(2)
         .map(|pair| (pair[0].clone(), pair[1].clone()))
         .collect();
+    let revocation_policy = match options.get("--tls-revocation").map(String::as_str) {
+        None | Some("strict_offline") => RevocationPolicy::StrictOffline,
+        Some("standard") => RevocationPolicy::Standard,
+        Some(value) => {
+            eprintln!("invalid --tls-revocation: {value}");
+            std::process::exit(2);
+        }
+    };
     let url = options.get("--url").expect("--url");
     let ip = options.get("--ip").expect("--ip");
     let uri: http::Uri = url.parse().expect("fixture URI");
@@ -141,6 +149,7 @@ fn main() {
             assert!(!options.contains_key("--cached-crls"));
             snapshot = snapshot.with_fixture_native_cache();
         }
+        snapshot = snapshot.with_fixture_revocation_policy(revocation_policy);
         let budget = unsafe {
             Budget::from_callback(
                 now + budget_ms,

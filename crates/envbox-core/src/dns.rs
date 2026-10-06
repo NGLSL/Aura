@@ -12,6 +12,42 @@ fn port_853() -> u16 {
     853
 }
 
+/// TLS revocation policy is independent from strict DNS routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsTlsRevocation {
+    #[default]
+    Standard,
+    StrictOffline,
+}
+impl DnsTlsRevocation {
+    pub const ALL: [Self; 2] = [Self::Standard, Self::StrictOffline];
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::Standard => "0",
+            Self::StrictOffline => "1",
+        }
+    }
+}
+impl std::fmt::Display for DnsTlsRevocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Standard => "标准证书验证",
+            Self::StrictOffline => "严格离线吊销验证",
+        })
+    }
+}
+impl std::str::FromStr for DnsTlsRevocation {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "strict_offline" => Ok(Self::StrictOffline),
+            _ => Err("tls_revocation must be standard|strict_offline"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DnsUpstream {
@@ -35,6 +71,8 @@ pub enum DnsUpstream {
         url: String,
         #[serde(default)]
         bootstrap_ips: Vec<IpAddr>,
+        #[serde(default)]
+        tls_revocation: DnsTlsRevocation,
     },
 }
 
@@ -52,7 +90,9 @@ impl DnsUpstream {
                     validate_identity(server_name)?;
                 }
             }
-            Self::Doh { url, bootstrap_ips } => {
+            Self::Doh {
+                url, bootstrap_ips, ..
+            } => {
                 let literal_authority = validate_doh_url(url)?;
                 if !literal_authority && bootstrap_ips.is_empty() {
                     return Err(invalid("hostname DoH URL requires explicit bootstrap_ips"));
@@ -79,8 +119,12 @@ impl DnsUpstream {
                 port,
                 server_name,
             } => format!("DoT {address}:{port} · {server_name}"),
-            Self::Doh { url, bootstrap_ips } => format!(
-                "DoH {url} · bootstrap {}",
+            Self::Doh {
+                url,
+                bootstrap_ips,
+                tls_revocation,
+            } => format!(
+                "DoH {url} · bootstrap {} · {tls_revocation}",
                 bootstrap_ips
                     .iter()
                     .map(ToString::to_string)
@@ -185,16 +229,6 @@ impl DnsProfile {
                 "non-strict DNS fallback is not implemented by this Runtime",
             ));
         }
-        if self.effective_upstreams().iter().any(|upstream| {
-            !matches!(
-                upstream,
-                DnsUpstream::Udp { .. } | DnsUpstream::Tcp { .. } | DnsUpstream::Dot { .. }
-            )
-        }) {
-            return Err(invalid(
-                "configured DNS transport/port is unsupported by this Runtime",
-            ));
-        }
         Ok(())
     }
     /// Shared typed protocol v1 vocabulary; callers must also bound the whole PROFILE line.
@@ -232,9 +266,14 @@ impl DnsProfile {
                         push("server_name", server_name.clone());
                     }
                 }
-                DnsUpstream::Doh { url, bootstrap_ips } => {
+                DnsUpstream::Doh {
+                    url,
+                    bootstrap_ips,
+                    tls_revocation,
+                } => {
                     push("type", "doh".into());
                     push("url", url.clone());
+                    push("tls_revocation", tls_revocation.wire_value().into());
                     push("bootstrap_count", bootstrap_ips.len().to_string());
                     for (bootstrap_index, address) in bootstrap_ips.iter().enumerate() {
                         push(&format!("bootstrap_{bootstrap_index}"), address.to_string());

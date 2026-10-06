@@ -856,6 +856,15 @@ fn decode_dns_fields(
                 DnsUpstream::Doh {
                     url: field("url")?.into(),
                     bootstrap_ips,
+                    tls_revocation: match field("tls_revocation")? {
+                        "0" => envbox_core::DnsTlsRevocation::Standard,
+                        "1" => envbox_core::DnsTlsRevocation::StrictOffline,
+                        _ => {
+                            return Err(IpcError::Protocol(
+                                "invalid DoH TLS revocation policy".into(),
+                            ))
+                        }
+                    },
                 }
             }
             _ => return Err(IpcError::Protocol("unknown DNS upstream protocol".into())),
@@ -1811,6 +1820,48 @@ mod tests {
             profile.registry.whitelist_paths
         );
         assert_eq!(decoded.browser.webrtc, profile.browser.webrtc);
+    }
+
+    #[test]
+    fn doh_ipc_preserves_policy_and_rejects_missing_or_unknown_values() {
+        let mut profile = EnvironmentProfile {
+            id: Uuid::nil(),
+            name: "DoH".into(),
+            locale: LocaleProfile {
+                locale_name: "en-US".into(),
+                ui_language: "en-US".into(),
+                region: "US".into(),
+            },
+            timezone: TimezoneProfile {
+                windows_id: "Pacific Standard Time".into(),
+                iana_id: "America/Los_Angeles".into(),
+            },
+            dns: Default::default(),
+            environment: Default::default(),
+            registry: Default::default(),
+            browser: Default::default(),
+        };
+        profile.dns = envbox_core::DnsProfile::typed(
+            envbox_core::DnsMode::VirtualView,
+            true,
+            vec![envbox_core::DnsUpstream::Doh {
+                url: "https://1.1.1.1/dns-query".into(),
+                bootstrap_ips: vec![],
+                tls_revocation: envbox_core::DnsTlsRevocation::StrictOffline,
+            }],
+        );
+        let line = profile_to_message(&profile, "instance").encode_line();
+        assert!(line.contains("dns_upstream_0_tls_revocation=1"));
+        let decoded = IpcMessage::decode_line(&line).unwrap();
+        assert_eq!(message_to_profile(&decoded).unwrap().dns, profile.dns);
+        assert!(
+            IpcMessage::decode_line(&line.replace(" dns_upstream_0_tls_revocation=1", "")).is_err()
+        );
+        assert!(IpcMessage::decode_line(&line.replace(
+            "dns_upstream_0_tls_revocation=1",
+            "dns_upstream_0_tls_revocation=2"
+        ))
+        .is_err());
     }
 
     #[test]

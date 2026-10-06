@@ -171,7 +171,7 @@ fn legacy_ready_and_forged_generation_cannot_confirm_runtime() {
 
 #[test]
 fn versioned_dns_wire_preserves_order_and_rejects_partial_snapshots() {
-    let wire = "PROFILE profile_id=p instance_id=i locale_name=en-US ui_language=en-US region=US tz_windows=UTC tz_iana=Etc/UTC inherit_children=1 audit=0 webrtc=host dns_mode=1 dns_config_version=1 dns_strict=1 dns_upstream_count=4 dns_upstream_0_type=doh dns_upstream_0_url=https://resolver.example.test/dns-query dns_upstream_0_bootstrap_count=1 dns_upstream_0_bootstrap_0=1.1.1.1 dns_upstream_1_type=dot dns_upstream_1_address=1.1.1.1 dns_upstream_1_port=853 dns_upstream_1_server_name=resolver.example.test dns_upstream_2_type=tcp dns_upstream_2_address=1.1.1.1 dns_upstream_2_port=5353 dns_upstream_3_type=udp dns_upstream_3_address=1.1.1.1 dns_upstream_3_port=53";
+    let wire = "PROFILE profile_id=p instance_id=i locale_name=en-US ui_language=en-US region=US tz_windows=UTC tz_iana=Etc/UTC inherit_children=1 audit=0 webrtc=host dns_mode=1 dns_config_version=1 dns_strict=1 dns_upstream_count=4 dns_upstream_0_type=doh dns_upstream_0_tls_revocation=0 dns_upstream_0_url=https://resolver.example.test/dns-query dns_upstream_0_bootstrap_count=1 dns_upstream_0_bootstrap_0=1.1.1.1 dns_upstream_1_type=dot dns_upstream_1_address=1.1.1.1 dns_upstream_1_port=853 dns_upstream_1_server_name=resolver.example.test dns_upstream_2_type=tcp dns_upstream_2_address=1.1.1.1 dns_upstream_2_port=5353 dns_upstream_3_type=udp dns_upstream_3_address=1.1.1.1 dns_upstream_3_port=53";
     let profile =
         envbox_launcher::message_to_profile(&IpcMessage::decode_line(wire).unwrap()).unwrap();
     let upstreams = profile.dns.effective_upstreams();
@@ -192,6 +192,11 @@ fn versioned_dns_wire_preserves_order_and_rejects_partial_snapshots() {
     for broken in [
         wire.replace(" dns_config_version=1", ""),
         wire.replace(" dns_strict=1", ""),
+        wire.replace(" dns_upstream_0_tls_revocation=0", ""),
+        wire.replace(
+            "dns_upstream_0_tls_revocation=0",
+            "dns_upstream_0_tls_revocation=2",
+        ),
         wire.replace("dns_mode=1", "dns_mode=unknown"),
         wire.replace("dns_upstream_count=4", "dns_upstream_count=3"),
         format!("{wire} dns_server=8.8.8.8"),
@@ -264,6 +269,7 @@ fn injected_runtime_reports_actual_identity() {
                         "a".repeat(600)
                     ),
                     bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
+                    tls_revocation: envbox_core::DnsTlsRevocation::Standard,
                 },
                 DnsUpstream::Dot {
                     address: "1.1.1.1".parse().unwrap(),

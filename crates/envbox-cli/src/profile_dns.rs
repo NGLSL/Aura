@@ -97,13 +97,18 @@ fn execute(store: &ConfigStore, args: &[String]) -> Result<(), String> {
                 "doh" => DnsUpstream::Doh {
                     url: get("--url")?.into(),
                     bootstrap_ips: bootstrap.clone(),
+                    tls_revocation: options
+                        .get("--tls-revocation")
+                        .copied()
+                        .unwrap_or("standard")
+                        .parse()?,
                 },
                 _ => return Err("type must be udp|tcp|dot|doh".into()),
             };
             upstream.validate().map_err(|err| err.to_string())?;
             upstreams.push(upstream);
             match kind {
-                "doh" => &["--type", "--url"],
+                "doh" => &["--type", "--url", "--tls-revocation"],
                 "dot" => &["--type", "--address", "--port", "--server-name"],
                 _ => &["--type", "--address", "--port"],
             }

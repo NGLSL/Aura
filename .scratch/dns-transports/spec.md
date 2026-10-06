@@ -55,6 +55,8 @@ port = 53
 - DoT 的 `server_name` 是证书校验身份和适用时的 SNI，不从宿主解析。支持 IP 身份时必须验证证书 IP SAN，不能关闭证书校验。
 - DoH 仅允许 `https://`，保留 URL 的主机名作为 HTTP authority、SNI、证书身份。主机名 URL 必须显式配置 `bootstrap_ips`；IP URL 可直接连接该 IP 并按 IP 身份验证证书。
 - 首版不自动解析上游域名、不跟随重定向、不继承系统代理/PAC/凭据。TLS 至少 1.2；证书有效期、信任链、主机名错误均返回失败。
+- 2026-10-06 用户确认修正 DoH 信任策略：`dns.strict` 只约束 Host DNS fallback。每个 DoH upstream 的 `tls_revocation` 独立配置为 `standard`（缺省）或 `strict_offline`。两者均验证 TLS 证书链、身份、用途、有效期与签名，保留显式不信任；Standard 不要求完整本机 CRL 覆盖，已有 CRL 的已知 revoked 仍拒绝，不读取 CDP URL cache；StrictOffline 要求完整、已知且新鲜的离线吊销材料，缺失返回失败。两种模式均不在线补取材料，不关闭证书校验。
+- DoH 使用固定依赖版本的 Mozilla 公共根证书 DER 集合与只读的本机物理 ROOT/CA/Disallowed。不是全量 AuthRoot 导入，不宣称等价于 Windows 完整原生 trust/Enterprise policy；公共根更新随依赖与应用版本发布，不在查询时下载。TOML 缺省策略为 Standard；immutable v2 DoH snapshot 和 typed Runtime DTO 必须显式绑定策略，缺失/未知值拒绝恢复或启动，不能静默丢弃 StrictOffline。
 - 旧 `servers=[IP...]` 按原顺序迁移为 UDP/53；不得自动改为 Cloudflare 或其他加密服务。不允许 `servers` 与 `upstreams` 同时生效。
 - 新建 VirtualView 默认 strict。旧 VirtualView 迁移也使用 strict 并在升级说明中说明失败行为改变；确需兼容 Host 回退的用户显式设置 `strict=false`。Host 模式仍是单独的显式选择。
 

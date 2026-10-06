@@ -6,7 +6,7 @@ Baseline: `9919ad1200e2406f1059e5a577a4a965cdd57ab7`
 
 ## 决策与当前资格
 
-WinHTTP 原型保留为 [No-Go 的既有证据](doh-bootstrap.md)。本轮验证另一个成熟库候选：Rust staticlib 内使用 Tokio literal `SocketAddr`、tokio-rustls 与 Hyper 低层 `client::conn`。没有 resolver、代理/PAC、重定向或通用 HTTP 客户端。HTTP/2 由成熟库处理。是否正式接入以原型结果为准；研究本身不能解除票 18 门禁。
+WinHTTP 原型保留为 [No-Go 的既有证据](doh-bootstrap.md)。后续采用 Rust staticlib 内的 Tokio literal `SocketAddr`、tokio-rustls 与 Hyper 低层 `client::conn`。没有 resolver、代理/PAC、重定向或通用 HTTP 客户端。HTTP/2 由成熟库处理。2026-10-06 用户明确授权修复默认离线信任阻塞：DNS strict 与 DoH TLS revocation 拆开，补入固定 Mozilla DER 根，并接入 Runtime；资格及真实结果按 [本次修复证据](doh-standard-tls-runtime.md) 分项记录，历史 No-Go 不被覆盖为成功。
 
 选择依据是可明确控制 I/O 的边界：Tokio 的 `SocketAddr` 转换不执行名称解析；Rustls 不自行执行网络 I/O；Hyper 接受已经建立的 TLS stream。URL 主机名保留为证书身份、适用时的 SNI 和 HTTP authority，连接地址单独传入。[Tokio 地址转换源码](https://raw.githubusercontent.com/tokio-rs/tokio/tokio-1.53.2/tokio/src/net/addr.rs)、[Rustls I/O 契约](https://docs.rs/rustls/0.23.43/rustls/index.html)、[Hyper HTTP/2 Connection](https://docs.rs/hyper/latest/hyper/client/conn/http2/struct.Connection.html)。这些源码契约支持原型设计，不能代替本机运行和辅助请求观测。
 
@@ -16,7 +16,7 @@ WinHTTP 原型保留为 [No-Go 的既有证据](doh-bootstrap.md)。本轮验证
 
 `READONLY` 不会把 logical system store 收窄到本地 registry；logical collection 可包含额外注册 physical provider。候选使用 `CERT_STORE_PROV_SYSTEM_REGISTRY_W`，明确 CurrentUser/LocalMachine 的 ROOT、CA、Disallowed。此选择缩窄原生 logical store 的覆盖，不宣称完全复现 Windows Enterprise/SmartCard/CTL 链策略。[CertOpenStore](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certopenstore)、[System Store Locations](https://learn.microsoft.com/en-us/windows/win32/seccrypto/system-store-locations)。
 
-- ROOT 才能作为 trust anchor；CA 只提供中间证书候选，不能把中间证书提升为独立信任锚。
+- 本机 ROOT 与固定版本 Mozilla DER 集合才能作为 trust anchor；CA 只提供中间证书候选，不能把中间证书提升为独立信任锚。后者是明确的应用信任输入，仍经过本机 Disallowed/hash 和已记录的限制过滤，不使用 AuthRoot 候选替代该输入。
 - ROOT 转换前检查有效期和 Windows 有效 EKU。`CertGetEnhancedKeyUsage(flags=0)` 的零 OID 必须区分 `CRYPT_E_NOT_FOUND`（全部用途）与成功错误码 0（没有用途）；非空列表必须允许 serverAuth，读取失败不能当作不限用途。[EKU 契约](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetenhancedkeyusage)。
 - WebPKI anchor 不保留 Windows 属性 EKU/CTL，所以筛选必须在转换前完成。[WebPKI trust anchor 源码](https://raw.githubusercontent.com/rustls/webpki/v/0.103.8/src/trust_anchor.rs)。
 - Disallowed 同时约束 ROOT、叶证书和全部中间证书候选；wrapper 只能增加拒绝条件，必须完整委托标准链、名称和 TLS handshake signature 校验。
@@ -26,7 +26,7 @@ WinHTTP 原型保留为 [No-Go 的既有证据](doh-bootstrap.md)。本轮验证
 
 ## 吊销策略
 
-保持现有 DoT 的严格离线策略，不为 DoH 偷换为“缺材料时跳过”：标准 verifier `with_crls` 加 `enforce_revocation_expiration`，保持全非根链深度和 Unknown Deny。不启用只查叶证书或 unknown allow。自包含 fixture 在构建 verifier 前拒绝空 CRL；native 快照可以等待收到 peer CDP 后读取已有缓存，但绝不接受空 CRL verifier 的结果。无匹配 issuer、过期、不支持格式和 revoked 均失败，不在线补材料。[Rustls verifier 源码](https://docs.rs/rustls/0.23.43/src/rustls/webpki/server_verifier.rs.html)。
+2026-10-06 用户授权修正此前无条件采用严格离线吊销的决策。DoH Standard 为缺省，使用标准 verifier 完整校验链、身份、用途、有效期和签名，已有 CRL 检查 known revoked，但不要求完整 revocation 覆盖、不强制 CRL freshness、不进入 CDP cache collector。DoH StrictOffline 保留 `with_crls` / `enforce_revocation_expiration`、全非根链深度和 Unknown Deny；空 CRL 或缺/过期材料严格失败。两种模式都不在线补材料，不降级 Host DNS；DoT 的既有策略保持。此显式策略差异取代之前“所有 DoH 缺材料即失败”的默认要求。[Rustls verifier 源码](https://docs.rs/rustls/0.23.45/src/rustls/webpki/server_verifier.rs.html)。
 
 Rustls 空 CRL 会跳过吊销，默认也允许过期 CRL；其标准 verifier 不验证 stapled OCSP。store 内 CRL 不等于完整 Cryptnet/OCSP 缓存。因此本机材料不足时公共 DoH 可以失败，不能把内存测试 CA/CRL 的成功写成产品公共服务正向。此限制必须在交付中明示。
 

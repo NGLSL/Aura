@@ -1,4 +1,4 @@
-use envbox_core::{DnsMode, DnsProfile, DnsUpstream};
+use envbox_core::{DnsMode, DnsProfile, DnsTlsRevocation, DnsUpstream};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransportChoice {
@@ -30,6 +30,7 @@ pub struct UpstreamDraft {
     pub server_name: String,
     pub url: String,
     pub bootstrap: String,
+    pub tls_revocation: DnsTlsRevocation,
 }
 impl Default for UpstreamDraft {
     fn default() -> Self {
@@ -40,6 +41,7 @@ impl Default for UpstreamDraft {
             server_name: String::new(),
             url: String::new(),
             bootstrap: String::new(),
+            tls_revocation: DnsTlsRevocation::Standard,
         }
     }
 }
@@ -64,6 +66,7 @@ impl UpstreamDraft {
             DnsUpstream::Doh {
                 url: self.url.clone(),
                 bootstrap_ips,
+                tls_revocation: self.tls_revocation,
             }
         } else {
             let address = self
@@ -154,12 +157,20 @@ mod tests {
         assert!(editor.add().is_err());
         assert_eq!(editor.upstreams.len(), 1);
         editor.draft.bootstrap = "1.0.0.1".into();
+        editor.draft.tls_revocation = DnsTlsRevocation::StrictOffline;
         editor.add().unwrap();
         editor.move_upstream(1, true);
         let profile = editor.to_profile(DnsMode::VirtualView).unwrap();
         assert!(matches!(profile.upstreams[0], DnsUpstream::Doh { .. }));
         assert!(profile.strict);
-        assert!(profile.validate_runtime_support().is_err());
+        assert!(matches!(
+            profile.upstreams[0],
+            DnsUpstream::Doh {
+                tls_revocation: DnsTlsRevocation::StrictOffline,
+                ..
+            }
+        ));
+        profile.validate_runtime_support().unwrap();
         let loaded: DnsProfile = toml::from_str(&toml::to_string(&profile).unwrap()).unwrap();
         assert_eq!(DnsEditor::from_profile(&loaded).upstreams, editor.upstreams);
         editor.strict = false;

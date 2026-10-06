@@ -15,7 +15,7 @@ pub mod dns;
 pub mod run_snapshot;
 pub mod session;
 pub mod storage_policy;
-pub use dns::{DnsProfile, DnsUpstream};
+pub use dns::{DnsProfile, DnsTlsRevocation, DnsUpstream};
 pub use run_snapshot::RunSnapshot;
 
 pub use browser_policy::{
@@ -464,6 +464,48 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("unknown".into(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<RunSnapshot>(unknown).is_err());
+    }
+
+    #[test]
+    fn snapshot_binds_explicit_doh_revocation_policy_and_rejects_missing_or_unknown() {
+        let mut profile = valid_profile();
+        profile.dns = DnsProfile::typed(
+            DnsMode::VirtualView,
+            true,
+            vec![DnsUpstream::Doh {
+                url: "https://1.1.1.1/dns-query".into(),
+                bootstrap_ips: vec![],
+                tls_revocation: DnsTlsRevocation::StrictOffline,
+            }],
+        );
+        let container = Container::new("DoH", profile.id);
+        let snapshot = RunSnapshot::new(&container, &profile, Uuid::new_v4()).unwrap();
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            encoded["effective_profile"]["dns"]["upstreams"][0]["tls_revocation"],
+            "strict_offline"
+        );
+        assert_eq!(
+            serde_json::from_value::<RunSnapshot>(encoded.clone()).unwrap(),
+            snapshot
+        );
+        let mut changed = snapshot.clone();
+        if let DnsUpstream::Doh { tls_revocation, .. } =
+            &mut changed.effective_profile.dns.upstreams[0]
+        {
+            *tls_revocation = DnsTlsRevocation::Standard;
+        }
+        assert!(changed.validate().is_err());
+        let mut missing = encoded.clone();
+        missing["effective_profile"]["dns"]["upstreams"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("tls_revocation");
+        assert!(serde_json::from_value::<RunSnapshot>(missing).is_err());
+        let mut unknown = encoded;
+        unknown["effective_profile"]["dns"]["upstreams"][0]["tls_revocation"] =
+            serde_json::json!("disabled");
         assert!(serde_json::from_value::<RunSnapshot>(unknown).is_err());
     }
 

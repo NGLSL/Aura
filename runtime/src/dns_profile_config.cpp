@@ -80,6 +80,7 @@ int EnvBoxDecodeDnsConfiguration(RuntimeProfile* out, EnvBoxDnsFieldGetter gette
   if (strcmp(strict, "1") == 0 || strcmp(strict, "true") == 0) out->dns_strict = 1;
   else if (strcmp(strict, "0") == 0 || strcmp(strict, "false") == 0) out->dns_strict = 0;
   else return 0;
+  if (out->dns_mode == 1 && out->dns_strict != 1) return 0;
   if (!GetNumber(getter, context, "dns_upstream_count", ENVBOX_DNS_MAX, &numeric)) return 0;
   out->dns_upstream_count = static_cast<int>(numeric);
   for (int i = 0; i < out->dns_upstream_count; ++i) {
@@ -105,11 +106,14 @@ int EnvBoxDecodeDnsConfiguration(RuntimeProfile* out, EnvBoxDnsFieldGetter gette
       if (entry.type == EnvBoxDnsDot &&
           (!field("server_name", entry.server_name, sizeof(entry.server_name)) || !entry.server_name[0])) return 0;
     } else {
-      char count[16];
+      char count[16], revocation[8];
       if (!field("url", entry.url, sizeof(entry.url)) || strncmp(entry.url, "https://", 8) != 0 ||
           !entry.url[8] || strchr(entry.url, '\r') || strchr(entry.url, '\n') ||
           !field("bootstrap_count", count, sizeof(count)) || !Number(count, ENVBOX_DNS_MAX, &numeric)) return 0;
       entry.bootstrap_count = static_cast<int>(numeric);
+      if (!field("tls_revocation", revocation, sizeof(revocation)) ||
+          !Number(revocation, 1, &numeric)) return 0;
+      entry.tls_revocation = static_cast<int>(numeric);
       for (int b = 0; b < entry.bootstrap_count; ++b) {
         sprintf_s(key, "dns_upstream_%d_bootstrap_%d", i, b);
         if (!Required(getter, context, key, entry.bootstrap_ips[b], sizeof(entry.bootstrap_ips[b])) ||
@@ -156,6 +160,8 @@ int EnvBoxEmitDnsConfiguration(const RuntimeProfile* p,
       if (!field("address", entry.address) || !field("port", number)) return 0;
       if (entry.type == EnvBoxDnsDot && !field("server_name", entry.server_name)) return 0;
     } else {
+      if (entry.tls_revocation < 0 || entry.tls_revocation > 1 ||
+          !field("tls_revocation", entry.tls_revocation ? "1" : "0")) return 0;
       sprintf_s(number, "%d", entry.bootstrap_count);
       if (entry.bootstrap_count < 0 || entry.bootstrap_count > ENVBOX_DNS_MAX ||
           !field("url", entry.url) || !field("bootstrap_count", number)) return 0;

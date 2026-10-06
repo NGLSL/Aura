@@ -458,9 +458,11 @@ mod tests {
             true,
             vec![envbox_core::DnsUpstream::Doh {
                 url: "https://resolver.example.test/dns-query".into(),
-                bootstrap_ips: vec![],
+                bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
+                tls_revocation: envbox_core::DnsTlsRevocation::Standard,
             }],
         );
+        unavailable.validate_runtime_support().unwrap();
         assert!(validate_runtime_for_profile(&path, &unavailable, true).is_err());
         assert!(validate_runtime_for_profile(
             Path::new("nonexistent-runtime.dll"),

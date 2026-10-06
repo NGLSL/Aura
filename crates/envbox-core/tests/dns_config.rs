@@ -25,13 +25,13 @@ fn legacy_servers_migrate_order_and_strict_without_host_fallback() {
 }
 
 #[test]
-fn encrypted_configuration_roundtrips_but_is_not_runtime_supported() {
+fn encrypted_configuration_roundtrips_and_is_runtime_supported() {
     let wire = "mode = 'virtual_view'\nstrict = true\n[[upstreams]]\ntype = 'doh'\nurl = 'https://dns.example/dns-query'\nbootstrap_ips = ['1.1.1.1']\n[[upstreams]]\ntype = 'dot'\naddress = '1.1.1.1'\nport = 853\nserver_name = 'dns.example'\n[[upstreams]]\ntype = 'tcp'\naddress = '1.0.0.1'\nport = 53\n[[upstreams]]\ntype = 'udp'\naddress = '1.0.0.1'\nport = 53\n";
     let dns: DnsProfile = toml::from_str(wire).unwrap();
     dns.validate().unwrap();
     assert_eq!(dns.upstreams.len(), 4);
     assert!(dns.servers.is_empty());
-    assert!(dns.validate_runtime_support().is_err());
+    dns.validate_runtime_support().unwrap();
     assert_eq!(
         toml::from_str::<DnsProfile>(&toml::to_string(&dns).unwrap()).unwrap(),
         dns
@@ -59,7 +59,7 @@ fn malformed_mixed_and_unimplemented_dns_are_rejected_explicitly() {
     )
     .unwrap();
     assert!(ip_url.servers.is_empty());
-    assert!(ip_url.validate_runtime_support().is_err());
+    ip_url.validate_runtime_support().unwrap();
 }
 
 #[test]
@@ -89,7 +89,8 @@ fn flat_fields_preserve_order_and_reject_payload_overflow() {
         vec![
             DnsUpstream::Doh {
                 url: format!("https://dns.example/{}", "x".repeat(1900)),
-                bootstrap_ips: vec!["1.1.1.1".parse().unwrap()]
+                bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
+                tls_revocation: envbox_core::DnsTlsRevocation::Standard
             };
             8
         ],
@@ -120,4 +121,29 @@ fn native_udp_tcp_port_capability_is_separate_from_encrypted_transports() {
         .flat_fields()
         .unwrap()
         .contains(&("dns_upstream_0_port".into(), "15353".into())));
+}
+
+#[test]
+fn doh_revocation_policy_defaults_and_strict_roundtrip_are_independent_of_dns_routing() {
+    let wire = "mode='virtual_view'\nstrict=true\n[[upstreams]]\ntype='doh'\nurl='https://1.1.1.1/dns-query'\n";
+    let standard: DnsProfile = toml::from_str(wire).unwrap();
+    assert!(matches!(
+        standard.upstreams[0],
+        DnsUpstream::Doh {
+            tls_revocation: envbox_core::DnsTlsRevocation::Standard,
+            ..
+        }
+    ));
+    let strict: DnsProfile =
+        toml::from_str(&format!("{wire}tls_revocation='strict_offline'\n")).unwrap();
+    assert!(strict.strict);
+    assert_eq!(
+        toml::from_str::<DnsProfile>(&toml::to_string(&strict).unwrap()).unwrap(),
+        strict
+    );
+    assert!(strict
+        .flat_fields()
+        .unwrap()
+        .contains(&("dns_upstream_0_tls_revocation".into(), "1".into())));
+    assert!(toml::from_str::<DnsProfile>(&format!("{wire}tls_revocation='disabled'\n")).is_err());
 }

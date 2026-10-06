@@ -1,4 +1,4 @@
-use crate::{transport, Budget, CancelCallback, Error};
+use crate::{transport, trust::RevocationPolicy, Budget, CancelCallback, Error};
 use std::{
     ffi::c_void,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -31,7 +31,75 @@ pub unsafe extern "C" fn envbox_doh_query(
     context: *mut c_void,
     error: *mut u32,
 ) -> i32 {
+    envbox_doh_query_with_policy(
+        url,
+        url_length,
+        literal_ip,
+        ip_length,
+        query,
+        query_length,
+        response,
+        capacity,
+        deadline,
+        cancelled,
+        context,
+        RevocationPolicy::Standard as u32,
+        error,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_tls_policy_is_rejected_before_pointer_or_trust_access() {
+        let mut error = 0;
+        let result = unsafe {
+            envbox_doh_query_with_policy(
+                std::ptr::null(),
+                1,
+                std::ptr::null(),
+                1,
+                std::ptr::null(),
+                12,
+                std::ptr::null_mut(),
+                12,
+                u64::MAX,
+                None,
+                std::ptr::null_mut(),
+                2,
+                &mut error,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(error, Error::Argument as u32);
+    }
+}
+
+/// Same pointer/lifetime contract as `envbox_doh_query`. Policy is independent
+/// of DNS routing: 0 standard PKI, 1 strict offline revocation; others fail.
+///
+/// # Safety
+/// All pointer and callback requirements of `envbox_doh_query` apply.
+#[no_mangle]
+pub unsafe extern "C" fn envbox_doh_query_with_policy(
+    url: *const u8,
+    url_length: usize,
+    literal_ip: *const u8,
+    ip_length: usize,
+    query: *const u8,
+    query_length: usize,
+    response: *mut u8,
+    capacity: usize,
+    deadline: u64,
+    cancelled: CancelCallback,
+    context: *mut c_void,
+    tls_revocation: u32,
+    error: *mut u32,
+) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
+        let policy = RevocationPolicy::try_from(tls_revocation)?;
         if url.is_null()
             || literal_ip.is_null()
             || query.is_null()
@@ -48,17 +116,14 @@ pub unsafe extern "C" fn envbox_doh_query(
         let literal_ip = str::from_utf8(slice::from_raw_parts(literal_ip, ip_length))
             .map_err(|_| Error::Argument)?;
         let query = slice::from_raw_parts(query, query_length);
-        let bytes = transport::query(
-            url,
-            literal_ip,
-            query,
-            Budget {
-                deadline,
-                cancelled,
-                context,
-            },
-            None,
-        )?;
+        let budget = Budget {
+            deadline,
+            cancelled,
+            context,
+        };
+        budget.check()?;
+        let snapshot = crate::trust::Snapshot::load_with_policy(budget, policy)?;
+        let bytes = transport::query(url, literal_ip, query, budget, Some(snapshot))?;
         if bytes.len() > capacity {
             return Err(Error::BodyLimit);
         }

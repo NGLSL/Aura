@@ -540,6 +540,7 @@ mod tests {
                 DnsUpstream::Doh {
                     url: "https://dns.example/dns-query".into(),
                     bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
+                    tls_revocation: envbox_core::DnsTlsRevocation::StrictOffline,
                 },
                 DnsUpstream::Dot {
                     address: "1.0.0.1".parse().unwrap(),

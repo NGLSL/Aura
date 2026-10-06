@@ -145,3 +145,11 @@ AuthRoot 签名/显式 signer trust、Root Program 属性、freshness/rollback/�
 默认 staticlib/MSVC DLL/C ABI fresh WMI 复测仍 certificate failure，默认诊断 `UnknownIssuer`、研究 AuthRoot 变体 `UnknownRevocationStatus`。Google cache 候选 2、Cloudflare 0，仍不能证明完整吊销。真实 AuthRoot policy/provenance/rotation、公共离线信任和完整观测门禁不因受控 fixture 通过而解除；18 No-Go/19 off。完整回归、来源/hash 与审查见 [本切片证据](doh-signed-ctl-cancellation.md) 和 [双轴 review](doh-signed-ctl-cancellation-review.md)。P4–P8 驱动/Verifier/内核恢复仍需隔离 VM。
 
 最终修正后 fresh WMI PID 5584 / Runtime modules 0，Rust 1.99 workspace build/test exit 0，**414 passed / 0 failed / 34 ignored**；x64/i686 DoH crate各 **25 passed / 0 failed / 1 ignored**。Standards 原 P2 已经独立复审标记 resolved；Standards/Spec 当前新增未解决 actionable findings 均 0，完整规格仍 partial。
+
+## 2026-10-06 用户授权修复：标准 TLS 与真实 DoH Runtime
+
+本轮基线 `a0dbac9`。用户明确确认问题后要求修复：每个DoH上游的 `tls_revocation` 与 DNS strict 拆开，Standard缺省完整校验证书但不要求本机完整CRL，StrictOffline保留材料不足失败；固定MozillaDER根包提供明确应用信任，不全量AuthRoot提升。GUI/CLI/IPC/不可变快照均传递策略。Runtime必链接default-feature-off Rust staticlib，DoH接入既有任意QTYPE Query Engine并报告真实能力。
+
+补充发现Google HTTP2会因额外普通Host头而RST_STREAM(PROTOCOL_ERROR)。保留absolute URI自动生成:authority，仅H1发送Host；产品最小错误和独立有/无Host对照定位，旧binary本地assert RED → 当前双架构114场景GREEN。最终默认native Cloudflare/Google IPv4都成功，strict与未知policy拒绝、process24 API分项通过；IPv6仍明确未执行。
+
+最终真实Profile/Launcher/Runtime双架构16项关键验收通过，含两个公共服务A/HTTPS65、StrictOffline、受控bootstrap retry/all-dead与async cancel；先前24项广覆盖包括AAAA/TXT/MX/PTR/SVCB/getaddrinfo保留。此次独立且不需VM的DoH可用性已证明，安装升级、完整OS/globaltraffic/IPv6及内核运行保证仍未证明。证据、最终回归数字和审查见 [修复证据](doh-standard-tls-runtime.md)、[双轴review](doh-standard-tls-runtime-review.md)。未发布或修改宿主网络/trust。

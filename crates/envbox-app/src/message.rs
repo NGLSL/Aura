@@ -258,6 +258,7 @@ pub enum Message {
     ProfileDnsServerName(String),
     ProfileDnsUrl(String),
     ProfileDnsBootstrap(String),
+    ProfileDnsTlsRevocation(envbox_core::DnsTlsRevocation),
     ProfileDnsAdd,
     ProfileDnsRemove(usize),
     ProfileDnsMove(usize, bool),

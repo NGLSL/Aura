@@ -24,6 +24,21 @@ int32_t ENVBOX_DOH_CALL envbox_doh_query(
   uint64_t deadline, EnvBoxDohCancelled cancelled, void* context,
   uint32_t* error);
 
+// TLS revocation policy is independent of DNS strict/no-host-fallback.
+// Standard checks chain/name/time/signatures and available CRLs; it requires
+// no complete revocation coverage. StrictOffline requires known, fresh status.
+enum EnvBoxDohRevocationPolicy {
+  EnvBoxDohStandard=0, EnvBoxDohStrictOffline=1
+};
+// envbox_doh_query uses Standard. Unknown policy values fail as Argument.
+int32_t ENVBOX_DOH_CALL envbox_doh_query_with_policy(
+  const uint8_t* url, size_t url_length,
+  const uint8_t* literal_ip, size_t ip_length,
+  const uint8_t* query, size_t query_length,
+  uint8_t* response, size_t response_capacity,
+  uint64_t deadline, EnvBoxDohCancelled cancelled, void* context,
+  uint32_t tls_revocation, uint32_t* error);
+
 enum EnvBoxDohError {
   EnvBoxDohNone=0, EnvBoxDohArgument=1, EnvBoxDohCancelledError=2,
   EnvBoxDohDeadline=3, EnvBoxDohNetwork=4, EnvBoxDohTls=5,

@@ -1,8 +1,8 @@
-# Explicit-bootstrap DoH backend prototype
+# Explicit-bootstrap DoH backend
 
-This crate is a prototype and FFI substrate. It is not enabled by the product
-Query Engine or Runtime capability report. Product integration requires a
-separate acceptance decision; the source does not replace the DNS packet parser.
+This crate is linked into the x64/x86 C++ Runtime as a staticlib. Profile DoH
+uses the existing Query Engine and DNS packet parser; TLS and HTTP transport
+do not interpret QTYPE. Runtime capabilities advertise the linked backend.
 
 The caller supplies a HTTPS URL, one literal bootstrap IP, a DNS packet, an
 absolute Windows `GetTickCount64` deadline, cancellation callback and output
@@ -38,12 +38,23 @@ pointers are not recoverable Rust panics.
 Offline trust reads bounded CurrentUser/LocalMachine physical registry ROOT,
 CA and Disallowed snapshots, plus readonly landed Disallowed CTL cache. No
 CryptoAPI chain, online certificate retrieval, logical-store provider, SSL_CERT
-environment override or host trust mutation is used. ROOT anchors require
+environment override or host trust mutation is used. A fixed-version
+`webpki-root-certs` Mozilla public DER bundle supplies additional explicit
+application anchors, filtered by the same local deny/signature-hash policy.
+It is updated with dependencies/application releases, never during a query.
+ROOT anchors require
 effective serverAuth EKU/time eligibility. CA material remains intermediate
 candidates. Explicit denied certificates and supported CTL subjects restrict
 roots and peer certificates. Unknown CTL structure/algorithm fails closed.
 
-Revocation requires a nonempty CRL collection, full non-root chain coverage,
+TLS revocation is independent of DNS strict/no-host-fallback. Profile DoH and
+the original `envbox_doh_query` entry use Standard by default: normal chain,
+hostname, purpose, time and signature validation, plus known-revoked rejection
+from available CRLs, without requiring complete revocation coverage or CRL
+freshness. Standard does not enter the CDP cache collector. It never performs
+online certificate/revocation retrieval.
+
+`StrictOffline` requires a nonempty CRL collection, full non-root chain coverage,
 known status and unexpired CRLs. The underlying rustls builder defaults to
 chain checking and unknown-status denial, but empty CRLs disable its revocation
 checks. Fixture snapshots reject empty lists during preparation. Native
@@ -71,12 +82,15 @@ does not authorize production AuthRoot anchors; signer provenance, rotation,
 chain/revocation and real Root Program policy semantics remain unproved. See
 [controlled fixtures](../../tools/envbox-authroot-fixture/README.md).
 
-This is a narrower local policy than Windows' complete native trust engine.
+This is an application trust policy, with narrower Windows provider/policy
+coverage than the complete native trust engine.
 Logical/Enterprise/GroupPolicy/SmartCard providers, all Windows CTL semantics and
 complete Cryptnet/OCSP/delta-CRL coverage are not reproduced. Public resolvers can fail when
 matching offline revocation material is unavailable; no Host fallback follows.
 
-`include/envbox_dns_doh.h` specifies the C ABI and typed error values. Buffer and
+`include/envbox_dns_doh.h` specifies the C ABI and typed error values. The
+`envbox_doh_query_with_policy` entry accepts 0 Standard or 1 StrictOffline;
+unknown values fail as Argument before trust/network work. Buffer and
 callback lifetimes are caller obligations. The safe Rust deadline constructor
 has no callback; the callback constructor is explicitly unsafe and documents
 validity for every use and copy of the budget.
@@ -86,4 +100,6 @@ directory separate from fixture builds. `fixture-trust` only exposes the
 standalone Rust fixture API and must never enter a product staticlib. The fixture
 binary is gated by `required-features`, so ordinary workspace builds do not
 activate it. The MSVC fixture verifies both architecture libraries really link
-and contain no fixture API symbols. No product CMake integration is enabled.
+and contain no fixture API symbols. Runtime CMake builds the locked default
+staticlib in its own architecture/configuration target directory and links the
+reported native libraries; no fixture feature enters the shipped Runtime.

@@ -888,6 +888,9 @@ impl EnvBoxApp {
             Message::ProfileDnsBootstrap(value) => {
                 self.profile_draft.dns_editor.draft.bootstrap = value
             }
+            Message::ProfileDnsTlsRevocation(value) => {
+                self.profile_draft.dns_editor.draft.tls_revocation = value
+            }
             Message::ProfileDnsAdd => {
                 if let Err(err) = self.profile_draft.dns_editor.add() {
                     self.set_status(StatusKind::Error, format!("上游配置失败：{err}"));

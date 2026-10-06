@@ -45,3 +45,9 @@ F03、F10。DNS 相关细节遵循 [DNS transports 规格](../../dns-transports/
 同日后续：已补 native Cryptnet CRL cache-only/no-write 读取和严格标准 verifier 重试，自包含 fixture 不读宿主缓存。用户 cache 的约 80 条列表不代表目标链可用；双架构 Google peer CDP 实际命中 2 份候选，Cloudflare 命中 0，研究 AuthRoot 变体仍严格拒绝 unknown revocation。AuthRoot CTL 验签、策略语义及 signer 轮换研究已保存，生产路径未全量导入 AuthRoot。见 [缓存切片证据](../evidence/doh-offline-crl-cache.md)、[AuthRoot 离线研究](../evidence/authroot-offline-research.md)。18 No-Go/19 阻塞保持。
 
 前一切片新增的 native cache 步骤间取消门禁已在后续切片补齐：caller-thread RAII scope 保管完整 Budget，verifier 只保留不可复用的 thread/scope identity；缓存 collector 各 CAPI 步骤间检查原 callback，一次性取消被锁存并传回 transport。双架构真实 cache-only collector 的入口、CDP 返回后和 retrieval 返回后取消均通过，查询返回后 callback 已恢复零，HTTP/canary 仍为零。单次同步 CAPI 内部不能抢占。另已实现受控 signed CTL 的显式 signer pins、逐 signer 验签和验签后策略检查，但不接入生产 AuthRoot；真实 policy/provenance/rotation 等门槛仍未解除。见 [本切片证据](../evidence/doh-signed-ctl-cancellation.md) 与 [独立审查](../evidence/doh-signed-ctl-cancellation-review.md)。18 No-Go/19 阻塞保持。
+
+## 2026-10-06 用户授权后的标准 TLS 修复
+
+用户明确要求修复，不再将 DNS strict 与完整离线 revocation 绑定为默认门槛。本票历史 No-Go 对应旧策略，保留为历史证据；当前 Standard / StrictOffline 是显式分开的策略。加入固定 Mozilla DER 根并修正 Google HTTP/2 对额外 Host 的兼容问题后，当前 Windows x64/x86 默认 native C ABI 的 Cloudflare/Google IPv4 均成功，policy negative 与 process API 分项均通过。114 fixture 场景通过；最终实际 Profile/Runtime 注入 16 项关键场景通过，另保留先前 24 项广覆盖。
+
+当前机器的 Standard IPv4 后端资格已有真实正负证据，用户授权修复范围内已接入 19；不把固定根包当作全量 AuthRoot 授权。其他 OS/IPv6/global traffic 完整门禁仍 partial，宽泛 global acceptance 仍未通过，不能把本票或完整 Container 全部关闭。策略变更、来源/hash、阶段差异和剩余范围见 [本次修复证据](../evidence/doh-standard-tls-runtime.md)、[独立审查](../evidence/doh-standard-tls-runtime-review.md)。未修改宿主配置或加载驱动。

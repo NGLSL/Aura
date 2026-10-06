@@ -11,7 +11,8 @@ pub mod trust;
 mod verification_scope;
 pub use budget::{Budget, CancelCallback};
 pub use error::Error;
-pub use ffi::envbox_doh_query;
+pub use ffi::{envbox_doh_query, envbox_doh_query_with_policy};
+pub use trust::RevocationPolicy;
 
 /// Standalone fixture callback instrumentation; absent from product/C ABI.
 #[cfg(feature = "fixture-trust")]

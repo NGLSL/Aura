@@ -85,6 +85,10 @@ OTHER = cert("other", ca=True)
 BADROOT = cert("bad-root", ca=True, wrong_eku=True)
 INTERMEDIATE = cert("intermediate", ca=True, issuer=ROOT)
 LEAF = cert("leaf", issuer=ROOT)
+tampered_leaf = bytearray((OUT / "leaf.der").read_bytes())
+tampered_leaf[-1] ^= 1  # Keep the matching private key; invalidate issuer signature.
+(OUT / "bad-signature-leaf.pem").write_bytes(
+    x509.load_der_x509_certificate(bytes(tampered_leaf)).public_bytes(serialization.Encoding.PEM))
 cert("expired", issuer=ROOT, expired=True)
 cert("untrusted", issuer=OTHER)
 cert("bad-root-leaf", issuer=BADROOT)
@@ -119,7 +123,7 @@ tampered_crl[-1] ^= 1  # Preserve ASN.1, invalidate only the signature.
 def case(executable, trap, label, *, certificate="leaf", key=None, identity="fixture.test",
          roots="root", crls="root-crl", ca="", deny="", behavior="answer", protocol="h2",
          expected=0, budget=1800, cancel=None, repeats=1, tls12=False, bootstrap="127.0.0.1",
-         cached_crls=None, native_cache=False, cancel_cache_check=None):
+         cached_crls=None, native_cache=False, cancel_cache_check=None, tls_revocation=None):
     address = ipaddress.ip_address(bootstrap)
     listener = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET)
     listener.bind((bootstrap, 0))
@@ -127,7 +131,7 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
     listener.settimeout(.1)
     port = listener.getsockname()[1]
     stop = threading.Event()
-    observed = {"connections": 0, "requests": 0, "peer": [], "sni": [], "alpn": [], "tls": [], "authority": []}
+    observed = {"connections": 0, "requests": 0, "peer": [], "sni": [], "alpn": [], "tls": [], "authority": [], "h2_host": []}
     baseline_canary = CANARY_COUNT
 
     def respond(secure, packet, stream_id=None, connection=None):
@@ -212,6 +216,8 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
                                         observed["requests"] += 1
                                         headers = dict(event.headers)
                                         assert headers[":method"] == "POST"
+                                        observed["h2_host"].append(headers.get("host"))
+                                        assert "host" not in headers, "HTTP/2 request contains ordinary Host header"
                                         observed["authority"].append(headers[":authority"])
                                         bodies[event.stream_id] = b""
                                     elif isinstance(event, DataReceived):
@@ -244,6 +250,8 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
                                 pass
                         except (OSError, ssl.SSLError):
                             pass
+        except AssertionError as error:
+            observed["assertion"] = str(error)
         except (OSError, EOFError, ssl.SSLError) as error:
             observed["closed"] = type(error).__name__
         finally:
@@ -265,6 +273,8 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
         command += ["--native-cache", "true"]
     if cancel_cache_check is not None:
         command += ["--cancel-cache-check", str(cancel_cache_check)]
+    if tls_revocation is not None:
+        command += ["--tls-revocation", tls_revocation]
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=8)
     finally:
@@ -274,6 +284,7 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
     print(json.dumps({"arch": pathlib.Path(executable).parent.parent.name, "case": label,
         "stdout": output, "observed": observed, "canary": CANARY_COUNT - baseline_canary}), flush=True)
     assert not worker.is_alive(), label
+    assert "assertion" not in observed, (label, observed)
     assert re.search(r"error=" + str(expected) + r"\b", output), (label, result.returncode, output, result.stderr)
     trap_result = json.loads(output.split("trap=", 1)[1])
     assert trap_result["installed"]
@@ -281,7 +292,9 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
     assert trap_result["connects_denied"] == 0 and trap_result["extension_denied"] == 0
     assert all(api["calls"] == 0 for api in trap_result["apis"] if api["name"] in ("sendto", "WSASendTo"))
     assert CANARY_COUNT == baseline_canary
-    if native_cache:
+    if native_cache and tls_revocation == "standard":
+        assert "cache_checks=0" in output and "cache_pulses=0" in output, (label, output)
+    elif native_cache:
         cache_checks = int(re.search(r"cache_checks=(\d+)", output).group(1))
         cache_pulses = int(re.search(r"cache_pulses=(\d+)", output).group(1))
         assert observed["requests"] == 0, label
@@ -329,6 +342,11 @@ def main():
     try:
       for index in range(1, len(sys.argv), 2):
         exe, trap = map(pathlib.Path, sys.argv[index:index + 2])
+        invalid = subprocess.run([str(exe), "--tls-revocation", "invalid"],
+                                 text=True, capture_output=True, timeout=8)
+        assert invalid.returncode == 2 and "invalid --tls-revocation" in invalid.stderr
+        print(json.dumps({"arch": exe.parent.parent.name, "case": "invalid-tls-revocation",
+                          "exit": invalid.returncode, "stderr": invalid.stderr.strip()}), flush=True)
         case(exe, trap, "h2-positive")
         case(exe, trap, "h2-tls12-positive", tls12=True)
         case(exe, trap, "h1-positive", protocol="http/1.1")
@@ -378,6 +396,21 @@ def main():
              cancel_cache_check=5, expected=2)
         case(exe, trap, "native-cache-cancel-after-retrieve", crls="", native_cache=True,
              cancel_cache_check=10, expected=2)
+        # Standard TLS permits missing revocation material, but retains chain,
+        # identity, validity, signature, explicit denial, and known revocation.
+        case(exe, trap, "standard-empty-crls", crls="", tls_revocation="standard")
+        case(exe, trap, "standard-missing-ca-revocation", certificate="chain", key="chain-leaf",
+             crls="ca-crl", tls_revocation="standard")
+        case(exe, trap, "standard-revoked-ee", crls="revoked-leaf-crl", tls_revocation="standard", expected=8)
+        case(exe, trap, "standard-revoked-ca", certificate="chain", key="chain-leaf",
+             crls="revoked-ca-crl;ca-crl", tls_revocation="standard", expected=8)
+        case(exe, trap, "standard-untrusted", certificate="untrusted", crls="", tls_revocation="standard", expected=6)
+        case(exe, trap, "standard-wrong-name", identity="wrong.test", crls="", tls_revocation="standard", expected=9)
+        case(exe, trap, "standard-expired", certificate="expired", crls="", tls_revocation="standard", expected=6)
+        case(exe, trap, "standard-bad-signature", certificate="bad-signature-leaf", key="leaf",
+             crls="", tls_revocation="standard", expected=6)
+        case(exe, trap, "standard-denied-ee", deny="leaf", crls="", tls_revocation="standard", expected=10)
+        case(exe, trap, "standard-disables-native-cache", crls="", native_cache=True, tls_revocation="standard")
         case(exe, trap, "redirect", behavior="redirect", expected=12)
         case(exe, trap, "http-non2xx", behavior="http-error", expected=12)
         case(exe, trap, "media", behavior="bad-media", expected=13)

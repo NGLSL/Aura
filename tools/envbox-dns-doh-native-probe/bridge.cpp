@@ -9,6 +9,7 @@
 BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
 
 struct ProbeOutcome {
+  uint32_t policy;
   uint32_t error;
   int32_t length;
   uint16_t query_id;
@@ -77,17 +78,18 @@ static void MakeQuery(uint8_t* packet, uint16_t id) {
   packet[offset + 3] = 1; // IN
 }
 
-static int32_t Query(const char* url, const char* ip, ProbeOutcome* outcome) {
+static int32_t Query(const char* url, const char* ip, uint32_t policy, ProbeOutcome* outcome) {
   uint8_t query[64] = {};
   uint8_t response[65535] = {};
   const uint16_t id = 0xA042;
   MakeQuery(query, id);
   uint32_t error = 0;
-  const int32_t length = envbox_doh_query(
+  const int32_t length = envbox_doh_query_with_policy(
       reinterpret_cast<const uint8_t*>(url), strlen(url),
       reinterpret_cast<const uint8_t*>(ip), strlen(ip), query,
       12 + 13 + 4, response, sizeof(response), GetTickCount64() + 15000,
-      nullptr, nullptr, &error);
+      nullptr, nullptr, policy, &error);
+  outcome->policy = policy;
   outcome->error = error;
   outcome->length = length;
   outcome->query_id = id;
@@ -109,14 +111,18 @@ static int32_t Query(const char* url, const char* ip, ProbeOutcome* outcome) {
   return length;
 }
 
-extern "C" __declspec(dllexport) int __cdecl RunNativeDohProbe(ProbeOutcome* outcomes) {
-  if (!outcomes) return 2;
-  // Each URL/IP pair is explicit. The IPv6 attempts are retained as separate
-  // outcomes; a local lack of IPv6 is recorded by the host, not treated as a
-  // successful positive result.
-  Query("https://cloudflare-dns.com/dns-query", "1.1.1.1", &outcomes[0]);
-  Query("https://cloudflare-dns.com/dns-query", "2606:4700:4700::1111", &outcomes[1]);
-  Query("https://dns.google/dns-query", "8.8.8.8", &outcomes[2]);
-  Query("https://dns.google/dns-query", "2001:4860:4860::8888", &outcomes[3]);
+extern "C" __declspec(dllexport) int __cdecl RunNativeDohProbe(uint32_t index, ProbeOutcome* outcome) {
+  if (!outcome || index >= 7) return 2;
+  // One endpoint per process keeps the process-local API trap's allowance
+  // fixed before trust loading and network activity.
+  const char* urls[] = {
+      "https://cloudflare-dns.com/dns-query", "https://cloudflare-dns.com/dns-query",
+      "https://dns.google/dns-query", "https://dns.google/dns-query",
+      "https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query",
+      "https://cloudflare-dns.com/dns-query"};
+  const char* ips[] = {"1.1.1.1", "2606:4700:4700::1111", "8.8.8.8",
+      "2001:4860:4860::8888", "1.1.1.1", "8.8.8.8", "1.1.1.1"};
+  const uint32_t policies[] = {0, 0, 0, 0, 1, 1, 2};
+  Query(urls[index], ips[index], policies[index], outcome);
   return 0;
 }

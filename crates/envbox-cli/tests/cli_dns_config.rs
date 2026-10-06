@@ -85,6 +85,8 @@ fn typed_dns_cli_order_roundtrip_and_failed_edits_keep_profile() {
             "doh",
             "--url",
             "https://dns.example/dns-query",
+            "--tls-revocation",
+            "strict_offline",
             "--bootstrap",
             "1.1.1.1",
             "--bootstrap",
@@ -102,13 +104,16 @@ fn typed_dns_cli_order_roundtrip_and_failed_edits_keep_profile() {
     let dns = store.load_profiles().unwrap().profiles[0].dns.clone();
     assert!(matches!(
         dns.upstreams[0],
-        envbox_core::DnsUpstream::Doh { .. }
+        envbox_core::DnsUpstream::Doh {
+            tls_revocation: envbox_core::DnsTlsRevocation::StrictOffline,
+            ..
+        }
     ));
     assert_eq!(dns.upstreams.len(), 5);
     assert!(dns.servers.is_empty());
     let shown = run(&root, &["profile", "dns", "show", &id]);
     assert!(shown.status.success());
-    assert!(String::from_utf8_lossy(&shown.stdout).contains("runtime_supported = false"));
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("runtime_supported = true"));
     let decoded: envbox_core::DnsProfile =
         toml::from_str(&String::from_utf8(shown.stdout).unwrap()).unwrap();
     assert_eq!(decoded, dns);
@@ -147,6 +152,18 @@ fn typed_dns_cli_order_roundtrip_and_failed_edits_keep_profile() {
             "resolver.example",
         ],
         vec!["profile", "dns", "set", &id, "--strict", "invalid"],
+        vec![
+            "profile",
+            "dns",
+            "add",
+            &id,
+            "--type",
+            "doh",
+            "--url",
+            "https://1.1.1.1/dns-query",
+            "--tls-revocation",
+            "invalid",
+        ],
         vec![
             "profile",
             "dns",

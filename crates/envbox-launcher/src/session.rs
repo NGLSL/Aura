@@ -867,14 +867,15 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_dns_transport_is_refused_before_process_creation() {
+    fn unsupported_non_strict_dns_is_refused_before_process_creation() {
         let mut selected = profile();
         selected.dns = envbox_core::DnsProfile::typed(
             envbox_core::DnsMode::VirtualView,
-            true,
+            false,
             vec![envbox_core::DnsUpstream::Doh {
                 url: "https://fixture.invalid/dns-query".into(),
                 bootstrap_ips: vec!["127.0.0.1".parse().unwrap()],
+                tls_revocation: envbox_core::DnsTlsRevocation::Standard,
             }],
         );
         let result = start_session(SessionStartRequest {

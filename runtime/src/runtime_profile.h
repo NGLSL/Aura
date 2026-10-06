@@ -28,6 +28,7 @@ struct RuntimeDnsUpstream {
   unsigned short port;
   char server_name[256];
   char url[2048];
+  int tls_revocation; // DoH only: 0 standard, 1 strict offline
   int bootstrap_count;
   char bootstrap_ips[ENVBOX_DNS_MAX][64];
 };
