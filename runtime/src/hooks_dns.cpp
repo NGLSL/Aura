@@ -27,6 +27,7 @@
 
 #include "audit.h"
 #include "dns_transport.h"
+#include "dns_doh.h"
 
 static DWORD(WINAPI* TrueGetNetworkParams)(PFIXED_INFO, PULONG) =
     GetNetworkParams;
@@ -71,6 +72,30 @@ static DNS_STATUS(WINAPI* TrueDnsQueryRaw)(void*, void*) = nullptr;
 
 // Process-immutable virtual DNS views (built once at hook install).
 static int g_view_active = 0;
+// Windows resolves localhost through a newer DnsQueryEx request internally.
+// Keep this permission scoped to the synchronous local resolver invocation:
+// it must never turn an unrelated nested query into a Host DNS fallback.
+static thread_local unsigned int g_localhost_resolution_depth = 0;
+class LocalhostResolutionScope {
+ public:
+  explicit LocalhostResolutionScope(const wchar_t* name)
+      : active_(name && (_wcsicmp(name, L"localhost") == 0 ||
+                         _wcsicmp(name, L"localhost.") == 0)) {
+    if (active_) ++g_localhost_resolution_depth;
+  }
+  explicit LocalhostResolutionScope(const char* name)
+      : active_(name && (_stricmp(name, "localhost") == 0 ||
+                         _stricmp(name, "localhost.") == 0)) {
+    if (active_) ++g_localhost_resolution_depth;
+  }
+  ~LocalhostResolutionScope() {
+    if (active_) --g_localhost_resolution_depth;
+  }
+  LocalhostResolutionScope(const LocalhostResolutionScope&) = delete;
+  LocalhostResolutionScope& operator=(const LocalhostResolutionScope&) = delete;
+ private:
+  bool active_;
+};
 // A custom cancel token is safe only when its matching cancel hook attached.
 static int g_dns_cancel_hook_attached = 0;
 static int g_dns_hooks_ready = 0;
@@ -666,6 +691,10 @@ static ULONGLONG DnsAttemptDeadline(ULONGLONG total) {
   return bounded < total ? bounded : total;
 }
 
+static int DnsBootstrapFromProfile(const char* name, char (&addresses)[ENVBOX_DNS_MAX][64],
+                                  int* count, ULONGLONG deadline, HANDLE cancel_event);
+static int IsAsciiNameA(const char* s);
+
 static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname,
                        unsigned qtype, ULONGLONG deadline, HANDLE cancel_event,
                        DnsAddrs* out, PDNS_RECORD* records = nullptr,
@@ -691,6 +720,20 @@ static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname
   qoff += 4;
 
   DnsTransportEndpoint endpoint = configured;
+  char bootstrap_name[256] = {};
+  char bootstrap_addresses[ENVBOX_DNS_MAX][64] = {};
+  if (DnsDohBootstrapName(endpoint, bootstrap_name)) {
+    int count = 0;
+    int bootstrap = DnsBootstrapFromProfile(bootstrap_name, bootstrap_addresses, &count,
+                                           deadline, cancel_event);
+    if (bootstrap <= 0) {
+      EnvBoxAuditEvent("DnsTransport.DoH", 1,
+                       bootstrap < 0 ? "doh-bootstrap-cancelled" : "doh-profile-bootstrap-failed");
+      return bootstrap;
+    }
+    endpoint.bootstrap_ips = bootstrap_addresses;
+    endpoint.bootstrap_count = count;
+  }
   if ((options & DNS_QUERY_USE_TCP_ONLY) && endpoint.kind == DnsTransportKind::Udp) {
     endpoint.kind = DnsTransportKind::Tcp;
   }
@@ -817,6 +860,96 @@ static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname
     out->nodata = 1;
   }
   return 1;
+}
+
+// Bootstrap uses only already-connectable Profile upstreams. In particular,
+// another hostname DoH entry without addresses cannot recursively bootstrap.
+// Reuse the normal wire identity/question checks and native record decoder;
+// accept A addresses only for the requested name or its validated CNAME chain.
+static int DnsBootstrapFromProfile(const char* name, char (&addresses)[ENVBOX_DNS_MAX][64],
+                                  int* count, ULONGLONG deadline, HANDLE cancel_event) {
+  *count = 0;
+  const RuntimeProfile* profile = EnvBoxProfile();
+  if (!profile || profile->dns_mode != 1) return 0;
+  char current[256];
+  strcpy_s(current, name);
+  char visited[kDnsMaxCnameHops + 1][256] = {};
+  strcpy_s(visited[0], current);
+  int hops = 0;
+  for (;;) {
+    bool followed = false;
+    for (int index = 0; index < DnsUpstreamCount(profile); ++index) {
+      if (cancel_event && WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) return -1;
+      if (GetTickCount64() >= deadline) return 0;
+      DnsTransportEndpoint seed;
+      char seed_name[256] = {};
+      if (!DnsEndpoint(profile, index, &seed) || DnsDohBootstrapName(seed, seed_name)) continue;
+      PDNS_RECORD records = nullptr;
+      DNS_STATUS status = ERROR_TIMEOUT;
+      int result = DnsQueryOne(seed, current, DNS_TYPE_A, DnsAttemptDeadline(deadline),
+                               cancel_event, nullptr, &records, &status);
+      if (result <= 0 || status != ERROR_SUCCESS) {
+        if (records) TrueDnsFree(records, DnsFreeRecordList);
+        if (result < 0) return -1;
+        if (status == DNS_ERROR_RCODE_NAME_ERROR || status == DNS_INFO_NO_RECORDS) return 0;
+        continue;
+      }
+      // A response can contain an entire alias chain in one answer section.
+      for (;;) {
+        if (cancel_event && WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
+          TrueDnsFree(records, DnsFreeRecordList); return -1;
+        }
+        if (GetTickCount64() >= deadline) {
+          TrueDnsFree(records, DnsFreeRecordList); return 0;
+        }
+        wchar_t owner[256] = {};
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, current, -1, owner, ARRAYSIZE(owner))) break;
+        wchar_t* alias = nullptr;
+        bool invalid = false;
+        for (PDNS_RECORD record = records; record; record = record->pNext) {
+          if (record->Flags.S.Section != DnsSectionAnswer || !record->pName ||
+              _wcsicmp(reinterpret_cast<wchar_t*>(record->pName), owner) != 0) continue;
+          if (record->wType == DNS_TYPE_A && *count < ENVBOX_DNS_MAX) {
+            in_addr address;
+            address.s_addr = record->Data.A.IpAddress;
+            const ULONG host_address = ntohl(address.s_addr);
+            if (host_address == 0 || host_address == INADDR_BROADCAST ||
+                (host_address & 0xf0000000) == 0xe0000000) { invalid = true; break; }
+            if (!InetNtopA(AF_INET, &address, addresses[*count], sizeof(addresses[*count]))) { invalid = true; break; }
+            ++*count;
+          } else if (record->wType == DNS_TYPE_CNAME) {
+            wchar_t* target = reinterpret_cast<wchar_t*>(record->Data.PTR.pNameHost);
+            if (!target || (alias && _wcsicmp(alias, target) != 0)) { invalid = true; break; }
+            alias = target;
+          }
+        }
+        if (invalid || (*count && alias)) { *count = 0; break; }
+        if (*count) { TrueDnsFree(records, DnsFreeRecordList); return 1; }
+        if (!alias) break;
+        char target[256] = {};
+        unsigned char encoded[256];
+        if (hops == kDnsMaxCnameHops ||
+            !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, alias, -1, target, sizeof(target), nullptr, nullptr) ||
+            !IsAsciiNameA(target) ||
+            EncodeDnsName(target, encoded, sizeof(encoded)) <= 0) {
+          TrueDnsFree(records, DnsFreeRecordList); return 0;
+        }
+        size_t target_length = strlen(target);
+        if (target_length > 1 && target[target_length - 1] == '.') target[target_length - 1] = '\0';
+        for (int previous = 0; previous <= hops; ++previous) {
+          if (_stricmp(visited[previous], target) == 0) {
+            TrueDnsFree(records, DnsFreeRecordList); return 0;
+          }
+        }
+        strcpy_s(current, target);
+        strcpy_s(visited[++hops], target);
+        followed = true;
+      }
+      TrueDnsFree(records, DnsFreeRecordList);
+      if (followed) break;
+    }
+    if (!followed) return 0;
+  }
 }
 
 // Route one name through Profile servers in order. Follows CNAME (max
@@ -1745,6 +1878,7 @@ static int HookGetAddrInfoCommonA(PCSTR node, PCSTR service,
   }
   if (node == nullptr || node[0] == '\0' || (flags & AI_NUMERICHOST) ||
       IsNumericNodeA(node) || IsLocalMachineDnsNameA(node)) {
+    LocalhostResolutionScope local(node);
     INT r = Truegetaddrinfo(node, service, hints, result);
     EnvBoxAuditEvent(api, 0, "numeric-or-passthrough");
     SetLastError(err);
@@ -1820,6 +1954,7 @@ static int HookGetAddrInfoCommonW(PCWSTR node, PCWSTR service,
 
   if (node == nullptr || node[0] == L'\0' || (flags & AI_NUMERICHOST) ||
       IsNumericNodeW(node) || IsLocalMachineDnsNameW(node)) {
+    LocalhostResolutionScope local(node);
     INT r = TrueGetAddrInfoW(node, service, hints, result);
     EnvBoxAuditEvent(api, 0, "numeric-or-passthrough");
     SetLastError(err);
@@ -2002,6 +2137,7 @@ static INT WSAAPI HookGetAddrInfoExA(
   }
   if (name == nullptr || name[0] == '\0' || (flags & AI_NUMERICHOST) ||
       IsNumericNodeA(name) || IsLocalMachineDnsNameA(name)) {
+    LocalhostResolutionScope local(name);
     INT r = TrueGetAddrInfoExA(name, service, dw_name_space, nlp_id, hints,
                                result, timeout, overlapped, completion,
                                name_handle);
@@ -2270,6 +2406,7 @@ static INT WSAAPI HookGetAddrInfoExW(
 
   if (name == nullptr || name[0] == L'\0' || (flags & AI_NUMERICHOST) ||
       IsNumericNodeW(name) || IsLocalMachineDnsNameW(name)) {
+    LocalhostResolutionScope local(name);
     INT r = TrueGetAddrInfoExW(name, service, dw_name_space, nlp_id, hints,
                                result, timeout, overlapped, completion,
                                name_handle);
@@ -2713,6 +2850,16 @@ static DNS_STATUS WINAPI HookDnsQueryEx(PDNS_QUERY_REQUEST request,
     return ERROR_INVALID_PARAMETER;
   }
 
+  // This invocation belongs to Windows' synchronous localhost resolver.
+  // Its private request/result layout must be interpreted by Windows itself,
+  // before our public v1 validator, without extending Profile wire support.
+  if (g_localhost_resolution_depth != 0 &&
+      request->Version != DNS_QUERY_REQUEST_VERSION1) {
+    DNS_STATUS st = TrueDnsQueryEx(request, results, cancel);
+    EnvBoxAuditEvent("DnsQueryEx", 0, "dns-localhost-native-reentry");
+    SetLastError(err);
+    return st;
+  }
 
   // Only the v1 request/result layouts are handled. Later SDK versions may
   // append fields whose semantics this hook must not silently truncate.

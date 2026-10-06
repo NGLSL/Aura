@@ -11,6 +11,7 @@ pub struct ManagementState {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub pending_run: Option<RunCommand>,
+    pending_profile_id: Option<Uuid>,
     epoch: u64,
 }
 
@@ -24,6 +25,21 @@ pub struct ManagementReply {
 }
 
 impl ManagementState {
+    fn clear_pending(&mut self) {
+        self.pending_run = None;
+        self.pending_profile_id = None;
+    }
+
+    pub fn pending_belongs_to_profile(&self, profile_id: Uuid) -> bool {
+        self.pending_run.is_some() && self.pending_profile_id == Some(profile_id)
+    }
+
+    pub fn profile_instances(&self, profile_id: Uuid) -> impl Iterator<Item = &RunView> {
+        self.instances
+            .iter()
+            .filter(move |view| view.result.profile_id == profile_id)
+    }
+
     pub fn selection_changed(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.application_id = None;
@@ -34,7 +50,7 @@ impl ManagementState {
         // Settle the sole in-flight Run even if the user navigated away.
         // Its records and errors still cannot overwrite the newly selected view.
         if reply.operation == "Run" && reply.result.is_err() && !reply.run_submission_unknown {
-            self.pending_run = None;
+            self.clear_pending();
             self.notice = None;
         }
         if reply
@@ -49,7 +65,7 @@ impl ManagementState {
                     && run.state != "Starting"
             })
         {
-            self.pending_run = None;
+            self.clear_pending();
             self.notice = None;
         }
         // A delayed A response must never update B's workspace view.
@@ -66,7 +82,7 @@ impl ManagementState {
                     .is_some_and(|old| old != &response.generation);
                 if changed {
                     self.instances.clear();
-                    self.pending_run = None;
+                    self.clear_pending();
                     self.notice = Some("Supervisor 已换代；列表以当前服务端记录为准。TrackingLost 表示未恢复跟踪，不能保证进程已退出。".into());
                 }
                 self.generation = Some(response.generation.clone());
@@ -78,7 +94,7 @@ impl ManagementState {
                                 && view.result.state != "Starting"
                         })
                     }) {
-                        self.pending_run = None;
+                        self.clear_pending();
                         self.notice = None;
                     }
                 } else if let Some(run) = &response.run {
@@ -89,7 +105,7 @@ impl ManagementState {
                         process_ids: vec![],
                     });
                     if run.state != "Starting" {
-                        self.pending_run = None;
+                        self.clear_pending();
                     }
                 } else if matches!(reply.operation.as_str(), "Stop" | "StopAll") {
                     for view in &response.instances {
@@ -110,14 +126,6 @@ impl ManagementState {
         }
         true
     }
-
-    pub fn workspace_instances(&self, workspace: Uuid) -> impl Iterator<Item = &RunView> {
-        // Current List responses may include recovered metadata whose original
-        // generation is retained when the Job could not be reopened.
-        self.instances
-            .iter()
-            .filter(move |view| view.result.container_id == workspace)
-    }
 }
 
 fn prepare_run(
@@ -125,6 +133,7 @@ fn prepare_run(
     container_id: Uuid,
     application_id: Uuid,
     instance_id: Uuid,
+    expected_profile: Option<Uuid>,
 ) -> Result<RunCommand, String> {
     let applications = store
         .load_applications()
@@ -138,6 +147,9 @@ fn prepare_run(
     let snapshot = store
         .prepare_run_snapshot(container_id, instance_id)
         .map_err(|error| error.to_string())?;
+    if expected_profile.is_some_and(|profile| profile != snapshot.effective_profile.id) {
+        return Err("环境配置运行快照归属已变更；请刷新".into());
+    }
     snapshot
         .effective_profile
         .dns
@@ -156,9 +168,12 @@ impl EnvBoxApp {
     }
 
     pub(super) fn workspace_run(&mut self) -> Task<Message> {
-        if self.workspaces.dirty() {
+        if self.workspaces.dirty() || self.profile_draft != self.profile_saved_draft {
             self.workspace_management.error =
-                Some("请先保存或取消工作区修改，再创建不可变运行快照".into());
+                Some("请先保存或取消环境配置修改，再创建不可变运行快照".into());
+            return Task::none();
+        }
+        if self.workspace_management.busy {
             return Task::none();
         }
         if self.workspace_management.pending_run.is_some() {
@@ -166,11 +181,20 @@ impl EnvBoxApp {
                 Some("上次运行结果尚未知；请查询原实例，不能再次启动".into());
             return Task::none();
         }
+        let Some(profile_id) = self.profile_draft.id else {
+            self.workspace_management.error = Some("请先保存环境配置".into());
+            return Task::none();
+        };
+        self.bind_profile_scope();
+        if let Some(error) = self.workspaces.error.clone() {
+            self.workspace_management.error = Some(format!("环境配置运行准备失败：{error}"));
+            return Task::none();
+        }
         let (Some(container_id), Some(application_id)) = (
             self.workspaces.selected,
             self.workspace_management.application_id,
         ) else {
-            self.workspace_management.error = Some("请选择已保存工作区及持久应用".into());
+            self.workspace_management.error = Some("请选择已保存环境配置及应用".into());
             return Task::none();
         };
         let command = RunCommand {
@@ -182,10 +206,11 @@ impl EnvBoxApp {
             return Task::none();
         }
         let Some(generation) = self.workspace_management.generation.clone() else {
-            self.workspace_management.error = Some("请先刷新 Supervisor，再启动工作区".into());
+            self.workspace_management.error = Some("请先刷新运行状态，再启动环境配置".into());
             return Task::none();
         };
         self.workspace_management.pending_run = Some(command.clone());
+        self.workspace_management.pending_profile_id = Some(profile_id);
         self.workspace_management.notice = None;
         self.workspace_request("Run", Some(command), Some(generation))
     }
@@ -194,7 +219,11 @@ impl EnvBoxApp {
         let Some(command) = self.workspace_management.pending_run.clone() else {
             return Task::none();
         };
-        if Some(command.container_id) != self.workspaces.selected {
+        if !self
+            .profile_draft
+            .id
+            .is_some_and(|id| self.workspace_management.pending_belongs_to_profile(id))
+        {
             return Task::none();
         }
         self.workspace_request(
@@ -205,7 +234,7 @@ impl EnvBoxApp {
     }
 
     pub(super) fn workspace_stop(&mut self, instance: Option<Uuid>) -> Task<Message> {
-        let Some(container_id) = self.workspaces.selected else {
+        let Some(profile_id) = self.profile_draft.id else {
             return Task::none();
         };
         let Some(generation) = self.workspace_management.generation.clone() else {
@@ -215,7 +244,7 @@ impl EnvBoxApp {
         let command = if let Some(instance) = instance {
             let Some(view) = self
                 .workspace_management
-                .workspace_instances(container_id)
+                .profile_instances(profile_id)
                 .find(|view| {
                     view.result.instance_id == instance
                         && view.result.supervisor_generation == generation
@@ -223,11 +252,11 @@ impl EnvBoxApp {
                 })
             else {
                 self.workspace_management.error =
-                    Some("实例不属于当前工作区及 Supervisor 代；请刷新".into());
+                    Some("实例不属于当前环境配置及运行管理会话；请刷新".into());
                 return Task::none();
             };
             Some(RunCommand {
-                container_id,
+                container_id: view.result.container_id,
                 instance_id: instance,
                 application_id: view.result.application_id,
             })
@@ -257,6 +286,7 @@ impl EnvBoxApp {
         self.workspace_management.busy = true;
         self.workspace_management.error = None;
         let workspace_id = self.workspaces.selected;
+        let profile_id = self.profile_draft.id;
         let epoch = self.workspace_management.epoch;
         let operation = operation.to_string();
         let store = self.store.clone();
@@ -265,13 +295,8 @@ impl EnvBoxApp {
                 let (tx, rx) = iced::futures::channel::oneshot::channel();
                 let worker_operation = operation.clone();
                 std::thread::spawn(move || {
-                    let result = management_exchange(
-                        &store,
-                        &worker_operation,
-                        workspace_id,
-                        run,
-                        generation,
-                    );
+                    let result =
+                        management_exchange(&store, &worker_operation, profile_id, run, generation);
                     let _ = tx.send(result);
                 });
                 let (result, run_submission_unknown) = rx
@@ -302,18 +327,100 @@ impl EnvBoxApp {
                     "运行结果未知；保留原 Instance UUID，请查询原实例，禁止自动重新启动。".into(),
                 );
             } else {
-                self.workspace_management.pending_run = None;
+                self.workspace_management.clear_pending();
             }
         }
         Task::none()
     }
 }
 
+fn profile_stop_commands(
+    instances: &[RunView],
+    profile: Uuid,
+    generation: &str,
+) -> Vec<RunCommand> {
+    instances
+        .iter()
+        .filter(|view| {
+            view.result.profile_id == profile
+                && view.result.supervisor_generation == generation
+                && view.result.state != "TrackingLost"
+        })
+        .map(|view| RunCommand {
+            container_id: view.result.container_id,
+            instance_id: view.result.instance_id,
+            application_id: view.result.application_id,
+        })
+        .collect()
+}
+
+fn stop_profile_runs(
+    profile: Uuid,
+    generation: &str,
+    mut exchange: impl FnMut(Request) -> Result<Response, String>,
+) -> Result<Response, String> {
+    let request = |command: &str, run: Option<RunCommand>| Request {
+        version: PROTOCOL_VERSION,
+        generation: Some(generation.into()),
+        request_id: Uuid::new_v4().to_string(),
+        command: command.into(),
+        container_id: run.as_ref().map(|run| run.container_id),
+        run,
+    };
+    let mut latest = exchange(request("List", None))?;
+    if latest.generation != generation || latest.status != "Ok" {
+        return Ok(latest);
+    }
+    let commands = profile_stop_commands(&latest.instances, profile, generation);
+    let mut errors = Vec::new();
+    for command in commands {
+        match exchange(request("Stop", Some(command))) {
+            Ok(response) => {
+                if response.generation != generation {
+                    // Keep facts already confirmed by the original service. A replacement
+                    // invalidates the remaining stop set and has not verified those facts.
+                    errors.push("运行管理会话已失效；停止操作已中断，请刷新当前会话".into());
+                    latest.status = errors.join("；");
+                    return Ok(latest);
+                }
+                for view in response.instances {
+                    latest
+                        .instances
+                        .retain(|old| old.result.instance_id != view.result.instance_id);
+                    latest.instances.push(view);
+                }
+                if !matches!(response.status.as_str(), "Ok" | "Stopped" | "Stopping") {
+                    errors.push(format!("停止失败：{}", response.status));
+                }
+            }
+            Err(error) => {
+                errors.push(error);
+                // Do not resend a stop after an uncertain transport failure.
+                break;
+            }
+        }
+    }
+    match exchange(request("List", None)) {
+        Ok(response) if response.generation == generation && response.status == "Ok" => {
+            latest = response;
+        }
+        Ok(response) if response.generation != generation => {
+            errors.push("运行管理会话已失效；请刷新当前会话，已确认的停止结果仍保留".into());
+        }
+        Ok(response) => errors.push(format!("刷新失败：{}", response.status)),
+        Err(error) => errors.push(format!("刷新失败：{error}")),
+    }
+    if !errors.is_empty() {
+        latest.status = errors.join("；");
+    }
+    Ok(latest)
+}
+
 #[cfg(windows)]
 fn management_exchange(
     store: &ConfigStore,
     operation: &str,
-    workspace_id: Option<Uuid>,
+    profile_id: Option<Uuid>,
     run: Option<RunCommand>,
     generation: Option<String>,
 ) -> (Result<Response, String>, bool) {
@@ -324,11 +431,21 @@ fn management_exchange(
         client.timeout = std::time::Duration::from_secs(20);
         let command = if operation == "Run" {
             let target = run.as_ref().ok_or("缺少运行身份")?;
+            let profile_id = profile_id.ok_or("缺少环境配置身份")?;
+            let document = store.load_containers().map_err(|error| error.to_string())?;
+            if !document
+                .containers
+                .iter()
+                .any(|scope| scope.id == target.container_id && scope.profile_id == profile_id)
+            {
+                return Err("环境配置运行作用域已变更；请刷新".into());
+            }
             Some(prepare_run(
                 store,
                 target.container_id,
                 target.application_id,
                 target.instance_id,
+                Some(profile_id),
             )?)
         } else {
             run
@@ -342,6 +459,13 @@ fn management_exchange(
                     .generation
             }
         };
+        if operation == "StopAll" {
+            return stop_profile_runs(
+                profile_id.ok_or("缺少环境配置身份")?,
+                &generation,
+                |request| client.request(request).map_err(|error| error.to_string()),
+            );
+        }
         submitted = operation == "Run";
         client
             .request(Request {
@@ -349,8 +473,8 @@ fn management_exchange(
                 generation: Some(generation),
                 request_id: Uuid::new_v4().to_string(),
                 command: operation.into(),
+                container_id: command.as_ref().map(|run| run.container_id),
                 run: command,
-                container_id: workspace_id,
             })
             .map_err(|error| error.to_string())
     })();
@@ -432,6 +556,267 @@ mod tests {
     }
 
     #[test]
+    fn profile_membership_and_stop_set_use_snapshot_facts_across_legacy_scopes() {
+        let profile = Uuid::from_u128(4);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut other = view(a, Uuid::new_v4(), "current");
+        other.result.profile_id = Uuid::from_u128(5);
+        let mut lost = view(a, Uuid::new_v4(), "current");
+        lost.result.state = "TrackingLost".into();
+        let current_a = view(a, Uuid::new_v4(), "current");
+        let current_b = view(b, Uuid::new_v4(), "current");
+        let old = view(a, Uuid::new_v4(), "old");
+        let state = ManagementState {
+            instances: vec![current_a.clone(), current_b.clone(), other, lost, old],
+            ..Default::default()
+        };
+        assert_eq!(state.profile_instances(profile).count(), 4);
+        let commands = profile_stop_commands(&state.instances, profile, "current");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].container_id, a);
+        assert_eq!(commands[1].container_id, b);
+    }
+
+    #[test]
+    fn profile_stop_all_refreshes_and_retains_partial_success_when_transport_fails() {
+        let profile = Uuid::from_u128(4);
+        let a = view(Uuid::new_v4(), Uuid::new_v4(), "current");
+        let b = view(Uuid::new_v4(), Uuid::new_v4(), "current");
+        let mut other = view(a.result.container_id, Uuid::new_v4(), "current");
+        other.result.profile_id = Uuid::from_u128(5);
+        let initial = vec![a.clone(), b.clone(), other.clone()];
+        let mut operations = vec![];
+        let result = stop_profile_runs(profile, "current", |request| {
+            operations.push(request.command.clone());
+            assert_eq!(request.generation.as_deref(), Some("current"));
+            match operations.len() {
+                1 => {
+                    assert!(request.container_id.is_none());
+                    assert!(request.run.is_none());
+                    Ok(reply(0, None, "current", initial.clone()).result.unwrap())
+                }
+                2 => {
+                    assert_eq!(
+                        request.run.as_ref().unwrap().instance_id,
+                        a.result.instance_id
+                    );
+                    assert_eq!(request.container_id, Some(a.result.container_id));
+                    let mut stopped = a.clone();
+                    stopped.result.state = "Stopped".into();
+                    let mut response = reply(0, None, "current", vec![stopped]).result.unwrap();
+                    response.status = "Stopped".into();
+                    Ok(response)
+                }
+                3 => {
+                    assert_eq!(
+                        request.run.as_ref().unwrap().instance_id,
+                        b.result.instance_id
+                    );
+                    Err("stop timeout".into())
+                }
+                4 => {
+                    assert!(request.container_id.is_none());
+                    assert_eq!(request.command, "List");
+                    Err("list timeout".into())
+                }
+                _ => panic!("unexpected extra request"),
+            }
+        })
+        .unwrap();
+        assert_eq!(operations, ["List", "Stop", "Stop", "List"]);
+        assert_eq!(
+            result
+                .instances
+                .iter()
+                .find(|view| view.result.instance_id == a.result.instance_id)
+                .unwrap()
+                .result
+                .state,
+            "Stopped"
+        );
+        assert!(result
+            .instances
+            .iter()
+            .any(|view| view.result.instance_id == other.result.instance_id
+                && view.result.profile_id == other.result.profile_id));
+        assert!(result.status.contains("stop timeout"));
+        assert!(result.status.contains("list timeout"));
+    }
+
+    #[test]
+    fn profile_stop_all_retains_confirmed_stop_when_final_list_is_rejected() {
+        let profile = Uuid::from_u128(4);
+        let running = view(Uuid::new_v4(), Uuid::new_v4(), "current");
+        let mut count = 0;
+        let response = stop_profile_runs(profile, "current", |request| {
+            count += 1;
+            match count {
+                1 => Ok(reply(0, None, "current", vec![running.clone()])
+                    .result
+                    .unwrap()),
+                2 => {
+                    assert_eq!(request.command, "Stop");
+                    let mut stopped = running.clone();
+                    stopped.result.state = "Stopped".into();
+                    let mut response = reply(0, None, "current", vec![stopped]).result.unwrap();
+                    response.status = "Stopped".into();
+                    Ok(response)
+                }
+                3 => {
+                    assert_eq!(request.command, "List");
+                    let mut rejected = reply(0, None, "current", vec![]).result.unwrap();
+                    rejected.status = "StorageUnavailable".into();
+                    Ok(rejected)
+                }
+                _ => panic!("unexpected request"),
+            }
+        })
+        .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(response.instances.len(), 1);
+        assert_eq!(response.instances[0].result.state, "Stopped");
+        assert_eq!(response.generation, "current");
+        assert!(response.status.contains("StorageUnavailable"));
+    }
+
+    #[test]
+    fn profile_stop_all_preserves_old_confirmed_facts_and_aborts_after_service_replacement() {
+        let profile = Uuid::from_u128(4);
+        let a = view(Uuid::new_v4(), Uuid::new_v4(), "old");
+        let b = view(Uuid::new_v4(), Uuid::new_v4(), "old");
+        let c = view(Uuid::new_v4(), Uuid::new_v4(), "old");
+        let mut count = 0;
+        let response = stop_profile_runs(profile, "old", |request| {
+            count += 1;
+            match count {
+                1 => Ok(reply(0, None, "old", vec![a.clone(), b.clone(), c.clone()])
+                    .result
+                    .unwrap()),
+                2 => {
+                    assert_eq!(request.command, "Stop");
+                    let mut stopped = a.clone();
+                    stopped.result.state = "Stopped".into();
+                    let mut response = reply(0, None, "old", vec![stopped]).result.unwrap();
+                    response.status = "Stopped".into();
+                    Ok(response)
+                }
+                3 => {
+                    assert_eq!(request.command, "Stop");
+                    assert_eq!(request.run.unwrap().instance_id, b.result.instance_id);
+                    let mut replaced = reply(0, None, "new", vec![]).result.unwrap();
+                    replaced.status = "GenerationMismatch".into();
+                    Ok(replaced)
+                }
+                _ => panic!("service replacement must abort all remaining stops"),
+            }
+        })
+        .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(response.generation, "old");
+        assert!(response.status.contains("会话已失效"));
+        assert_eq!(
+            response
+                .instances
+                .iter()
+                .find(|view| view.result.instance_id == a.result.instance_id)
+                .unwrap()
+                .result
+                .state,
+            "Stopped"
+        );
+        assert_eq!(
+            response
+                .instances
+                .iter()
+                .find(|view| view.result.instance_id == c.result.instance_id)
+                .unwrap()
+                .result
+                .state,
+            "Running"
+        );
+    }
+
+    #[test]
+    fn deleting_profile_with_unknown_run_keeps_the_query_entry_and_original_uuid() {
+        let root =
+            std::env::temp_dir().join(format!("aura-profile-pending-delete-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut app, _) = EnvBoxApp::new();
+        app.store = ConfigStore::new(&root);
+        let profile = Uuid::from_u128(4);
+        app.profile_draft.id = Some(profile);
+        let command = RunCommand {
+            container_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            application_id: Uuid::new_v4(),
+        };
+        app.workspace_management.pending_run = Some(command.clone());
+        app.workspace_management.pending_profile_id = Some(profile);
+        std::fs::write(app.store.profiles_path(), "invalid[").unwrap();
+        let _ = app.delete_profile();
+        assert!(app.status.contains("启动结果尚未知"));
+        assert_eq!(app.profile_draft.id, Some(profile));
+        assert_eq!(app.workspace_management.pending_run, Some(command));
+        assert!(app.workspace_management.pending_belongs_to_profile(profile));
+        assert_eq!(
+            std::fs::read_to_string(app.store.profiles_path()).unwrap(),
+            "invalid["
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn profile_stop_all_never_stops_after_a_generation_mismatch() {
+        let profile = Uuid::from_u128(4);
+        let mut count = 0;
+        let response = stop_profile_runs(profile, "old", |request| {
+            count += 1;
+            assert_eq!(request.command, "List");
+            let mut response = reply(
+                0,
+                None,
+                "new",
+                vec![view(Uuid::new_v4(), Uuid::new_v4(), "new")],
+            )
+            .result
+            .unwrap();
+            response.status = "GenerationMismatch".into();
+            Ok(response)
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(response.generation, "new");
+        assert_eq!(response.status, "GenerationMismatch");
+    }
+
+    #[test]
+    fn pending_profile_follows_submission_not_current_scope_and_clears_on_settlement() {
+        let profile = Uuid::from_u128(4);
+        let command = RunCommand {
+            container_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            application_id: Uuid::new_v4(),
+        };
+        let mut state = ManagementState {
+            pending_run: Some(command.clone()),
+            pending_profile_id: Some(profile),
+            ..Default::default()
+        };
+        state.selection_changed();
+        assert!(state.pending_belongs_to_profile(profile));
+        assert!(!state.pending_belongs_to_profile(Uuid::from_u128(5)));
+        let mut completed = reply(0, Some(command.container_id), "current", vec![]);
+        completed.operation = "Run".into();
+        completed.result.as_mut().unwrap().run =
+            Some(view(command.container_id, command.instance_id, "current").result);
+        assert!(!state.accept(&completed, Some(Uuid::new_v4())));
+        assert!(state.pending_run.is_none());
+        assert!(state.pending_profile_id.is_none());
+        assert!(state.instances.is_empty());
+    }
+
+    #[test]
     fn late_workspace_reply_cannot_replace_current_scope() {
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
@@ -457,9 +842,9 @@ mod tests {
             ),
             Some(b)
         ));
-        assert_eq!(state.workspace_instances(b).count(), 1);
+        assert_eq!(state.profile_instances(Uuid::from_u128(4)).count(), 2);
         state.instances.push(view(b, Uuid::new_v4(), "old"));
-        assert_eq!(state.workspace_instances(b).count(), 2);
+        assert_eq!(state.profile_instances(Uuid::from_u128(4)).count(), 3);
     }
 
     #[test]
@@ -474,7 +859,7 @@ mod tests {
             Some(container),
         );
         let visible = state
-            .workspace_instances(container)
+            .profile_instances(Uuid::from_u128(4))
             .next()
             .expect("restored Lost record must remain visible");
         assert_eq!(visible.result.supervisor_generation, "previous");
@@ -579,13 +964,22 @@ mod tests {
             .unwrap();
         let instance = Uuid::new_v4();
         assert_eq!(
-            prepare_run(&store, container.id, application.id, instance).unwrap(),
+            prepare_run(&store, container.id, application.id, instance, None).unwrap(),
             RunCommand {
                 container_id: container.id,
                 instance_id: instance,
                 application_id: application.id
             }
         );
+        assert!(prepare_run(
+            &store,
+            container.id,
+            application.id,
+            Uuid::new_v4(),
+            Some(Uuid::new_v4())
+        )
+        .unwrap_err()
+        .contains("快照归属已变更"));
         let path = store.run_snapshot_path(container.id, instance);
         let bytes = std::fs::read(&path).unwrap();
         let mut edited = profile;
@@ -595,13 +989,13 @@ mod tests {
                 profiles: vec![edited],
             })
             .unwrap();
-        assert!(prepare_run(&store, container.id, application.id, instance).is_err());
+        assert!(prepare_run(&store, container.id, application.id, instance, None).is_err());
         assert_eq!(std::fs::read(path).unwrap(), bytes);
-        assert!(prepare_run(&store, container.id, Uuid::new_v4(), Uuid::new_v4()).is_err());
+        assert!(prepare_run(&store, container.id, Uuid::new_v4(), Uuid::new_v4(), None).is_err());
         store
             .save_profiles(&envbox_storage::ProfileDocument { profiles: vec![] })
             .unwrap();
-        assert!(prepare_run(&store, container.id, application.id, Uuid::new_v4()).is_err());
+        assert!(prepare_run(&store, container.id, application.id, Uuid::new_v4(), None).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -668,17 +1062,18 @@ mod tests {
     }
 
     #[test]
-    fn stop_cannot_address_another_workspace_or_old_generation() {
+    fn stop_cannot_address_another_profile_or_old_generation() {
         let (mut app, _) = EnvBoxApp::new();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let instance = Uuid::new_v4();
         app.workspaces.selected = Some(b);
+        app.profile_draft.id = Some(Uuid::from_u128(4));
         app.workspace_management.busy = false;
         app.workspace_management.generation = Some("current".into());
-        app.workspace_management
-            .instances
-            .push(view(a, instance, "current"));
+        let mut other = view(a, instance, "current");
+        other.result.profile_id = Uuid::from_u128(5);
+        app.workspace_management.instances.push(other);
         let _ = app.workspace_stop(Some(instance));
         assert!(!app.workspace_management.busy);
         assert!(app
@@ -686,7 +1081,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap()
-            .contains("不属于当前工作区"));
+            .contains("不属于当前环境配置"));
         app.workspace_management.instances = vec![view(b, instance, "old")];
         let _ = app.workspace_stop(Some(instance));
         assert!(!app.workspace_management.busy);

@@ -563,9 +563,14 @@ mod tests {
         };
         store.save_profiles(&doc).unwrap();
         assert_eq!(store.load_profiles().unwrap(), doc);
-        let before = fs::read(store.profiles_path()).unwrap();
         if let DnsUpstream::Doh { bootstrap_ips, .. } = &mut doc.profiles[0].dns.upstreams[0] {
             bootstrap_ips.clear();
+        }
+        store.save_profiles(&doc).unwrap();
+        assert_eq!(store.load_profiles().unwrap(), doc);
+        let before = fs::read(store.profiles_path()).unwrap();
+        if let DnsUpstream::Doh { bootstrap_ips, .. } = &mut doc.profiles[0].dns.upstreams[0] {
+            bootstrap_ips.push("0.0.0.0".parse().unwrap());
         }
         assert!(store.save_profiles(&doc).is_err());
         assert_eq!(fs::read(store.profiles_path()).unwrap(), before);

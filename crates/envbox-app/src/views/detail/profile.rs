@@ -1,4 +1,6 @@
-use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, scrollable, text, text_input, tooltip,
+};
 use iced::{Alignment, Element, Fill, Padding};
 
 use crate::app::EnvBoxApp;
@@ -10,7 +12,7 @@ use crate::widgets::{
     danger_btn, field_label, form_row, kv_row, primary_btn, searchable_select, secondary_btn,
 };
 
-use super::{detail_shell, section_title};
+use super::section_title;
 
 pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let is_new = app.profile_draft.id.is_none();
@@ -69,7 +71,21 @@ pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         profile_overview(app)
     };
 
-    detail_shell(column![header, content].spacing(12))
+    container(
+        scrollable(
+            container(column![header, content].spacing(20))
+                .width(Fill)
+                .max_width(900)
+                .padding(Padding::from([8, 20])),
+        )
+        .height(Fill)
+        .style(dark_scrollable),
+    )
+    .padding(Padding::from([14, 16]))
+    .width(Fill)
+    .height(Fill)
+    .style(|_| panel_style(PANEL_RIGHT))
+    .into()
 }
 
 fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
@@ -302,7 +318,16 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
     let advanced: Element<_> = if app.profile_advanced {
         container(
             column![
-                field_label("身份信息视图 · 留空跟随宿主"),
+                row![
+                    field_label("身份信息视图 · 留空跟随宿主"),
+                    tooltip(icon(Icon::Info, MUTED, 12.0),
+                        container(column![
+                            text("提供 Win32 主机名 / 用户名、网卡信息和 MachineGuid 注册表读取视图。真实账户、网卡和系统安装标识保持原值；CPU、GPU、磁盘身份暂不覆盖。").size(12).font(font::ui_font()),
+                            text("GetUserNameEx、WMI、Native Registry API 和设备 IOCTL 暂不覆盖。").size(12).font(font::ui_font()),
+                        ].spacing(8)).width(320).padding(12),
+                        tooltip::Position::Left,
+                    ).style(inner_card_style),
+                ].spacing(8).align_y(Alignment::Center),
                 form_row(
                     "主机名",
                     text_input("1–15 位 ASCII 主机名", &app.profile_draft.identity.computer_name)
@@ -321,28 +346,38 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
                 ),
                 form_row(
                     "MAC",
-                    text_input("02:AA:BB:CC:DD:EE", &app.profile_draft.identity.mac_address)
-                        .on_input(Message::ProfileMacAddress)
-                        .padding(Padding::from([5, 8]))
-                        .style(input_style)
-                        .font(font::ui_font()),
+                    row![
+                        text_input("02:AA:BB:CC:DD:EE", &app.profile_draft.identity.mac_address)
+                            .on_input(Message::ProfileMacAddress)
+                            .padding(Padding::from([5, 8]))
+                            .style(input_style)
+                            .font(font::ui_font())
+                            .width(Fill),
+                        button(text("生成").size(12).font(font::ui_font()))
+                            .padding(Padding::from([6, 10]))
+                            .style(secondary_btn)
+                            .on_press(Message::ProfileMacAddressGenerate),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
                 ),
                 form_row(
                     "MachineGuid",
-                    text_input("Windows 安装标识 UUID", &app.profile_draft.identity.machine_guid)
-                        .on_input(Message::ProfileMachineGuid)
-                        .padding(Padding::from([5, 8]))
-                        .style(input_style)
-                        .font(font::ui_font()),
+                    row![
+                        text_input("Windows 安装标识 UUID", &app.profile_draft.identity.machine_guid)
+                            .on_input(Message::ProfileMachineGuid)
+                            .padding(Padding::from([5, 8]))
+                            .style(input_style)
+                            .font(font::ui_font())
+                            .width(Fill),
+                        button(text("生成").size(12).font(font::ui_font()))
+                            .padding(Padding::from([6, 10]))
+                            .style(secondary_btn)
+                            .on_press(Message::ProfileMachineGuidGenerate),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
                 ),
-                text("提供 Win32 主机名 / 用户名、网卡信息和 MachineGuid 注册表读取视图。真实账户、网卡和系统安装标识保持原值；CPU、GPU、磁盘身份暂不覆盖。")
-                    .size(10)
-                    .color(FAINT)
-                    .font(font::ui_font()),
-                text("GetUserNameEx、WMI、Native Registry API 和设备 IOCTL 暂不覆盖。")
-                    .size(10)
-                    .color(FAINT)
-                    .font(font::ui_font()),
                 form_row(
                     "IANA 时区",
                     searchable_select(
@@ -457,27 +492,54 @@ fn dns_mode_label(mode: &envbox_core::DnsMode) -> &'static str {
 fn dns_editor_view(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::app::dns_editor::TransportChoice;
     let editor = &app.profile_draft.dns_editor;
-    let mut content = column![
-        checkbox(
-            "Strict：受支持的 DNS API 失败时禁止回退宿主 DNS",
-            editor.strict
-        )
-        .on_toggle(Message::ProfileDnsStrict),
-        text("UDP、TCP、DoT、DoH 按列表顺序尝试，不自动添加上游。Host 模式使用宿主 DNS。"),
+    let mut explanation = column![
+        text("Strict：受支持的 DNS API 解析失败时，禁止回退宿主 DNS。")
+            .size(12)
+            .font(font::ui_font()),
+        text("UDP、TCP、DoT、DoH 按列表顺序尝试，不自动添加上游。Host 模式使用宿主 DNS。")
+            .size(12)
+            .font(font::ui_font()),
+        text("应用自带 DNS/DoH/DoT/DoQ 可能绕过这些 API；浏览器 renderer 的信息覆盖需单独验证。")
+            .size(12)
+            .font(font::ui_font()),
     ]
     .spacing(8);
-    content = content.push(text(
-        "应用自带 DNS/DoH/DoT/DoQ 可能绕过这些 API；浏览器 renderer 的信息覆盖需单独验证。",
-    ));
     if editor
         .upstreams
         .iter()
         .any(envbox_core::DnsUpstream::is_plaintext)
     {
-        content = content.push(text(
-            "包含 UDP/TCP 明文上游；前面的加密上游失败后可能发送明文查询。",
-        ));
+        explanation = explanation.push(
+            text("包含 UDP/TCP 明文上游；前面的加密上游失败后可能发送明文查询。")
+                .size(12)
+                .font(font::ui_font()),
+        );
     }
+    let help = tooltip(
+        row![
+            text("说明").size(12).color(MUTED).font(font::ui_font()),
+            icon(Icon::Info, MUTED, 12.0)
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center),
+        container(explanation)
+            .width(320)
+            .padding(12)
+            .style(inner_card_style),
+        tooltip::Position::Left,
+    )
+    .gap(8)
+    .style(inner_card_style);
+    let mut content = column![row![
+        checkbox("Strict：禁止回退宿主 DNS", editor.strict)
+            .on_toggle(Message::ProfileDnsStrict)
+            .text_size(12)
+            .width(Fill),
+        help,
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center),]
+    .spacing(8);
     if editor
         .to_profile(app.profile_draft.dns_mode.to_mode())
         .ok()
@@ -490,51 +552,101 @@ fn dns_editor_view(app: &EnvBoxApp) -> Element<'_, Message> {
     for (index, upstream) in editor.upstreams.iter().enumerate() {
         content = content.push(
             row![
-                text(format!("{} · {}", index + 1, upstream.label())).width(Fill),
-                button("↑").on_press(Message::ProfileDnsMove(index, true)),
-                button("↓").on_press(Message::ProfileDnsMove(index, false)),
-                button("移除").on_press(Message::ProfileDnsRemove(index)),
+                text(format!("{} · {}", index + 1, upstream.label()))
+                    .size(12)
+                    .width(Fill),
+                button("↑")
+                    .style(secondary_btn)
+                    .on_press(Message::ProfileDnsMove(index, true)),
+                button("↓")
+                    .style(secondary_btn)
+                    .on_press(Message::ProfileDnsMove(index, false)),
+                button("移除")
+                    .style(secondary_btn)
+                    .on_press(Message::ProfileDnsRemove(index)),
             ]
             .spacing(4),
         );
     }
-    content = content.push(pick_list(
-        TransportChoice::ALL,
-        Some(editor.draft.transport),
-        Message::ProfileDnsTransport,
-    ));
+    content = content.push(
+        pick_list(
+            TransportChoice::ALL,
+            Some(editor.draft.transport),
+            Message::ProfileDnsTransport,
+        )
+        .style(pick_style)
+        .menu_style(pick_menu)
+        .text_size(12),
+    );
     if editor.draft.transport == TransportChoice::Doh {
-        content = content.push(pick_list(
-            envbox_core::DnsTlsRevocation::ALL,
-            Some(editor.draft.tls_revocation),
-            Message::ProfileDnsTlsRevocation,
-        ));
         content = content.push(
-            text_input("https://resolver.example/dns-query", &editor.draft.url)
-                .on_input(Message::ProfileDnsUrl),
+            pick_list(
+                envbox_core::DnsTlsRevocation::ALL,
+                Some(editor.draft.tls_revocation),
+                Message::ProfileDnsTlsRevocation,
+            )
+            .style(pick_style)
+            .menu_style(pick_menu)
+            .padding(Padding::from([5, 8]))
+            .font(font::ui_font())
+            .text_size(12),
         );
         content = content.push(
-            text_input("显式 bootstrap IP，逗号分隔", &editor.draft.bootstrap)
-                .on_input(Message::ProfileDnsBootstrap),
+            text_input("https://resolver.example/dns-query", &editor.draft.url)
+                .on_input(Message::ProfileDnsUrl)
+                .style(input_style)
+                .padding(8)
+                .font(font::ui_font()),
+        );
+        content = content.push(tooltip(
+            field_label("连接 IP · 可选"),
+            container(text("留空时通过 Profile 中可直接连接的上游解析 DoH 服务域名；没有可用上游时解析失败，不调用宿主 DNS。手填 IP 会覆盖自动解析。").size(12).font(font::ui_font()))
+                .width(320).padding(12),
+            tooltip::Position::Left,
+        ).style(inner_card_style));
+        content = content.push(
+            text_input("留空自动解析；或填写 IP，逗号分隔", &editor.draft.bootstrap)
+                .on_input(Message::ProfileDnsBootstrap)
+                .style(input_style)
+                .padding(8)
+                .font(font::ui_font()),
         );
     } else {
         content = content.push(
             text_input("literal IP，例如 1.1.1.1", &editor.draft.address)
-                .on_input(Message::ProfileDnsAddress),
+                .on_input(Message::ProfileDnsAddress)
+                .style(input_style)
+                .padding(8)
+                .font(font::ui_font()),
         );
-        content =
-            content.push(text_input("端口", &editor.draft.port).on_input(Message::ProfileDnsPort));
+        content = content.push(
+            text_input("端口", &editor.draft.port)
+                .on_input(Message::ProfileDnsPort)
+                .style(input_style)
+                .padding(8)
+                .font(font::ui_font()),
+        );
         if editor.draft.transport == TransportChoice::Dot {
             content = content.push(
                 text_input(
                     "证书身份，例如 cloudflare-dns.com",
                     &editor.draft.server_name,
                 )
-                .on_input(Message::ProfileDnsServerName),
+                .on_input(Message::ProfileDnsServerName)
+                .style(input_style)
+                .padding(8)
+                .font(font::ui_font()),
             );
         }
     }
+    if let Some(error) = editor.draft_error() {
+        content = content.push(text(error).size(12).color(DANGER).font(font::ui_font()));
+    }
     content
-        .push(button("添加上游").on_press(Message::ProfileDnsAdd))
+        .push(
+            button("添加上游")
+                .style(secondary_btn)
+                .on_press(Message::ProfileDnsAdd),
+        )
         .into()
 }

@@ -110,6 +110,8 @@ enum PendingNavigation {
 pub struct EnvBoxApp {
     pub store: ConfigStore,
     pub nav: Nav,
+    pub content_panes: iced::widget::pane_grid::State<bool>,
+    pub profile_panes: iced::widget::pane_grid::State<bool>,
     pub search: String,
     pub applications: Vec<Application>,
     pub profiles: Vec<EnvironmentProfile>,
@@ -217,6 +219,22 @@ impl EnvBoxApp {
         let mut app = Self {
             store,
             nav: Nav::Apps,
+            content_panes: iced::widget::pane_grid::State::with_configuration(
+                iced::widget::pane_grid::Configuration::Split {
+                    axis: iced::widget::pane_grid::Axis::Vertical,
+                    ratio: 0.40,
+                    a: Box::new(iced::widget::pane_grid::Configuration::Pane(false)),
+                    b: Box::new(iced::widget::pane_grid::Configuration::Pane(true)),
+                },
+            ),
+            profile_panes: iced::widget::pane_grid::State::with_configuration(
+                iced::widget::pane_grid::Configuration::Split {
+                    axis: iced::widget::pane_grid::Axis::Vertical,
+                    ratio: 0.36,
+                    a: Box::new(iced::widget::pane_grid::Configuration::Pane(false)),
+                    b: Box::new(iced::widget::pane_grid::Configuration::Pane(true)),
+                },
+            ),
             search: String::new(),
             applications,
             profiles,
@@ -412,6 +430,10 @@ impl EnvBoxApp {
                         self.select_app(id);
                     }
                 }
+                if nav == Nav::Profiles {
+                    self.bind_profile_scope();
+                    return self.workspace_list();
+                }
                 if nav == Nav::Workspaces {
                     return self.workspace_list();
                 }
@@ -429,7 +451,7 @@ impl EnvBoxApp {
             }
             PendingNavigation::Profile(id) => {
                 self.select_profile(id);
-                Task::none()
+                self.workspace_list()
             }
             PendingNavigation::NewApp => self.begin_new_app(),
             PendingNavigation::NewProfile => {
@@ -478,6 +500,8 @@ impl EnvBoxApp {
     }
 
     fn begin_new_profile(&mut self) {
+        self.workspace_management.selection_changed();
+        self.workspaces.clear(Uuid::nil());
         self.nav = Nav::Profiles;
         self.profile_draft = self.blank_profile();
         self.profile_saved_draft = self.profile_draft.clone();
@@ -488,14 +512,35 @@ impl EnvBoxApp {
     }
 
     fn select_profile(&mut self, id: Uuid) {
+        self.workspace_management.selection_changed();
         if let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) {
             self.profile_draft = profile_to_draft(profile);
             self.profile_saved_draft = self.profile_draft.clone();
             self.profile_edit_mode = false;
             self.profile_advanced = false;
         }
+        self.bind_profile_scope();
         self.open_combo = None;
         self.combo_query.clear();
+    }
+
+    fn bind_profile_scope(&mut self) {
+        let previous_scope = self.workspaces.selected;
+        let profile = self
+            .profile_draft
+            .id
+            .and_then(|id| self.profiles.iter().find(|profile| profile.id == id))
+            .cloned();
+        if let Some(profile) = profile {
+            if let Err(error) = self.workspaces.bind_profile(&self.store, &profile) {
+                self.set_status(StatusKind::Error, format!("环境配置运行准备失败：{error}"));
+            }
+        } else {
+            self.workspaces.clear(Uuid::nil());
+        }
+        if previous_scope != self.workspaces.selected {
+            self.workspace_management.selection_changed();
+        }
     }
 
     pub fn load_audit(&mut self) {
@@ -718,6 +763,11 @@ impl EnvBoxApp {
                     return self.request_navigation(PendingNavigation::Nav(n));
                 }
             }
+            Message::ContentPaneResized(event) => {
+                let panes = if self.nav == Nav::Profiles { &mut self.profile_panes } else { &mut self.content_panes };
+                let minimum = if self.nav == Nav::Profiles { 0.32 } else { 0.35 };
+                panes.resize(event.split, event.ratio.clamp(minimum, 0.75));
+            }
             Message::Search(v) => self.search = v,
             Message::WorkspaceNew => {
                 return self.request_navigation(PendingNavigation::Workspace(None));
@@ -861,7 +911,19 @@ impl EnvBoxApp {
             Message::ProfileComputerName(v) => self.profile_draft.identity.computer_name = v,
             Message::ProfileUserName(v) => self.profile_draft.identity.user_name = v,
             Message::ProfileMacAddress(v) => self.profile_draft.identity.mac_address = v,
+            Message::ProfileMacAddressGenerate => {
+                let mut bytes = *Uuid::new_v4().as_bytes();
+                bytes[0] = (bytes[0] & 0xfc) | 0x02;
+                self.profile_draft.identity.mac_address = bytes[..6]
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(":");
+            }
             Message::ProfileMachineGuid(v) => self.profile_draft.identity.machine_guid = v,
+            Message::ProfileMachineGuidGenerate => {
+                self.profile_draft.identity.machine_guid = Uuid::new_v4().to_string();
+            }
             Message::ProfileLocale(v) => self.profile_draft.locale = v,
             Message::ProfileUi(v) => self.profile_draft.ui = v,
             Message::ProfileRegion(v) => self.profile_draft.region = v,
@@ -1411,13 +1473,18 @@ impl EnvBoxApp {
                 self.profile_draft.id = Some(profile.id);
                 self.profile_draft.identity =
                     identity_editor::IdentityDraft::from_profile(&profile.identity);
+                self.profile_draft.dns_editor = dns_editor::DnsEditor::from_profile(&profile.dns);
                 self.profile_saved_draft = self.profile_draft.clone();
                 self.profile_edit_mode = false;
-                self.set_status(StatusKind::Success, "环境配置已保存");
+                self.bind_profile_scope();
+                if self.workspaces.error.is_none() {
+                    self.set_status(StatusKind::Success, "环境配置已保存");
+                }
                 if self.resume_new_app {
                     self.resume_new_app = false;
                     return self.begin_new_app();
                 }
+                return self.workspace_list();
             }
             Err(err) => self.set_status(StatusKind::Error, format!("保存失败: {err}")),
         }
@@ -1429,6 +1496,13 @@ impl EnvBoxApp {
             self.set_status(StatusKind::Error, "请先选择环境配置");
             return Task::none();
         };
+        if self.workspace_management.pending_belongs_to_profile(id) {
+            self.set_status(
+                StatusKind::Error,
+                "此环境配置的启动结果尚未知；请先查询原实例，再删除配置",
+            );
+            return Task::none();
+        }
         let in_use = self
             .applications
             .iter()
@@ -1441,7 +1515,13 @@ impl EnvBoxApp {
             );
             return Task::none();
         }
-        let mut doc = self.store.load_profiles().unwrap_or_default();
+        let mut doc = match self.store.load_profiles() {
+            Ok(doc) => doc,
+            Err(error) => {
+                self.set_status(StatusKind::Error, format!("读取配置失败：{error}"));
+                return Task::none();
+            }
+        };
         doc.profiles.retain(|p| p.id != id);
         match self.store.save_profiles(&doc) {
             Ok(()) => {
@@ -1452,6 +1532,8 @@ impl EnvBoxApp {
                     self.profile_draft = self.blank_profile();
                     self.profile_saved_draft = self.profile_draft.clone();
                     self.profile_edit_mode = false;
+                    self.workspace_management.selection_changed();
+                    self.workspaces.clear(Uuid::nil());
                 }
                 self.set_status(StatusKind::Success, "环境配置已删除");
             }

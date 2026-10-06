@@ -1,7 +1,10 @@
 use crate::app::EnvBoxApp;
+use crate::font;
 use crate::message::Message;
-use iced::widget::{button, column, pick_list, row, scrollable, text, text_input};
-use iced::{Element, Fill};
+use crate::theme::{self, DANGER_TEXT, INK, INK_2, MUTED};
+use crate::widgets::{field_label, short_id};
+use iced::widget::{button, column, container, pick_list, row, text, tooltip};
+use iced::{Element, Fill, Padding};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,91 +23,13 @@ impl std::fmt::Display for ProfileChoice {
     }
 }
 
+// Kept for internal routing compatibility; the public entry is Profile detail.
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
+    run_panel(app)
+}
+
+pub fn run_panel(app: &EnvBoxApp) -> Element<'_, Message> {
     let state = &app.workspaces;
-    let mut items = column![
-        text("环境容器").size(22),
-        text("容器保存 Profile 信息视图与运行记录，每次运行使用不可变快照。目标程序继续使用宿主文件、网络、GPU 和用户权限。"),
-        row![
-            button("新建").on_press(Message::WorkspaceNew),
-            button("刷新").on_press(Message::WorkspaceRefresh)
-        ]
-        .spacing(8),
-    ]
-    .spacing(14);
-    if let Some(error) = &state.error {
-        items = items.push(text(format!("读取或保存失败：{error}")));
-    }
-    for workspace in &state.document.containers {
-        items = items.push(
-            button(text(format!("{} · {}", workspace.name, workspace.id)))
-                .on_press(Message::WorkspaceSelect(workspace.id)),
-        );
-    }
-    let options: Vec<ProfileChoice> = app
-        .profiles
-        .iter()
-        .map(|profile| ProfileChoice {
-            id: profile.id,
-            name: profile.name.clone(),
-        })
-        .collect();
-    let selected = options
-        .iter()
-        .find(|profile| profile.id == state.draft.profile_id)
-        .cloned();
-    if state.selected.is_some() && selected.is_none() {
-        items = items.push(text(format!(
-            "环境配置 {} 已不存在或无法读取；环境容器及已有快照保留，新准备会失败。",
-            state.draft.profile_id
-        )));
-    }
-    items = items.push(
-        column![
-            text(if state.selected.is_some() {
-                "编辑环境容器"
-            } else {
-                "新建环境容器"
-            })
-            .size(18),
-            text_input("名称", &state.draft.name).on_input(Message::WorkspaceName),
-            pick_list(options, selected, |profile| Message::WorkspaceProfile(
-                profile.id
-            ))
-            .placeholder("选择环境配置"),
-            text("DNS Host 模式使用 Windows 宿主 DNS；VirtualView 模式下，受支持的 DNS API 按 Profile 配置使用 UDP、TCP、DoT、DoH，Strict 模式禁止失败后回退宿主 DNS。"),
-            text("应用自带 DNS 和不能注入的浏览器 renderer 可能读取宿主信息；Profile 不改变公网出口 IP。"),
-            row![
-                button("保存").on_press(Message::WorkspaceSave),
-                button("取消修改").on_press(Message::WorkspaceCancel)
-            ]
-            .spacing(8),
-        ]
-        .spacing(10),
-    );
-    if let Some(profile) = app
-        .profiles
-        .iter()
-        .find(|profile| profile.id == state.draft.profile_id)
-    {
-        let enabled = [
-            ("主机名", profile.identity.computer_name.is_some()),
-            ("用户名", profile.identity.user_name.is_some()),
-            ("MAC", profile.identity.mac_address.is_some()),
-            ("MachineGuid", profile.identity.machine_guid.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(name, configured)| configured.then_some(name))
-        .collect::<Vec<_>>();
-        items = items.push(text(if enabled.is_empty() {
-            "身份信息视图：跟随宿主".to_string()
-        } else {
-            format!(
-                "身份信息视图：{} 已配置（仅支持的读取入口）",
-                enabled.join("、")
-            )
-        }));
-    }
     let management = &app.workspace_management;
     let applications: Vec<ProfileChoice> = app
         .applications
@@ -118,7 +43,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         .iter()
         .find(|value| Some(value.id) == management.application_id)
         .cloned();
-    let mut run_button = button("创建快照并运行");
+    let mut run_button = action("创建快照并运行").style(theme::primary_btn);
     if !management.busy
         && !state.dirty()
         && state.selected.is_some()
@@ -128,50 +53,125 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     {
         run_button = run_button.on_press(Message::WorkspaceRun);
     }
-    let mut refresh_button = button("刷新 Supervisor 实例");
-    let mut stop_all = button("停止此环境容器全部实例");
+    let mut refresh_button = action("刷新运行状态");
+    let mut stop_all = action("停止全部实例").style(theme::danger_btn);
     if !management.busy {
         refresh_button = refresh_button.on_press(Message::WorkspaceList);
         if state.selected.is_some() && management.generation.is_some() {
             stop_all = stop_all.on_press(Message::WorkspaceStopAll);
         }
     }
-    items = items.push(text("环境容器运行 · Supervisor").size(18));
-    items = items.push(
+    let mut runs = column![
+        text("使用此配置运行")
+            .size(17)
+            .color(INK)
+            .font(font::name_font()),
+        field_label("已保存应用")
+    ]
+    .spacing(10);
+    runs = runs.push(
         pick_list(applications, application, |value| {
             Message::WorkspaceApplication(value.id)
         })
-        .placeholder("选择已保存应用"),
+        .placeholder("选择要运行的应用")
+        .text_size(13)
+        .font(font::ui_font())
+        .padding(Padding::from([10, 12]))
+        .width(Fill)
+        .style(theme::pick_style)
+        .menu_style(theme::pick_menu),
     );
-    items = items.push(row![run_button, refresh_button, stop_all].spacing(8));
-    items = items.push(text("不支持 Packaged、控制台 broker 或关闭子进程继承的应用；由服务器验证入口资格。停止范围由服务器的环境容器实例集合决定。"));
+    runs = runs.push(run_button.width(Fill));
+    runs = runs.push(row![refresh_button, stop_all].spacing(8));
+    if let Some(error) = &state.error {
+        runs = runs.push(
+            text(format!("准备运行配置失败：{error}"))
+                .size(13)
+                .color(DANGER_TEXT)
+                .font(font::ui_font()),
+        );
+    }
+    if app.applications.is_empty() {
+        runs = runs.push(
+            text("尚无已保存应用，请先在“应用”页面添加。")
+                .size(12)
+                .color(MUTED)
+                .font(font::ui_font()),
+        );
+    }
+    if state.selected.is_none() {
+        runs = runs.push(
+            text("当前配置的运行范围尚未准备好，请重新选择配置或刷新。")
+                .size(12)
+                .color(MUTED)
+                .font(font::ui_font()),
+        );
+    }
     if management.busy {
-        items = items.push(text("正在处理 Supervisor 请求…"));
+        runs = runs.push(
+            text("正在处理运行管理请求…")
+                .size(13)
+                .color(MUTED)
+                .font(font::ui_font()),
+        );
+    } else if management.generation.is_none() {
+        runs = runs.push(
+            text("尚未取得运行管理状态，请刷新。")
+                .size(12)
+                .color(MUTED)
+                .font(font::ui_font()),
+        );
     }
     if let Some(error) = &management.error {
-        items = items.push(text(format!("Supervisor 请求失败：{error}")));
+        runs = runs.push(
+            text(format!("运行管理请求失败：{error}"))
+                .size(13)
+                .color(DANGER_TEXT)
+                .font(font::ui_font()),
+        );
     }
     if let Some(notice) = &management.notice {
-        items = items.push(text(notice));
+        runs = runs.push(text(notice).size(13).color(INK_2).font(font::ui_font()));
     }
     if let Some(generation) = &management.generation {
-        items = items.push(text(format!("当前 Supervisor generation：{generation}")));
+        runs = runs.push(technical_info(
+            "运行管理会话标识".into(),
+            format!("Supervisor generation：{generation}"),
+            MUTED,
+        ));
     }
     if let Some(pending) = &management.pending_run {
-        items = items.push(text(format!(
-            "待确认实例：{} · 环境容器 {}",
-            pending.instance_id, pending.container_id
-        )));
-        let mut query = button("查询原实例运行结果");
-        if !management.busy && Some(pending.container_id) == state.selected {
-            query = query.on_press(Message::WorkspaceRunStatus);
+        if app
+            .profile_draft
+            .id
+            .is_some_and(|profile_id| management.pending_belongs_to_profile(profile_id))
+        {
+            runs = runs.push(technical_info(
+                format!("实例 {} 的运行结果待确认", short_id(pending.instance_id)),
+                format!(
+                    "实例 ID：{}\n运行范围 ID：{}",
+                    pending.instance_id, pending.container_id
+                ),
+                INK_2,
+            ));
+            let mut query = action("查询原实例运行结果");
+            if !management.busy {
+                query = query.on_press(Message::WorkspaceRunStatus);
+            }
+            runs = runs.push(query);
+        } else {
+            runs = runs.push(
+                text("另一环境配置的启动结果待确认，请切回原配置查询。")
+                    .size(12)
+                    .color(MUTED)
+                    .font(font::ui_font()),
+            );
         }
-        items = items.push(query);
     }
-    if let Some(workspace_id) = state.selected {
-        for view in management.workspace_instances(workspace_id) {
+    if let Some(profile_id) = app.profile_draft.id {
+        for view in management.profile_instances(profile_id) {
             let result = &view.result;
-            let mut stop = button("停止实例");
+            let mut stop = action("停止实例").style(theme::danger_btn);
             if !management.busy
                 && Some(result.supervisor_generation.as_str()) == management.generation.as_deref()
                 && result.state != "TrackingLost"
@@ -208,38 +208,81 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
                 .iter()
                 .filter(|member| member.environment_facts.is_some())
                 .count();
-            items = items.push(
-                column![
+            let application_name = app
+                .applications
+                .iter()
+                .find(|application| application.id == result.application_id)
+                .map(|application| application.name.clone())
+                .unwrap_or_else(|| format!("应用 {}", short_id(result.application_id)));
+            let details = format!(
+                "实例 ID：{}\nApplication：{}\nSupervisor generation：{}\n配置身份：{}\n快照：{}",
+                result.instance_id,
+                result.application_id,
+                result.supervisor_generation,
+                result.configuration_id,
+                result.snapshot_digest
+            );
+            let mut instance = column![
                     text(format!(
                         "{} · {} · PID {}",
-                        result.instance_id, result.state, result.root_pid
-                    )),
-                    text(format!(
-                        "Application {} · generation {}",
-                        result.application_id, result.supervisor_generation
-                    )),
+                        application_name, result.state, result.root_pid
+                    )).size(14).color(INK).font(font::name_font()),
+                    technical_info(format!("实例 {} · 标识详情", short_id(result.instance_id)), details, MUTED),
                     text(format!(
                         "{} · 入口保证 {}",
                         result.mode, result.entry_guarantee
-                    )),
-                    text(format!(
-                        "配置身份 {} · 快照 {}",
-                        result.configuration_id, result.snapshot_digest
-                    )),
-                    text(environment_observation),
+                    )).size(12).color(INK_2).font(font::ui_font()),
+                    text(environment_observation).size(12).color(INK_2).font(font::ui_font()),
                     text(format!(
                         "已记录成员环境观测：{} / {} · 未观测 {} · Hook 安装信息不代表所有读取入口已验证",
                         observed_members,
                         result.known_members.len(),
                         result.known_members.len().saturating_sub(observed_members)
-                    )),
-                    text(format!("当前 Job 进程：{:?}", view.process_ids)),
-                    text(result.error.as_deref().unwrap_or("")),
-                    stop,
+                    )).size(12).color(MUTED).font(font::ui_font()),
+                    text(format!("当前 Job 进程：{:?}", view.process_ids)).size(12).color(MUTED).font(font::ui_font()),
                 ]
-                .spacing(6),
+                .spacing(8);
+            if let Some(error) = &result.error {
+                instance = instance.push(
+                    text(error)
+                        .size(13)
+                        .color(DANGER_TEXT)
+                        .font(font::ui_font()),
+                );
+            }
+            instance = instance.push(stop);
+            runs = runs.push(
+                container(instance)
+                    .padding(14)
+                    .width(Fill)
+                    .style(theme::inner_card_style),
             );
         }
     }
-    scrollable(items.width(Fill)).into()
+    runs = runs.push(technical_info(
+        "支持范围（悬停查看）".into(),
+        "每次启动保存独立快照；应用继续使用宿主文件、网络、GPU 和用户权限，公网出口 IP 保持不变。\n配置 DNS 仅覆盖支持的 Windows DNS API；应用自带 DNS 和无法注入的浏览器 renderer 仍可能读取宿主信息。\n不支持 Packaged、控制台 broker 或关闭子进程继承的应用。停止操作仅针对此配置实际关联的运行实例。".into(),
+        MUTED,
+    ));
+    container(runs)
+        .padding(12)
+        .width(Fill)
+        .style(theme::panel_card_style)
+        .into()
+}
+
+fn action<'a>(label: &'static str) -> iced::widget::Button<'a, Message> {
+    button(text(label).size(13).font(font::ui_font()))
+        .padding(Padding::from([9, 14]))
+        .style(theme::secondary_btn)
+}
+
+fn technical_info(label: String, detail: String, color: iced::Color) -> Element<'static, Message> {
+    tooltip(
+        text(label).size(12).color(color).font(font::ui_font()),
+        text(detail).size(12).color(INK_2).font(font::ui_font()),
+        tooltip::Position::Top,
+    )
+    .style(theme::inner_card_style)
+    .into()
 }

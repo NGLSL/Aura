@@ -350,6 +350,9 @@ pub fn shell_style(_t: &Theme) -> container::Style {
 }
 
 pub fn primary_btn(_t: &Theme, status: button::Status) -> button::Style {
+    if matches!(status, button::Status::Disabled) {
+        return disabled_button_style();
+    }
     let bg = match status {
         button::Status::Hovered => ACCENT_HOVER,
         button::Status::Pressed => ACCENT_SOFT,
@@ -368,6 +371,9 @@ pub fn primary_btn(_t: &Theme, status: button::Status) -> button::Style {
 }
 
 pub fn secondary_btn(_t: &Theme, status: button::Status) -> button::Style {
+    if matches!(status, button::Status::Disabled) {
+        return disabled_button_style();
+    }
     let bg = match status {
         button::Status::Hovered => Color::from_rgb(0.118, 0.165, 0.235),
         button::Status::Pressed => Color::from_rgb(0.067, 0.098, 0.145),
@@ -386,6 +392,9 @@ pub fn secondary_btn(_t: &Theme, status: button::Status) -> button::Style {
 }
 
 pub fn danger_btn(_t: &Theme, status: button::Status) -> button::Style {
+    if matches!(status, button::Status::Disabled) {
+        return disabled_button_style();
+    }
     let bg = match status {
         button::Status::Hovered => Color::from_rgb(0.260, 0.100, 0.100),
         button::Status::Pressed => Color::from_rgb(0.180, 0.060, 0.060),
@@ -399,6 +408,19 @@ pub fn danger_btn(_t: &Theme, status: button::Status) -> button::Style {
             radius: 8.0.into(),
         },
         text_color: DANGER_TEXT,
+        ..Default::default()
+    }
+}
+
+fn disabled_button_style() -> button::Style {
+    button::Style {
+        background: Some(Background::Color(INPUT)),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        text_color: FAINT,
         ..Default::default()
     }
 }

@@ -1,6 +1,6 @@
 //! Three-column shell with custom title bar (no native chrome).
 
-use iced::widget::{button, column, container, mouse_area, row, text, Space};
+use iced::widget::{button, column, container, mouse_area, pane_grid, row, text, Space};
 use iced::{Element, Fill, Length, Padding};
 
 use crate::app::EnvBoxApp;
@@ -16,9 +16,34 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::message::Nav;
 
     let body = match app.nav {
-        Nav::Apps | Nav::Profiles => {
-            row![nav::view(app), center(app), detail::view(app)].spacing(0)
-        }
+        Nav::Apps | Nav::Profiles => row![
+            nav::view(app),
+            pane_grid::PaneGrid::new(
+                if app.nav == Nav::Profiles {
+                    &app.profile_panes
+                } else {
+                    &app.content_panes
+                },
+                |_, is_detail, _| {
+                    pane_grid::Content::new(if *is_detail {
+                        detail::view(app)
+                    } else {
+                        center(app)
+                    })
+                }
+            )
+            .width(Fill)
+            .height(Fill)
+            .spacing(6)
+            .on_resize(8, Message::ContentPaneResized)
+            .style(|theme| {
+                let mut style = pane_grid::default(theme);
+                style.hovered_split.color = theme::ACCENT_LINE;
+                style.picked_split.color = theme::ACCENT_LINE;
+                style
+            }),
+        ]
+        .spacing(0),
         Nav::Workspaces | Nav::Instances | Nav::Audit | Nav::Settings => {
             row![nav::view(app), center_full(app)].spacing(0)
         }

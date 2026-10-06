@@ -1,7 +1,6 @@
 use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{Alignment, Element, Fill, Length, Padding};
 
-use envbox_core::ConsoleHost;
 use crate::app::EnvBoxApp;
 use crate::font;
 use crate::icons::{icon, Icon};
@@ -12,6 +11,7 @@ use crate::widgets::{
     app_icon_badge, badge, danger_btn, field_label, form_row, kv_row, primary_btn, secondary_btn,
     status_dot, toggle,
 };
+use envbox_core::ConsoleHost;
 
 use super::{detail_shell, section_title};
 
@@ -70,23 +70,7 @@ pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     .align_y(Alignment::Center);
 
     let header_action: Element<_> = if let Some(id) = selected {
-        let run_button: Element<_> = if running {
-            button(
-                row![
-                    icon(Icon::Instances, ACCENT_TEXT, 11.0),
-                    text("查看实例")
-                        .size(12)
-                        .color(INK_2)
-                        .font(font::name_font()),
-                ]
-                .spacing(5)
-                .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([6, 12]))
-            .style(secondary_btn)
-            .on_press(Message::InstanceFilter(Some(id)))
-            .into()
-        } else {
+        let run_button: Element<_> = {
             button(
                 row![
                     icon(Icon::Play, INK, 11.0),
@@ -160,11 +144,23 @@ pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     .spacing(10)
     .align_y(Alignment::Center);
 
-    let action_row = row![open_loc_btn, header_action]
+    let mut action_row = row![open_loc_btn, header_action]
         .spacing(6)
         .align_y(Alignment::Center);
+    if !editing {
+        if let Some(application) = selected_app {
+            action_row = action_row.push(run_selector(app, application));
+        }
+    }
 
-    let header = column![title_row, action_row].spacing(8).width(Fill);
+    let mut header = column![title_row, action_row].spacing(8).width(Fill);
+    if running {
+        header = header.push(
+            button(text("查看运行实例").size(12).font(font::ui_font()))
+                .style(secondary_btn)
+                .on_press(Message::InstanceFilter(selected)),
+        );
+    }
 
     let content = if editing {
         app_editor(app)
@@ -173,6 +169,62 @@ pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     };
 
     detail_shell(column![header, content].spacing(12))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunChoice {
+    label: String,
+    profile_id: Option<uuid::Uuid>,
+}
+
+impl std::fmt::Display for RunChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+fn run_selector<'a>(
+    app: &'a EnvBoxApp,
+    application: &'a envbox_core::Application,
+) -> Element<'a, Message> {
+    let id = application.id;
+    let unsupported = app
+        .app_capabilities
+        .get(&id)
+        .is_some_and(|capability| capability.injection == InjectionSupport::Unsupported);
+    let mut choices: Vec<_> = app
+        .profiles
+        .iter()
+        .filter(|profile| !unsupported && profile.id != application.default_profile_id)
+        .map(|profile| RunChoice {
+            label: if app
+                .profiles
+                .iter()
+                .filter(|other| other.name == profile.name)
+                .count()
+                > 1
+            {
+                format!("{} ({})", profile.name, &profile.id.to_string()[..8])
+            } else {
+                profile.name.clone()
+            },
+            profile_id: Some(profile.id),
+        })
+        .collect();
+    choices.push(RunChoice {
+        label: "在本机直接运行".into(),
+        profile_id: None,
+    });
+    pick_list(choices, None::<RunChoice>, move |choice| {
+        Message::AppRunWithId(id, choice.profile_id)
+    })
+    .placeholder("其他方式")
+    .style(pick_style)
+    .menu_style(pick_menu)
+    .padding(Padding::from([5, 8]))
+    .font(font::ui_font())
+    .text_size(12)
+    .into()
 }
 
 fn app_overview<'a>(

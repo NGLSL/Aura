@@ -1,4 +1,4 @@
-# Aura 环境信息容器规格
+# Aura 环境配置规格
 
 Status: ready-for-human
 Date: 2026-10-06
@@ -7,16 +7,18 @@ Implementation status: 当前声明的信息视图范围已实现并完成验证
 
 ## 目标
 
-用户在 Aura 中创建环境容器，选择一个 Environment Profile，让该容器中受支持的程序及子进程读取指定的环境信息，减少通过已覆盖入口读取到宿主信息的情况。同一程序在 Host、A、B 下分别呈现 Host、Profile A、Profile B 的信息；宿主系统配置保持原样。
+用户在 Aura 中创建环境配置（Environment Profile），在应用页为应用选择环境配置并启动，让受支持的程序及子进程读取指定的环境信息，减少通过已覆盖入口读取到宿主信息的情况。同一程序在 Host、A、B 下分别呈现 Host、Profile A、Profile B 的信息；宿主系统配置保持原样。
 
-容器保存身份、Profile 引用和运行记录。每次运行使用不可变有效配置快照，运行中不热更新。目标程序继续使用宿主文件系统、GPU、网络和用户权限。文件写入、Registry 写入和出口访问权限隔离不属于本规格。
+环境配置页只负责设置，不提供应用选择或启动入口；应用页负责选择应用及配置并启动，运行实例页负责实例管理。不要求另外新建或关联容器。GUI 自动管理后端运行作用域，复用原 Container/Supervisor 协议与旧数据，保留历史目录与 metadata。记录按 RunResult.profile_id 的运行时快照事实归属；后端批量停止精确限定所选 Profile、当前 generation 且可跟踪的实例，不能根据旧容器当前关联配置扩大范围。
+
+每次运行使用不可变有效配置快照，运行中不热更新。目标程序继续使用宿主文件系统、GPU、网络和用户权限。文件写入、Registry 写入和出口访问权限隔离不属于本规格。
 
 “防泄漏”必须写成具体能力和读取入口的保证，不能以容器名称或 DLL 已加载宣称所有宿主信息都不可获取。
 
 ## 术语与现有模型
 
 - **Environment Profile**：定义支持的环境信息视图与 DNS/浏览器策略。
-- **环境容器 / 环境工作区**：保存稳定身份和 Profile 引用，管理使用该配置启动的实例；不是独立操作系统或权限沙箱。
+- **Container / 环境工作区**：保留为内部运行作用域和旧数据兼容模型，由 GUI 自动管理，不再是用户需要另行配置的产品对象。
 - **RunSnapshot**：一次运行的有效配置快照，绑定 Container/Profile/Instance 身份。
 - **RuntimeInstance**：一次运行及其受支持进程树。
 - **Coverage**：按能力、读取入口和进程报告 Verified、Partial、Unsupported、Unverified。

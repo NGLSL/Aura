@@ -55,6 +55,24 @@ const char* Summary(uint32_t error) {
 }
 }
 
+bool DnsDohBootstrapName(const DnsTransportEndpoint& endpoint, char (&name)[256]) {
+  if (endpoint.kind != DnsTransportKind::Doh || endpoint.bootstrap_count != 0 ||
+      !endpoint.url || strncmp(endpoint.url, "https://", 8) != 0) return false;
+  char literal[64] = {};
+  if (LiteralAuthority(endpoint.url, literal)) return false;
+  const char* host = endpoint.url + 8;
+  size_t length = strcspn(host, ":/?");
+  if (!length || length >= sizeof(name)) return false;
+  for (size_t i = 0; i < length; ++i) {
+    const unsigned char character = static_cast<unsigned char>(host[i]);
+    if (character <= 32 || character >= 127 || character == '@' ||
+        character == '[' || character == ']' || character == '\\' || character == '#') return false;
+  }
+  memcpy(name, host, length);
+  name[length] = '\0';
+  return true;
+}
+
 int DnsDohExchange(const DnsTransportEndpoint& endpoint,
                    const unsigned char* query, int query_length,
                    unsigned char* response, int capacity,

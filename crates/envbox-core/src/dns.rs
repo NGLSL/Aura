@@ -93,10 +93,9 @@ impl DnsUpstream {
             Self::Doh {
                 url, bootstrap_ips, ..
             } => {
-                let literal_authority = validate_doh_url(url)?;
-                if !literal_authority && bootstrap_ips.is_empty() {
-                    return Err(invalid("hostname DoH URL requires explicit bootstrap_ips"));
-                }
+                // Empty bootstrap delegates service-host lookup to other directly
+                // connectable Profile upstreams. It never authorizes Host DNS.
+                validate_doh_url(url)?;
                 if bootstrap_ips.len() > MAX_DNS_UPSTREAMS {
                     return Err(invalid("at most eight bootstrap IPs are supported"));
                 }

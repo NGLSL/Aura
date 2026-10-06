@@ -1,6 +1,6 @@
 //! Applications center: search/header and application cards.
 
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Column};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, tooltip, Column};
 use iced::{Alignment, Border, Element, Fill, Length, Padding};
 
 use crate::app::EnvBoxApp;
@@ -8,19 +8,7 @@ use crate::font;
 use crate::icons::{icon, Icon};
 use crate::message::Message;
 use crate::theme::*;
-use crate::widgets::{app_icon_badge, badge, primary_btn, secondary_btn, status_dot};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RunChoice {
-    label: String,
-    profile_id: Option<uuid::Uuid>,
-}
-
-impl std::fmt::Display for RunChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.label)
-    }
-}
+use crate::widgets::{app_icon_badge, primary_btn, status_dot};
 
 fn ellipsize(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -65,12 +53,16 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
         .align_y(Alignment::Center),
     )
     .padding(Padding::from([4, 10]))
-    .width(Length::Fixed(210.0))
+    .width(Fill)
     .style(search_box_container);
 
-    let header = row![title.width(Fill), add_btn, search_bar]
-        .spacing(12)
-        .align_y(Alignment::Center);
+    let header = column![
+        title.width(Fill),
+        row![add_btn, search_bar]
+            .spacing(12)
+            .align_y(Alignment::Center)
+    ]
+    .spacing(10);
 
     let filtered = app.filtered_apps();
     let cards: Element<_> = if filtered.is_empty() {
@@ -135,29 +127,10 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
 }
 
 fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<'a, Message> {
-    use envbox_core::LaunchTarget;
-
     let selected = app.app_draft.id == Some(a.id);
     let running_count = app.running_count(a.id);
     let id = a.id;
     let capability = app.app_capabilities.get(&id).copied();
-    let unsupported = capability
-        .is_some_and(|cap| cap.injection == crate::package::InjectionSupport::Unsupported);
-
-    let path_label = match &a.launch {
-        LaunchTarget::Command { command } => command.clone(),
-        LaunchTarget::Executable { path } => path
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string()),
-        LaunchTarget::Packaged { .. } => "Windows 应用".to_string(),
-    };
-
-    let profile_badge = badge(
-        &app.profile_name(a.default_profile_id),
-        ACCENT_BG,
-        ACCENT_TEXT,
-    );
 
     let status_indicator = row![
         status_dot(if running_count > 0 { SUCCESS } else { FAINT }),
@@ -172,87 +145,6 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
     ]
     .spacing(6)
     .align_y(Alignment::Center);
-
-    let run_button = button(
-        row![
-            icon(Icon::Play, INK, 11.0),
-            text("运行").size(12).color(INK).font(font::name_font())
-        ]
-        .spacing(5)
-        .align_y(Alignment::Center),
-    )
-    .padding(Padding::from([5, 14]))
-    .style(if unsupported {
-        secondary_btn
-    } else {
-        primary_btn
-    })
-    .on_press_maybe((!unsupported).then_some(Message::AppRunId(id)));
-
-    let mut choices: Vec<RunChoice> = if unsupported {
-        Vec::new()
-    } else {
-        app.profiles
-            .iter()
-            .filter(|profile| profile.id != a.default_profile_id)
-            .map(|profile| {
-                let duplicate_name = app
-                    .profiles
-                    .iter()
-                    .filter(|other| other.name == profile.name)
-                    .count()
-                    > 1;
-                let label = if duplicate_name {
-                    format!("{} ({})", profile.name, &profile.id.to_string()[..8])
-                } else {
-                    profile.name.clone()
-                };
-                RunChoice {
-                    label,
-                    profile_id: Some(profile.id),
-                }
-            })
-            .collect()
-    };
-    choices.push(RunChoice {
-        label: "在本机直接运行".to_string(),
-        profile_id: None,
-    });
-    let run_picker = pick_list(choices, None::<RunChoice>, move |choice| {
-        Message::AppRunWithId(id, choice.profile_id)
-    })
-    .placeholder("其他方式")
-    .style(pick_style)
-    .menu_style(pick_menu)
-    .padding(Padding::from([5, 8]))
-    .font(font::ui_font())
-    .text_size(12)
-    .width(Length::Fixed(190.0));
-
-    let action_row = row![run_button, run_picker]
-        .spacing(5)
-        .align_y(Alignment::Center);
-    let mut action_stack = column![action_row]
-        .align_x(Alignment::End)
-        .width(Length::Shrink);
-    if running_count > 0 {
-        action_stack = action_stack.push(
-            button(
-                row![
-                    icon(Icon::Monitor, INK_2, 10.0),
-                    text(format!("查看实例 ({running_count})"))
-                        .size(11)
-                        .color(INK_2)
-                        .font(font::ui_font()),
-                ]
-                .spacing(5)
-                .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([4, 8]))
-            .style(secondary_btn)
-            .on_press(Message::InstanceFilter(Some(id))),
-        );
-    }
 
     let tile = app
         .app_icons
@@ -284,74 +176,54 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
         })
         .unwrap_or_else(|| app_icon_badge(&a.name, 40.0));
 
-    let meta_cmd = row![
-        icon(Icon::ArrowsHorizontal, FAINT, 11.0),
-        text(ellipsize(&path_label, 50))
-            .size(11)
-            .color(MUTED)
-            .font(font::ui_font()),
-    ]
-    .spacing(5)
+    let mut heading = row![text(&a.name)
+        .size(15)
+        .color(INK)
+        .font(font::name_font())
+        .width(Fill)]
+    .spacing(8)
     .align_y(Alignment::Center);
-
-    let mut top_left = row![
-        text(&a.name).size(15).color(INK).font(font::name_font()),
-        profile_badge,
+    let warning = if crate::package::chromium_renderer_sandbox_limited(a) {
+        Some("浏览器网页沙箱可能读取宿主信息；部分环境设置受限。")
+    } else {
+        match capability.map(|value| value.injection) {
+            Some(crate::package::InjectionSupport::Unsupported) => Some("此应用无法使用环境配置。"),
+            Some(crate::package::InjectionSupport::Delayed) => Some("部分环境设置可能不生效。"),
+            _ => None,
+        }
+    };
+    if let Some(warning) = warning {
+        heading = heading.push(
+            tooltip(
+                icon(Icon::Info, MUTED, 12.0),
+                container(text(warning).size(12).font(font::ui_font()))
+                    .width(260)
+                    .padding(10),
+                tooltip::Position::Right,
+            )
+            .style(inner_card_style),
+        );
+    }
+    let profile = ellipsize(&app.profile_name(a.default_profile_id), 32);
+    let metadata = row![
+        text(profile)
+            .size(12)
+            .color(MUTED)
+            .font(font::ui_font())
+            .width(Fill),
+        status_indicator
     ]
     .spacing(8)
     .align_y(Alignment::Center);
-    if let Some(status_badge) = capability_badge(capability) {
-        top_left = top_left.push(status_badge);
-    }
-    if crate::package::chromium_renderer_sandbox_limited(a) {
-        top_left = top_left.push(badge("网页沙箱：部分环境受限", ACCENT_BG, ACCENT_TEXT));
-    }
-
-    let left_info = column![top_left, meta_cmd].spacing(6).width(Length::Fill);
-
-    // Keep the action stack at its natural width. The left side owns the
-    // remaining space, so the actions stay against the card's right edge.
-    let right_column = column![status_indicator, action_stack]
-        .spacing(6)
-        .align_x(Alignment::End)
-        .width(Length::Shrink);
-
-    // Only the information side is a selection hit area. Keeping the action
-    // stack outside it prevents a transparent mouse area from intercepting
-    // the Run, menu, and instance-filter buttons.
-    let left_content = iced::widget::mouse_area(
-        row![tile, left_info]
-            .spacing(14)
-            .align_y(Alignment::Center)
-            .width(Fill),
-    )
-    .on_press(Message::AppSelect(id));
-
-    let card = container(
-        row![left_content, right_column]
-            .spacing(12)
-            .align_y(Alignment::Center)
-            .width(Fill),
-    )
-    .padding(Padding::from([12, 16]))
-    .width(Fill)
-    .style(move |_| card_style(selected));
-
-    card.into()
-}
-
-fn capability_badge(
-    capability: Option<crate::package::Capability>,
-) -> Option<Element<'static, Message>> {
-    use crate::package::InjectionSupport;
-
-    match capability.map(|cap| cap.injection) {
-        Some(InjectionSupport::Unsupported) => {
-            Some(badge("无法使用环境配置", DANGER_BG, DANGER_TEXT))
-        }
-        Some(InjectionSupport::Delayed) => {
-            Some(badge("部分环境可能不生效", ACCENT_BG, ACCENT_TEXT))
-        }
-        Some(InjectionSupport::Supported) | None => None,
-    }
+    let information = column![heading, metadata].spacing(6).width(Fill);
+    let content = row![tile, information]
+        .spacing(14)
+        .align_y(Alignment::Center)
+        .width(Fill);
+    button(content)
+        .padding(Padding::from([12, 14]))
+        .width(Fill)
+        .style(move |_, _| list_card_style(selected))
+        .on_press(Message::AppSelect(id))
+        .into()
 }

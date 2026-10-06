@@ -29,12 +29,19 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 }
 
 pub(super) fn detail_shell<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(scrollable(content).height(Fill).style(dark_scrollable))
-        .padding(Padding::from([14, 16]))
-        .width(Length::Fixed(350.0))
+    container(
+        scrollable(container(content).width(Fill).padding(Padding {
+            right: 12.0,
+            ..Padding::ZERO
+        }))
         .height(Fill)
-        .style(|_| panel_style(PANEL_RIGHT))
-        .into()
+        .style(dark_scrollable),
+    )
+    .padding(Padding::from([14, 16]))
+    .width(Fill)
+    .height(Fill)
+    .style(|_| panel_style(PANEL_RIGHT))
+    .into()
 }
 
 pub(super) fn section_title<'a>(title: &'a str, subtitle: &'a str) -> Element<'a, Message> {

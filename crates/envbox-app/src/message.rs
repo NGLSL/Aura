@@ -13,9 +13,8 @@ pub enum Nav {
 }
 
 impl Nav {
-    pub const ALL: [Nav; 6] = [
+    pub const ALL: [Nav; 5] = [
         Nav::Apps,
-        Nav::Workspaces,
         Nav::Profiles,
         Nav::Instances,
         Nav::Audit,
@@ -23,7 +22,7 @@ impl Nav {
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Nav::Workspaces => "环境容器",
+            Nav::Workspaces => "环境配置",
             Nav::Apps => "应用",
             Nav::Profiles => "环境配置",
             Nav::Instances => "运行实例",
@@ -189,6 +188,7 @@ pub enum ComboField {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Message {
+    ContentPaneResized(iced::widget::pane_grid::ResizeEvent),
     WorkspaceNew,
     WorkspaceRefresh,
     WorkspaceSelect(Uuid),
@@ -243,7 +243,9 @@ pub enum Message {
     ProfileComputerName(String),
     ProfileUserName(String),
     ProfileMacAddress(String),
+    ProfileMacAddressGenerate,
     ProfileMachineGuid(String),
+    ProfileMachineGuidGenerate,
     ProfileLocale(String),
     ProfileUi(String),
     ProfileRegion(String),

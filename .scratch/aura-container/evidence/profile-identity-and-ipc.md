@@ -69,3 +69,13 @@ Rust 1.99.0 locked workspace build/test 全部 exit 0：467 passed / 0 failed / 
 声明支持的身份 API、环境继承、不可变配置、DNS 严格路由、用户态恢复与产品字段构成本次范围。WMI、GetUserNameEx、Native Registry API、设备 IOCTL、程序自有缓存/解析器及任意程序的所有读取路径不在已验证矩阵；没有修改宿主权限、存储或网络出口，也不提供安全边界。
 
 不安装驱动、不要求 VM，不把 CPU/GPU/磁盘与 IPv6 延期项计为本次未完成。发布、安装/升级、全浏览器/全应用覆盖与长跑未执行。
+
+## 2026-10-07 产品入口合并与 UI
+
+按用户确认统一使用“环境配置”，移除独立容器导航和手工创建/关联步骤。配置详情顶部直接选择应用运行；编辑时隐藏运行面板，保存后自动绑定稳定的内部运行作用域并刷新管理状态。旧 Container 协议、目录、历史记录和 opaque metadata 保留；记录按快照 Profile ID 聚合，停止使用原记录的真实作用域，不按可变旧关联扩大停止范围。
+
+待确认启动按提交时 Profile 归属保留原 UUID，切换配置后仍可返回原配置查询；存在未知启动的配置禁止删除。后台生成快照后再次检查实际 Profile 身份，随后以不可变快照为准。停止全部使用 fresh List、精确 Profile/代次集合、逐实例 Stop 与最终 List；部分失败或换代保留已确认事实，不以空错误回复覆盖成功停止记录。
+
+最终 App 单元与持久化/请求合约测试 58 passed / 0 failed / 5 ignored；App 和 opt-in example 构建、定向 rustfmt、git diff --check 通过。实际 1400/980 宽度窗口已目视检查，配置名称与状态标签分行，不再被挤成竖排，右侧滚动条留出间距。截图 target/gui-workspace-0531a98e7131419f9d13042464367ec3/startup.png 和 target/gui-workspace-6c9692376a904653b94ab2ebee7c93c0/startup.png，独立配置根自动保存作用域，无手工容器操作。
+
+本增量的实际窗口验证覆盖渲染与绑定保存；跨配置 Stop 调度以真实 Request/Response 合约测试验证，未通过 GUI 对用户现有进程执行停止，也未将前述旧原生恢复证据计为本轮 GUI 运行验收。未更新已安装版本。

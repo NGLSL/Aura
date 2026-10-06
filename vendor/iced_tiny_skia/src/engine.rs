@@ -339,58 +339,95 @@ impl Engine {
                 paragraph,
                 position,
                 color,
-                clip_bounds: _, // TODO
+                clip_bounds: local_clip_bounds,
                 transformation: local_transformation,
             } => {
                 let transformation = transformation * *local_transformation;
+                let layer_clip_bounds = clip_bounds;
+                let Some(clip_bounds) =
+                    clip_bounds.intersection(&(*local_clip_bounds * transformation))
+                else {
+                    return;
+                };
 
-                let physical_bounds =
-                    Rectangle::new(*position, paragraph.min_bounds)
-                        * transformation;
+                use crate::core::text::Paragraph as _;
+
+                let Some(paragraph_layout) = paragraph.upgrade() else {
+                    return;
+                };
+                let mut physical_bounds =
+                    Rectangle::new(*position, paragraph.min_bounds) * transformation;
+                physical_bounds.x -= match paragraph_layout.horizontal_alignment() {
+                    crate::core::alignment::Horizontal::Left => 0.0,
+                    crate::core::alignment::Horizontal::Center => physical_bounds.width / 2.0,
+                    crate::core::alignment::Horizontal::Right => physical_bounds.width,
+                };
+                physical_bounds.y -= match paragraph_layout.vertical_alignment() {
+                    crate::core::alignment::Vertical::Top => 0.0,
+                    crate::core::alignment::Vertical::Center => physical_bounds.height / 2.0,
+                    crate::core::alignment::Vertical::Bottom => physical_bounds.height,
+                };
 
                 if !clip_bounds.intersects(&physical_bounds) {
                     return;
                 }
 
-                let clip_mask = (!physical_bounds.is_within(&clip_bounds))
-                    .then_some(clip_mask as &_);
+                let needs_clip = !physical_bounds.is_within(&clip_bounds);
+                if needs_clip {
+                    adjust_clip_mask(clip_mask, clip_bounds);
+                }
 
                 self.text_pipeline.draw_paragraph(
                     paragraph,
                     *position,
                     *color,
                     pixels,
-                    clip_mask,
+                    needs_clip.then_some(&*clip_mask),
                     transformation,
                 );
+
+                if needs_clip {
+                    adjust_clip_mask(clip_mask, layer_clip_bounds);
+                }
             }
             Text::Editor {
                 editor,
                 position,
                 color,
-                clip_bounds: _, // TODO
+                clip_bounds: local_clip_bounds,
                 transformation: local_transformation,
             } => {
                 let transformation = transformation * *local_transformation;
+                let layer_clip_bounds = clip_bounds;
+                let Some(clip_bounds) =
+                    clip_bounds.intersection(&(*local_clip_bounds * transformation))
+                else {
+                    return;
+                };
 
-                let physical_bounds =
-                    Rectangle::new(*position, editor.bounds) * transformation;
+                let physical_bounds = Rectangle::new(*position, editor.bounds) * transformation;
 
                 if !clip_bounds.intersects(&physical_bounds) {
                     return;
                 }
 
-                let clip_mask = (!physical_bounds.is_within(&clip_bounds))
-                    .then_some(clip_mask as &_);
+                let needs_clip = !physical_bounds.is_within(&clip_bounds);
+                if needs_clip {
+                    adjust_clip_mask(clip_mask, clip_bounds);
+                }
 
                 self.text_pipeline.draw_editor(
                     editor,
                     *position,
                     *color,
                     pixels,
-                    clip_mask,
+                    needs_clip.then_some(&*clip_mask),
                     transformation,
                 );
+
+                if needs_clip {
+                    adjust_clip_mask(clip_mask, layer_clip_bounds);
+                }
             }
             Text::Cached {
                 content,
@@ -845,4 +882,147 @@ pub fn adjust_clip_mask(clip_mask: &mut tiny_skia::Mask, bounds: Rectangle) {
         false,
         tiny_skia::Transform::default(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Point;
+    use crate::graphics::core::text::Text as TextLayout;
+    use crate::graphics::text::Paragraph;
+
+    #[test]
+    fn aligned_paragraph_text_is_visible_and_clipped() {
+        use crate::core::alignment::{Horizontal, Vertical};
+
+        for horizontal in [Horizontal::Left, Horizontal::Center, Horizontal::Right] {
+            for vertical in [Vertical::Top, Vertical::Center, Vertical::Bottom] {
+                let paragraph =
+                    <Paragraph as crate::graphics::core::text::Paragraph>::with_text(TextLayout {
+                        content: "visible alignment text across a narrow clip\nvisible alignment text across a narrow clip\nvisible alignment text across a narrow clip",
+                        bounds: Size::new(512.0, 100.0),
+                        size: 16.0.into(),
+                        line_height: 1.3.into(),
+                        font: crate::core::Font::DEFAULT,
+                        horizontal_alignment: horizontal,
+                        vertical_alignment: vertical,
+                        shaping: crate::core::text::Shaping::Advanced,
+                        wrapping: crate::core::text::Wrapping::None,
+                    });
+                let position = Point::new(
+                    match horizontal {
+                        Horizontal::Left => 8.0,
+                        Horizontal::Center => 58.0,
+                        Horizontal::Right => 108.0,
+                    },
+                    match vertical {
+                        Vertical::Top => 4.0,
+                        Vertical::Center => 16.0,
+                        Vertical::Bottom => 28.0,
+                    },
+                );
+                let mut engine = Engine::new();
+                let mut pixmap = tiny_skia::Pixmap::new(160, 64).expect("test pixmap");
+                let mut clip_mask = tiny_skia::Mask::new(160, 64).expect("test mask");
+                let text = Text::Paragraph {
+                    paragraph: paragraph.downgrade(),
+                    position,
+                    color: Color::WHITE,
+                    clip_bounds: Rectangle::new(Point::new(8.0, 4.0), Size::new(100.0, 24.0)),
+                    transformation: Transformation::IDENTITY,
+                };
+                engine.draw_text(
+                    &text,
+                    Transformation::IDENTITY,
+                    &mut pixmap.as_mut(),
+                    &mut clip_mask,
+                    Rectangle::new(Point::ORIGIN, Size::new(160.0, 64.0)),
+                );
+
+                let mut visible = false;
+                for y in 0..64 {
+                    for x in 0..160 {
+                        if pixmap.pixel(x, y).is_some_and(|pixel| pixel.alpha() != 0) {
+                            assert!(
+                                (8..108).contains(&x) && (4..28).contains(&y),
+                                "{horizontal:?}/{vertical:?} text escaped at ({x}, {y})"
+                            );
+                            visible = true;
+                        }
+                    }
+                }
+                assert!(visible, "{horizontal:?}/{vertical:?} text was culled");
+            }
+        }
+    }
+
+    #[test]
+    fn paragraph_text_is_clipped_to_its_local_bounds() {
+        let paragraph =
+            <Paragraph as crate::graphics::core::text::Paragraph>::with_text(TextLayout {
+                content: "a long MachineGuid-like value 10d0d970-985d-465e-bd69-d6d6f49facc",
+                bounds: Size::new(512.0, 24.0),
+                size: 16.0.into(),
+                line_height: 1.3.into(),
+                font: crate::core::Font::DEFAULT,
+                horizontal_alignment: crate::core::alignment::Horizontal::Left,
+                vertical_alignment: crate::core::alignment::Vertical::Center,
+                shaping: crate::core::text::Shaping::Advanced,
+                wrapping: crate::core::text::Wrapping::None,
+            });
+        let mut engine = Engine::new();
+        let mut pixmap = tiny_skia::Pixmap::new(160, 32).expect("test pixmap");
+        let mut clip_mask = tiny_skia::Mask::new(160, 32).expect("test mask");
+        let input_bounds = Rectangle::new(Point::new(8.0, 4.0), Size::new(40.0, 24.0));
+        let text = Text::Paragraph {
+            paragraph: paragraph.downgrade(),
+            position: Point::new(8.0, 4.0),
+            color: Color::WHITE,
+            clip_bounds: input_bounds,
+            transformation: Transformation::IDENTITY,
+        };
+
+        engine.draw_text(
+            &text,
+            Transformation::IDENTITY,
+            &mut pixmap.as_mut(),
+            &mut clip_mask,
+            Rectangle::new(Point::ORIGIN, Size::new(160.0, 32.0)),
+        );
+
+        let visible_inside = (8..48)
+            .any(|x| (0..32).any(|y| pixmap.pixel(x, y).is_some_and(|pixel| pixel.alpha() != 0)));
+        assert!(visible_inside, "paragraph test text did not render");
+
+        let leaked = (48..160)
+            .any(|x| (0..32).any(|y| pixmap.pixel(x, y).is_some_and(|pixel| pixel.alpha() != 0)));
+        assert!(!leaked, "paragraph text escaped its input clip bounds");
+
+        let sibling_text = Text::Cached {
+            content: "label".to_string(),
+            bounds: Rectangle::new(Point::new(96.0, 4.0), Size::new(64.0, 24.0)),
+            color: Color::WHITE,
+            size: 16.0.into(),
+            line_height: 1.3.into(),
+            font: crate::core::Font::DEFAULT,
+            horizontal_alignment: crate::core::alignment::Horizontal::Left,
+            vertical_alignment: crate::core::alignment::Vertical::Center,
+            shaping: crate::core::text::Shaping::Advanced,
+            clip_bounds: Rectangle::new(Point::ORIGIN, Size::new(160.0, 32.0)),
+        };
+        engine.draw_text(
+            &sibling_text,
+            Transformation::IDENTITY,
+            &mut pixmap.as_mut(),
+            &mut clip_mask,
+            Rectangle::new(Point::ORIGIN, Size::new(160.0, 32.0)),
+        );
+
+        let sibling_visible = (96..140)
+            .any(|x| (0..32).any(|y| pixmap.pixel(x, y).is_some_and(|pixel| pixel.alpha() != 0)));
+        assert!(
+            sibling_visible,
+            "a clipped paragraph damaged the next text draw"
+        );
+    }
 }

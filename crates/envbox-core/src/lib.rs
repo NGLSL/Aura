@@ -497,7 +497,7 @@ mod tests {
             DnsMode::VirtualView,
             true,
             vec![DnsUpstream::Doh {
-                url: "https://1.1.1.1/dns-query".into(),
+                url: "https://resolver.example/dns-query".into(),
                 bootstrap_ips: vec![],
                 tls_revocation: DnsTlsRevocation::StrictOffline,
             }],

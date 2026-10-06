@@ -93,6 +93,16 @@ fn typed_dns_cli_order_roundtrip_and_failed_edits_keep_profile() {
             "1.0.0.1",
         ],
         vec!["profile", "dns", "move", &id, "--from", "4", "--to", "0"],
+        vec![
+            "profile",
+            "dns",
+            "add",
+            &id,
+            "--type",
+            "doh",
+            "--url",
+            "https://dns.example/dns-query",
+        ],
     ] {
         let output = run(&root, &args);
         assert!(
@@ -109,7 +119,12 @@ fn typed_dns_cli_order_roundtrip_and_failed_edits_keep_profile() {
             ..
         }
     ));
-    assert_eq!(dns.upstreams.len(), 5);
+    assert_eq!(dns.upstreams.len(), 6);
+    assert!(matches!(
+        &dns.upstreams[5],
+        envbox_core::DnsUpstream::Doh { url, bootstrap_ips, .. }
+            if url == "https://dns.example/dns-query" && bootstrap_ips.is_empty()
+    ));
     assert!(dns.servers.is_empty());
     let shown = run(&root, &["profile", "dns", "show", &id]);
     assert!(shown.status.success());
@@ -127,7 +142,7 @@ fn typed_dns_cli_order_roundtrip_and_failed_edits_keep_profile() {
             "--type",
             "doh",
             "--url",
-            "https://dns.example/dns-query",
+            "http://dns.example/dns-query",
         ],
         vec![
             "profile",

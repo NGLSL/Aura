@@ -51,6 +51,10 @@ envbox run --profile <id> .\target\debug\envbox-probe.exe
 
 Config lives under `%LOCALAPPDATA%\com.aura.envbox\` (or `ENVBOX_CONFIG_ROOT`).
 
+DoH 的 `bootstrap_ips` 可留空：Aura 使用同一 Profile 中可直接连接的上游解析服务域名；手填 IP 则覆盖自动解析。全部上游都缺少解析起点时查询失败，不调用宿主 DNS，也不添加默认公共 DNS。当前自动解析连接按 IPv4 范围支持。
+
+GUI 统一使用“环境配置”：此页只创建、查看和编辑环境设置；在“应用”页选择应用及其默认环境配置并启动，在“运行实例”页管理实例，无需另建容器。每次运行仍使用不可变快照。旧容器数据与 CLI 兼容入口保留，GUI 自动管理内部运行作用域；历史记录按运行时的 Profile 身份归属。
+
 ## Windows installer
 
 `scripts/build-installer.ps1` builds the Rust workspace, both C++ Runtime DLLs, and the NSIS installer. The version shown in Aura and the version registered by the installer both come from `workspace.package.version` in `Cargo.toml`. When bumping it, update and commit `Cargo.lock` too; an explicit `-Version` value is accepted only when it matches the Cargo version.

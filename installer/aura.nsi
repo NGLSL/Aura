@@ -13,6 +13,7 @@ RequestExecutionLevel admin
 
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
+!include "x64.nsh"
 !define MUI_ABORTWARNING
 !define MUI_ICON "..\icons\icon.ico"
 !define MUI_UNICON "..\icons\icon.ico"
@@ -20,19 +21,62 @@ RequestExecutionLevel admin
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "启动 Aura"
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchInstalledAura
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
 !insertmacro MUI_LANGUAGE "English"
 
+; Stop only installation-owned managers, never the applications they launched.
+!macro StopInstalledAuraFunction Prefix
+Function ${Prefix}StopInstalledAura
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File /oname=stop-installed-aura.ps1 "stop-installed-aura.ps1"
+  StrCpy $2 "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+  ${If} ${RunningX64}
+    StrCpy $2 "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+  ${EndIf}
+  stop_retry:
+    nsExec::ExecToStack '"$2" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop-installed-aura.ps1" -InstallDirectory "$INSTDIR\."'
+    Pop $0
+    Pop $1
+    ${If} $0 != 0
+      DetailPrint "Aura process shutdown failed: $1"
+      IfSilent stop_abort
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法安全关闭此安装目录中的 Aura，或程序文件仍被使用。请关闭 Aura 后重试。尚未修改安装文件。$\r$\n$\r$\n$1" IDRETRY stop_retry
+      stop_abort:
+        SetErrorLevel 1
+        Quit
+    ${EndIf}
+FunctionEnd
+!macroend
+!insertmacro StopInstalledAuraFunction ""
+!insertmacro StopInstalledAuraFunction "un."
+
+Function LaunchInstalledAura
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File /oname=launch-installed-aura.ps1 "launch-installed-aura.ps1"
+  StrCpy $2 "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+  ${If} ${RunningX64}
+    StrCpy $2 "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+  ${EndIf}
+  nsExec::ExecToStack '"$2" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\launch-installed-aura.ps1" -InstallDirectory "$INSTDIR\."'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Aura 已安装，但无法自动启动。请从开始菜单启动 Aura。$\r$\n$\r$\n$1"
+  ${EndIf}
+FunctionEnd
+
 ; 用户确认开始安装后才关闭旧 Aura。取消安装向导时，旧版继续运行。
 Section "-关闭旧版 Aura" SEC_CLOSE_OLD
   SectionIn RO
-  ; 只结束 Aura 自身进程，不递归结束它唤起的目标应用（taskkill 不带 /T）。
-  ExecWait '"$SYSDIR\taskkill.exe" /F /IM envbox-app.exe'
-  ExecWait '"$SYSDIR\taskkill.exe" /F /IM envbox-broker.exe'
-  Sleep 300
+  Call StopInstalledAura
 SectionEnd
 
 ; 覆盖安装不单独卸载旧版本：InstallDirRegKey 已把默认目录对齐到上一版安装位置，
@@ -75,6 +119,7 @@ Section "桌面快捷方式" SEC_DESKTOP
 SectionEnd
 
 Section "Uninstall"
+  Call un.StopInstalledAura
   Delete "$DESKTOP\Aura.lnk"
   Delete "$SMPROGRAMS\Aura\Aura.lnk"
   Delete "$SMPROGRAMS\Aura\EnvBox CLI.lnk"

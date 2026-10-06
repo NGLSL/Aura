@@ -45,7 +45,6 @@ fn malformed_mixed_and_unimplemented_dns_are_rejected_explicitly() {
         "mode='virtual_view'\n[[upstreams]]\ntype='udp'\naddress='1.1.1.1'\nport=0\n",
         "mode='virtual_view'\n[[upstreams]]\ntype='tcp'\naddress='resolver.example'\nport=53\n",
         "mode='virtual_view'\n[[upstreams]]\ntype='dot'\naddress='1.1.1.1'\nserver_name=''\n",
-        "mode='virtual_view'\n[[upstreams]]\ntype='doh'\nurl='https://dns.example/dns-query'\n",
         "mode='virtual_view'\n[[upstreams]]\ntype='doh'\nurl='http://1.1.1.1/dns-query'\n",
         "mode='virtual_view'\n[[upstreams]]\ntype='doh'\nurl='https://user:secret@dns.example/dns-query'\nbootstrap_ips=['1.1.1.1']\n",
         "mode='virtual_view'\n[[upstreams]]\ntype='doh'\nurl='https://dns.example/dns-query'\nbootstrap_ips=['resolver.example']\n",
@@ -60,6 +59,15 @@ fn malformed_mixed_and_unimplemented_dns_are_rejected_explicitly() {
     .unwrap();
     assert!(ip_url.servers.is_empty());
     ip_url.validate_runtime_support().unwrap();
+}
+
+#[test]
+fn hostname_doh_bootstrap_is_optional_and_roundtrips() {
+    let dns: DnsProfile = toml::from_str("mode='virtual_view'\n[[upstreams]]\ntype='doh'\nurl='https://dns.example/dns-query'\n").unwrap();
+    dns.validate_runtime_support().unwrap();
+    assert!(matches!(&dns.upstreams[0], DnsUpstream::Doh { bootstrap_ips, .. } if bootstrap_ips.is_empty()));
+    assert_eq!(toml::from_str::<DnsProfile>(&toml::to_string(&dns).unwrap()).unwrap(), dns);
+    assert!(dns.flat_fields().unwrap().contains(&("dns_upstream_0_bootstrap_count".into(), "0".into())));
 }
 
 #[test]
