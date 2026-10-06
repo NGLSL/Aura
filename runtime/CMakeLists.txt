@@ -42,6 +42,7 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/hooks_language.cpp
   src/hooks_dns.cpp
   src/dns_transport.cpp
+  src/dns_response_cache.cpp
   src/dns_dot.cpp
   src/dns_doh.cpp
   src/dns_profile_config.cpp

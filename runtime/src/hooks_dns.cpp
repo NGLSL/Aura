@@ -28,6 +28,7 @@
 #include "audit.h"
 #include "dns_transport.h"
 #include "dns_doh.h"
+#include "dns_response_cache.h"
 
 static DWORD(WINAPI* TrueGetNetworkParams)(PFIXED_INFO, PULONG) =
     GetNetworkParams;
@@ -695,10 +696,216 @@ static int DnsBootstrapFromProfile(const char* name, char (&addresses)[ENVBOX_DN
                                   int* count, ULONGLONG deadline, HANDLE cancel_event);
 static int IsAsciiNameA(const char* s);
 
+// Downlevel dnsapi can silently discard SVCB/HTTPS records. Their default API
+// representation is a flat wire buffer. Use a private unknown type as carrier
+// (native extraction drops NULL records too), then restore mapped wire types.
+// ownership, charset conversion and public DnsFree remain entirely native.
+static decltype(&DnsExtractRecordsFromMessage_W) g_extract_dns_records =
+    DnsExtractRecordsFromMessage_W;
+static int DnsNameEqualsW(const wchar_t* query, const wchar_t* local);
+static constexpr WORD kDnsOpaqueCarrierType = 0xff00;
+struct DnsOpaqueWireRecord {
+  int owner_offset;
+  int data_offset;
+  WORD length;
+  WORD type;
+  WORD section;
+  DWORD ttl;
+};
+struct DnsOpaqueExtractionBuffers {
+  unsigned char* packet = nullptr;
+  DnsOpaqueWireRecord* mapping = nullptr;
+  ~DnsOpaqueExtractionBuffers() {
+    if (packet) HeapFree(GetProcessHeap(), 0, packet);
+    if (mapping) HeapFree(GetProcessHeap(), 0, mapping);
+  }
+};
+static DNS_STATUS ScanDnsOpaqueWireRecords(const unsigned char* packet, int length,
+                                           DnsOpaqueWireRecord* mapping,
+                                           unsigned* mapped, bool* has_service_binding) {
+  if (!packet || length < 12 || length > 65535) return DNS_ERROR_BAD_PACKET;
+  const unsigned total = ReadU16(packet + 6) + ReadU16(packet + 8) + ReadU16(packet + 10);
+  if (total > static_cast<unsigned>(length / 11)) return DNS_ERROR_BAD_PACKET;
+  int offset = 12;
+  for (unsigned i = 0; i < ReadU16(packet + 4); ++i) {
+    if (!SkipDnsName(packet, length, &offset) || offset > length - 4)
+      return DNS_ERROR_BAD_PACKET;
+    offset += 4;
+  }
+  *mapped = 0;
+  *has_service_binding = false;
+  for (WORD section = 1; section <= 3; ++section) {
+    const unsigned count = ReadU16(packet + 4 + section * 2);
+    for (unsigned i = 0; i < count; ++i) {
+      const int owner_offset = offset;
+      if (!SkipDnsName(packet, length, &offset) || offset > length - 10)
+        return DNS_ERROR_BAD_PACKET;
+      const WORD type = ReadU16(packet + offset);
+      const WORD data_length = ReadU16(packet + offset + 8);
+      const DWORD ttl = ReadU32(packet + offset + 4);
+      offset += 10;
+      if (data_length > length - offset) return DNS_ERROR_BAD_PACKET;
+      if (type == DNS_TYPE_NULL || type == DNS_TYPE_SVCB || type == DNS_TYPE_HTTPS || type == kDnsOpaqueCarrierType) {
+        if (mapping) mapping[*mapped] = {owner_offset, offset, data_length, type, section, ttl};
+        ++*mapped;
+        *has_service_binding |= type != kDnsOpaqueCarrierType;
+      }
+      offset += data_length;
+    }
+  }
+  return ERROR_SUCCESS;
+}
+static DNS_STATUS ExtractProfileDnsRecords(unsigned char* packet, int length,
+                                           PDNS_RECORD* records) {
+  if (!records) return DNS_ERROR_BAD_PACKET;
+  *records = nullptr;
+  unsigned mapped = 0;
+  bool has_service_binding = false;
+  DNS_STATUS scanned = ScanDnsOpaqueWireRecords(packet, length, nullptr, &mapped,
+                                               &has_service_binding);
+  if (scanned != ERROR_SUCCESS) return scanned;
+  if (!has_service_binding) {
+    DNS_BYTE_FLIP_HEADER_COUNTS(&reinterpret_cast<PDNS_MESSAGE_BUFFER>(packet)->MessageHead);
+    DNS_STATUS status = g_extract_dns_records(reinterpret_cast<PDNS_MESSAGE_BUFFER>(packet),
+                                               static_cast<WORD>(length), records);
+    DNS_BYTE_FLIP_HEADER_COUNTS(&reinterpret_cast<PDNS_MESSAGE_BUFFER>(packet)->MessageHead);
+    return status;
+  }
+  DnsOpaqueExtractionBuffers buffers;
+  buffers.mapping = static_cast<DnsOpaqueWireRecord*>(HeapAlloc(
+      GetProcessHeap(), 0, mapped * sizeof(DnsOpaqueWireRecord)));
+  if (!buffers.mapping) return ERROR_NOT_ENOUGH_MEMORY;
+  scanned = ScanDnsOpaqueWireRecords(packet, length, buffers.mapping, &mapped,
+                                    &has_service_binding);
+  if (scanned != ERROR_SUCCESS) return scanned;
+  buffers.packet = static_cast<unsigned char*>(HeapAlloc(GetProcessHeap(), 0, length));
+  if (!buffers.packet) return ERROR_NOT_ENOUGH_MEMORY;
+  memcpy(buffers.packet, packet, length);
+  for (unsigned i = 0; i < mapped; ++i) {
+    // The RR header is ten bytes immediately before its RDATA.
+    WriteU16(buffers.packet + buffers.mapping[i].data_offset - 10, kDnsOpaqueCarrierType);
+  }
+  DNS_BYTE_FLIP_HEADER_COUNTS(&reinterpret_cast<PDNS_MESSAGE_BUFFER>(buffers.packet)->MessageHead);
+  DNS_STATUS status = g_extract_dns_records(
+      reinterpret_cast<PDNS_MESSAGE_BUFFER>(buffers.packet), static_cast<WORD>(length), records);
+  if (status == ERROR_SUCCESS) {
+    PDNS_RECORD cursor = *records;
+    for (unsigned i = 0; i < mapped; ++i) {
+      while (cursor && cursor->wType != kDnsOpaqueCarrierType) cursor = cursor->pNext;
+      const auto& source = buffers.mapping[i];
+      char owner[256] = {};
+      wchar_t owner_w[256] = {};
+      int owner_offset = source.owner_offset;
+      if (!cursor || !DecodeDnsName(packet, length, &owner_offset, owner, sizeof(owner)) ||
+          !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, owner, -1, owner_w, ARRAYSIZE(owner_w)) ||
+          !DnsNameEqualsW(reinterpret_cast<const wchar_t*>(cursor->pName), owner_w) ||
+          cursor->Flags.S.Section != source.section || cursor->dwTtl != source.ttl ||
+          cursor->wDataLength != source.length ||
+          memcmp(&cursor->Data, packet + source.data_offset, source.length) != 0) {
+        status = DNS_ERROR_BAD_PACKET;
+        break;
+      }
+      cursor->wType = source.type;
+      cursor = cursor->pNext;
+    }
+    while (cursor && cursor->wType != kDnsOpaqueCarrierType) cursor = cursor->pNext;
+    if (cursor) status = DNS_ERROR_BAD_PACKET;
+  }
+  if (status != ERROR_SUCCESS && *records) {
+    TrueDnsFree(*records, DnsFreeRecordList);
+    *records = nullptr;
+  }
+  return status;
+}
+
+// A Runtime Profile is immutable and this cache is local to its process. The
+// endpoint's TLS policy and configured addresses still belong in the key so a
+// response cannot be reused for a different upstream or transport requirement.
+static std::string DnsResponseCacheKey(const DnsTransportEndpoint& endpoint,
+                                       const char* name, unsigned type, DWORD options) noexcept {
+  try {
+    std::string key;
+    auto field = [&key](const char* value) {
+      key.append(value ? value : "");
+      key.push_back('\0');
+    };
+    const RuntimeProfile* profile = EnvBoxProfile();
+    if (profile) {
+      key.append(reinterpret_cast<const char*>(profile->profile_id),
+                 wcslen(profile->profile_id) * sizeof(wchar_t));
+    }
+    key.push_back('\0');
+    field(endpoint.address);
+    field(endpoint.server_name);
+    field(endpoint.url);
+    for (int i = 0; i < endpoint.bootstrap_count; ++i) field(endpoint.bootstrap_ips[i]);
+    const unsigned identity[] = {static_cast<unsigned>(endpoint.kind), endpoint.port,
+        endpoint.tls_revocation, static_cast<unsigned>(endpoint.bootstrap_count), type, options};
+    key.append(reinterpret_cast<const char*>(identity), sizeof(identity));
+    size_t count = strlen(name);
+    if (count > 1 && name[count - 1] == '.') --count;
+    for (size_t i = 0; i < count; ++i) {
+      unsigned char c = static_cast<unsigned char>(name[i]);
+      key.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c));
+    }
+    return key;
+  } catch (...) { return {}; }
+}
+
+// Merge simultaneous misses for the same cache key. No network work runs under
+// this lock, and waiters retain their own original deadline and cancellation.
+struct DnsQueryFlightSlot { std::string key; bool active = false; };
+static DnsQueryFlightSlot g_dns_flights[32];
+static SRWLOCK g_dns_flight_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_dns_flight_changed = CONDITION_VARIABLE_INIT;
+struct DnsQueryFlight {
+  int slot = -1;
+  ~DnsQueryFlight() {
+    if (slot < 0) return;
+    AcquireSRWLockExclusive(&g_dns_flight_lock);
+    g_dns_flights[slot].active = false;
+    g_dns_flights[slot].key.clear();
+    WakeAllConditionVariable(&g_dns_flight_changed);
+    ReleaseSRWLockExclusive(&g_dns_flight_lock);
+  }
+  int Enter(const std::string& key, ULONGLONG deadline, HANDLE cancel) noexcept {
+    AcquireSRWLockExclusive(&g_dns_flight_lock);
+    int result = 1;
+    try {
+      for (;;) {
+        if (cancel && WaitForSingleObject(cancel, 0) == WAIT_OBJECT_0) { result = -1; break; }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) { result = 0; break; }
+        int free_slot = -1;
+        bool pending = false;
+        for (int i = 0; i < ARRAYSIZE(g_dns_flights); ++i) {
+          if (!g_dns_flights[i].active) free_slot = i;
+          else if (g_dns_flights[i].key == key) pending = true;
+        }
+        if (!pending) {
+          if (free_slot >= 0) {
+            g_dns_flights[free_slot].key = key;
+            g_dns_flights[free_slot].active = true;
+            slot = free_slot;
+          }
+          break; // A full table simply disables merging for this query.
+        }
+        const DWORD wait = static_cast<DWORD>((deadline - now) < 25 ? deadline - now : 25);
+        if (!SleepConditionVariableSRW(&g_dns_flight_changed, &g_dns_flight_lock, wait, 0) &&
+            GetLastError() != ERROR_TIMEOUT) break;
+      }
+    } catch (...) { /* Allocation failure disables merging, never DNS routing. */ }
+    ReleaseSRWLockExclusive(&g_dns_flight_lock);
+    return result;
+  }
+};
+
 static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname,
                        unsigned qtype, ULONGLONG deadline, HANDLE cancel_event,
                        DnsAddrs* out, PDNS_RECORD* records = nullptr,
                        DNS_STATUS* record_status = nullptr, DWORD options = 0) {
+  if (cancel_event && WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) return -1;
+  if (GetTickCount64() >= deadline) return 0;
   unsigned char qbuf[512];
   int namelen = EncodeDnsName(qname, qbuf + 12, (int)sizeof(qbuf) - 12);
   if (namelen <= 0) {
@@ -720,9 +927,26 @@ static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname
   qoff += 4;
 
   DnsTransportEndpoint endpoint = configured;
+  if ((options & DNS_QUERY_USE_TCP_ONLY) && endpoint.kind == DnsTransportKind::Udp)
+    endpoint.kind = DnsTransportKind::Tcp;
+  const bool cache_allowed = !(options & (DNS_QUERY_BYPASS_CACHE | DNS_QUERY_WIRE_ONLY |
+                                          DNS_QUERY_DONT_RESET_TTL_VALUES));
+  const std::string cache_key = cache_allowed ? DnsResponseCacheKey(endpoint, qname, qtype, options)
+                                             : std::string{};
+  unsigned char rbuf[65535];
+  int rlen = cache_key.empty() ? 0 : EnvBoxDnsResponseCache::Lookup(
+      cache_key, rbuf, sizeof(rbuf), GetTickCount64());
+  DnsQueryFlight flight;
+  if (!rlen && !cache_key.empty()) {
+    const int entered = flight.Enter(cache_key, deadline, cancel_event);
+    if (entered <= 0) return entered;
+    rlen = EnvBoxDnsResponseCache::Lookup(cache_key, rbuf, sizeof(rbuf), GetTickCount64());
+  }
+  const bool cache_hit = rlen > 0;
+  if (cache_hit) WriteU16(rbuf, id & 0xffff);
   char bootstrap_name[256] = {};
   char bootstrap_addresses[ENVBOX_DNS_MAX][64] = {};
-  if (DnsDohBootstrapName(endpoint, bootstrap_name)) {
+  if (!cache_hit && DnsDohBootstrapName(endpoint, bootstrap_name)) {
     int count = 0;
     int bootstrap = DnsBootstrapFromProfile(bootstrap_name, bootstrap_addresses, &count,
                                            deadline, cancel_event);
@@ -734,12 +958,11 @@ static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname
     endpoint.bootstrap_ips = bootstrap_addresses;
     endpoint.bootstrap_count = count;
   }
-  if ((options & DNS_QUERY_USE_TCP_ONLY) && endpoint.kind == DnsTransportKind::Udp) {
-    endpoint.kind = DnsTransportKind::Tcp;
-  }
-  unsigned char rbuf[65535];
-  int rlen = DnsTransportExchange(endpoint, qbuf, qoff, rbuf, sizeof(rbuf), deadline, cancel_event);
+  if (!cache_hit)
+    rlen = DnsTransportExchange(endpoint, qbuf, qoff, rbuf, sizeof(rbuf), deadline, cancel_event);
   if (rlen < 0) return -1;
+  if (cancel_event && WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) return -1;
+  if (GetTickCount64() >= deadline) return 0;
   if (!DnsResponseMatches(rbuf, rlen, id, qname, qtype)) return 0;
   if (endpoint.kind == DnsTransportKind::Udp && (ReadU16(rbuf + 2) & 0x0200)) {
     endpoint.kind = DnsTransportKind::Tcp;
@@ -761,11 +984,11 @@ static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname
       *record_status = DNS_ERROR_RCODE_FORMAT_ERROR + rcode - 1;
       return 1;
     }
-    DNS_BYTE_FLIP_HEADER_COUNTS(&reinterpret_cast<PDNS_MESSAGE_BUFFER>(rbuf)->MessageHead);
-    *record_status = DnsExtractRecordsFromMessage_W(
-        reinterpret_cast<PDNS_MESSAGE_BUFFER>(rbuf), (WORD)rlen, records);
+    *record_status = ExtractProfileDnsRecords(rbuf, rlen, records);
     if (*record_status == ERROR_SUCCESS && *records == nullptr)
       *record_status = DNS_INFO_NO_RECORDS;
+    if (*record_status == ERROR_SUCCESS && !cache_hit && !cache_key.empty())
+      EnvBoxDnsResponseCache::Store(cache_key, rbuf, rlen, GetTickCount64());
     return 1;
   }
   unsigned qd = ReadU16(rbuf + 4);
@@ -859,6 +1082,9 @@ static int DnsQueryOne(const DnsTransportEndpoint& configured, const char* qname
   if (has_soa && out->n_v4 == 0 && out->n_v6 == 0 && !out->has_cname) {
     out->nodata = 1;
   }
+  if (rcode == 0 && !cache_hit && !cache_key.empty() &&
+      (out->n_v4 || out->n_v6 || out->has_cname))
+    EnvBoxDnsResponseCache::Store(cache_key, rbuf, rlen, GetTickCount64());
   return 1;
 }
 

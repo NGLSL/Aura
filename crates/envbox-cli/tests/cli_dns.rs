@@ -1054,6 +1054,52 @@ fn typed_upstream_order_negative_answers_and_total_deadline() {
 
 /// Every supported Windows DNS entry point must route every QTYPE to Profile.
 #[test]
+fn full_qtype_response_cache_reuses_profile_wire_and_honors_bypass() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let sock = try_bind_fixture_dns().expect("DNS acceptance fixture must bind");
+    let fixture = spawn_fixture_dns(sock, FixtureMode::Address);
+    let root = std::env::temp_dir().join(format!("envbox-dns-cache-{}", Uuid::new_v4()));
+    let profile_id = make_profile(&root, &["127.0.0.1"], true);
+    for api in ["a", "w", "utf8", "ex", "async"] {
+        for kind in [1u16, 64, 65, 16, 65280] {
+            for (options, expected_packets) in [(0, 1), (8, 20)] {
+                let before = fixture.queries.load(Ordering::SeqCst);
+                let output = envbox_with_root(&root)
+                    .env("ENVBOX_RUNTIME_DLL", &dll)
+                    .args(["run", "--profile", &profile_id])
+                    .arg(probe_exe().expect("probe required"))
+                    .args(["--dns-rr", "rr.fixture.test", &kind.to_string(), api])
+                    .arg(options.to_string())
+                    .args(["--repeat", "20"])
+                    .output()
+                    .expect("run repeated injected RR probe");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(stdout.matches("DnsRR_Status:\n0").count(), 20, "{stdout}");
+                assert_eq!(
+                    stdout
+                        .matches(&format!("DnsRR_Record: type={kind} "))
+                        .count(),
+                    20,
+                    "{stdout}"
+                );
+                assert_eq!(stdout.matches("DnsRR_Freed:\ntrue").count(), 20, "{stdout}");
+                let packets = fixture.queries.load(Ordering::SeqCst) - before;
+                assert_eq!(
+                    packets, expected_packets,
+                    "api={api} qtype={kind} options={options}: {stdout}"
+                );
+            }
+        }
+    }
+    fixture.store(true, Ordering::SeqCst);
+    drop(fixture);
+    std::fs::remove_dir_all(root).expect("remove owned DNS cache fixture");
+}
+
+/// Every supported Windows DNS entry point must route every QTYPE to Profile.
+#[test]
 fn arbitrary_qtypes_route_to_profile_dns() {
     let dll = test_runtime_dll().expect("runtime DLL required");
     let _guard = lock_fixture();
@@ -1293,6 +1339,26 @@ fn dnsquery_numeric_literals_and_cname_chain() {
     let root = std::env::temp_dir().join(format!("envbox-dns-rr-{}", Uuid::new_v4()));
     let profile_id = make_profile(&root, &["127.0.0.1"], true);
     let mut failures = Vec::new();
+    // Native inline numeric completion varies across supported Windows versions.
+    let numeric_summary = |output: &str| {
+        let field = |name: &str| {
+            output
+                .lines()
+                .skip_while(|line| *line != name)
+                .nth(1)
+                .map(str::to_owned)
+        };
+        Some((
+            field("DnsRR_ReturnStatus:")?,
+            field("DnsRR_Status:")?,
+            field("DnsRR_Records:")?,
+            output
+                .lines()
+                .filter(|line| line.starts_with("DnsRR_Record:"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        ))
+    };
     for api in ["a", "w", "utf8", "ex", "async"] {
         for (name, kind, expected, options) in [
             ("127.0.0.1", 1, "value=127.0.0.1", 0),
@@ -1310,15 +1376,29 @@ fn dnsquery_numeric_literals_and_cname_chain() {
                 .output()
                 .expect("run literal/CNAME probe");
             let stdout = String::from_utf8_lossy(&out.stdout);
+            if api == "async" && name != CNAME_A_NAME {
+                let native = std::process::Command::new(probe_exe().expect("probe required"))
+                    .args(["--dns-rr", name, &kind.to_string(), api])
+                    .arg(options.to_string())
+                    .output()
+                    .expect("run native numeric literal probe");
+                let native_stdout = String::from_utf8_lossy(&native.stdout);
+                let actual = numeric_summary(&stdout);
+                let expected_native = numeric_summary(&native_stdout);
+                if !out.status.success()
+                    || !native.status.success()
+                    || actual.is_none()
+                    || actual != expected_native
+                {
+                    failures.push(format!("api={api} name={name} options={options}: injected literal differs from native\nnative: {native_stdout}\ninjected: {stdout}"));
+                }
+                continue;
+            }
             if !out.status.success()
                 || !stdout.contains("DnsRR_Status:\n0")
                 || !stdout.contains(expected)
             {
                 failures.push(format!("api={api} name={name}: {stdout}"));
-            }
-            if api == "async" && name != CNAME_A_NAME && !stdout.contains("DnsRR_ReturnStatus:\n0")
-            {
-                failures.push(format!("numeric literal must complete inline: {stdout}"));
             }
         }
     }

@@ -106,6 +106,20 @@ jobs:
             Copy-Item -LiteralPath $dll -Destination (Join-Path $debug "envbox-$($runtime.dll).dll") -Force
           }
 
+      - name: Test DNS cache and routing contracts for x64 and x86
+        run: |
+          foreach ($arch in @('x64', 'Win32')) {
+            foreach ($fixture in @('dns-cache', 'dns-bootstrap')) {
+              $build = "target/ci-$fixture-$arch"
+              cmake -S "tools/envbox-$fixture-fixture" -B $build -G 'Visual Studio 17 2022' -A $arch "-DDETOURS_ROOT=$env:DETOURS_ROOT"
+              if ($LASTEXITCODE -ne 0) { throw "DNS fixture configure failed" }
+              cmake --build $build --config Release
+              if ($LASTEXITCODE -ne 0) { throw "DNS fixture build failed" }
+              ctest --test-dir $build -C Release --output-on-failure
+              if ($LASTEXITCODE -ne 0) { throw "DNS fixture tests failed" }
+            }
+          }
+
       # Native acceptance tests launch real processes and measure latency.
       # Serialize test cases to avoid sibling workloads on the shared runner.
       - name: Test workspace

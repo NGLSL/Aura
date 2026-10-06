@@ -141,109 +141,125 @@ pub fn run(args: &[String]) -> ExitCode {
         .get(3)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0x108);
-    super::print_runtime_marker();
-    unsafe {
-        let mut records = std::ptr::null_mut();
-        let (status, rows) = if api == "ex" || api == "async" {
-            let (sender, receiver) = mpsc::channel();
-            // Keep result, request and callback context alive through completion.
-            let sender = Box::into_raw(Box::new(sender));
-            let result = Box::into_raw(Box::new(DnsQueryResult {
-                version: 1,
-                query_status: 0,
-                query_options: 0,
-                query_records: std::ptr::null_mut(),
-                reserved: std::ptr::null_mut(),
-            }));
-            let request = DnsQueryRequest {
-                version: 1,
-                query_name: wide.as_ptr(),
-                query_type: kind,
-                query_options: options as u64,
-                dns_server_list: std::ptr::null_mut(),
-                interface_index: 0,
-                completion: if api == "async" {
-                    Some(completion)
-                } else {
-                    None
-                },
-                query_context: sender.cast(),
-            };
-            let mut cancel = DnsQueryCancel { reserved: [0; 32] };
-            let returned = DnsQueryEx(
-                &request,
-                result,
-                if api == "async" {
-                    &mut cancel
-                } else {
-                    std::ptr::null_mut()
-                },
-            );
-            println!("DnsRR_ReturnStatus:\n{returned}");
-            if returned == 9506 && args.iter().any(|arg| arg == "--cancel") {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let cancelled = super::DnsCancelQuery(&cancel);
-                println!("DnsRR_CancelStatus:\n{cancelled}");
+    let repeats = if let Some(index) = args.iter().position(|arg| arg == "--repeat") {
+        match args
+            .get(index + 1)
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            Some(count @ 1..=256) => count,
+            _ => {
+                eprintln!("--repeat requires a count between 1 and 256");
+                return ExitCode::FAILURE;
             }
-            let outcome = if returned == 9506 {
-                match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
-                    Ok(outcome) => outcome,
-                    Err(_) => {
-                        eprintln!("DNS completion timed out");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                let rows = describe((*result).query_records.cast(), true);
-                DnsRecordListFree((*result).query_records.cast(), 1);
-                (
-                    if returned == 0 {
-                        (*result).query_status
-                    } else {
-                        returned
-                    },
-                    rows,
-                )
-            };
-            drop(Box::from_raw(sender));
-            drop(Box::from_raw(result));
-            outcome
-        } else {
-            let status = match api.as_str() {
-                "a" => DnsQuery_A(
-                    name.as_ptr().cast(),
-                    kind,
-                    options,
-                    std::ptr::null_mut(),
-                    (&mut records as *mut *mut Record).cast(),
-                    std::ptr::null_mut(),
-                ),
-                "utf8" => DnsQuery_UTF8(
-                    name.as_ptr().cast(),
-                    kind,
-                    options,
-                    std::ptr::null_mut(),
-                    &mut records,
-                    std::ptr::null_mut(),
-                ),
-                _ => DnsQuery_W(
-                    wide.as_ptr(),
-                    kind,
-                    options,
-                    std::ptr::null_mut(),
-                    &mut records,
-                    std::ptr::null_mut(),
-                ),
-            };
-            let rows = describe(records, api == "w");
-            DnsRecordListFree(records, 1);
-            (status, rows)
-        };
-        println!("DnsRR_Status:\n{status}\nDnsRR_Records:\n{}", rows.len());
-        for row in rows {
-            println!("DnsRR_Record: {row}");
         }
-        println!("DnsRR_Freed:\ntrue");
+    } else {
+        1
+    };
+    super::print_runtime_marker();
+    for _ in 0..repeats {
+        unsafe {
+            let mut records = std::ptr::null_mut();
+            let (status, rows) = if api == "ex" || api == "async" {
+                let (sender, receiver) = mpsc::channel();
+                // Keep result, request and callback context alive through completion.
+                let sender = Box::into_raw(Box::new(sender));
+                let result = Box::into_raw(Box::new(DnsQueryResult {
+                    version: 1,
+                    query_status: 0,
+                    query_options: 0,
+                    query_records: std::ptr::null_mut(),
+                    reserved: std::ptr::null_mut(),
+                }));
+                let request = DnsQueryRequest {
+                    version: 1,
+                    query_name: wide.as_ptr(),
+                    query_type: kind,
+                    query_options: options as u64,
+                    dns_server_list: std::ptr::null_mut(),
+                    interface_index: 0,
+                    completion: if api == "async" {
+                        Some(completion)
+                    } else {
+                        None
+                    },
+                    query_context: sender.cast(),
+                };
+                let mut cancel = DnsQueryCancel { reserved: [0; 32] };
+                let returned = DnsQueryEx(
+                    &request,
+                    result,
+                    if api == "async" {
+                        &mut cancel
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                );
+                println!("DnsRR_ReturnStatus:\n{returned}");
+                if returned == 9506 && args.iter().any(|arg| arg == "--cancel") {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let cancelled = super::DnsCancelQuery(&cancel);
+                    println!("DnsRR_CancelStatus:\n{cancelled}");
+                }
+                let outcome = if returned == 9506 {
+                    match receiver.recv_timeout(std::time::Duration::from_secs(15)) {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            eprintln!("DNS completion timed out");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    let rows = describe((*result).query_records.cast(), true);
+                    DnsRecordListFree((*result).query_records.cast(), 1);
+                    (
+                        if returned == 0 {
+                            (*result).query_status
+                        } else {
+                            returned
+                        },
+                        rows,
+                    )
+                };
+                drop(Box::from_raw(sender));
+                drop(Box::from_raw(result));
+                outcome
+            } else {
+                let status = match api.as_str() {
+                    "a" => DnsQuery_A(
+                        name.as_ptr().cast(),
+                        kind,
+                        options,
+                        std::ptr::null_mut(),
+                        (&mut records as *mut *mut Record).cast(),
+                        std::ptr::null_mut(),
+                    ),
+                    "utf8" => DnsQuery_UTF8(
+                        name.as_ptr().cast(),
+                        kind,
+                        options,
+                        std::ptr::null_mut(),
+                        &mut records,
+                        std::ptr::null_mut(),
+                    ),
+                    _ => DnsQuery_W(
+                        wide.as_ptr(),
+                        kind,
+                        options,
+                        std::ptr::null_mut(),
+                        &mut records,
+                        std::ptr::null_mut(),
+                    ),
+                };
+                let rows = describe(records, api == "w");
+                DnsRecordListFree(records, 1);
+                (status, rows)
+            };
+            println!("DnsRR_Status:\n{status}\nDnsRR_Records:\n{}", rows.len());
+            for row in rows {
+                println!("DnsRR_Record: {row}");
+            }
+            println!("DnsRR_Freed:\ntrue");
+        }
     }
     ExitCode::SUCCESS
 }

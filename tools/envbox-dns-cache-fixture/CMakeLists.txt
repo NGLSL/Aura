@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox_dns_cache_fixture LANGUAGES CXX)
+add_executable(envbox-dns-cache-fixture contracts.cpp ../../runtime/src/dns_response_cache.cpp)
+target_compile_features(envbox-dns-cache-fixture PRIVATE cxx_std_17)
+target_compile_definitions(envbox-dns-cache-fixture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+enable_testing()
+add_test(NAME dns-response-cache COMMAND envbox-dns-cache-fixture)
