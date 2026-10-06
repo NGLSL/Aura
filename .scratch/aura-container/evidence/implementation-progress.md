@@ -133,3 +133,15 @@ AuthRoot 签名/显式 signer trust、Root Program 属性、freshness/rollback/�
 本轮审查修正 CDP 二阶段实际长度小于预估值时的误拒，全部 pointer 检查改用实际返回范围；新增 26 个 fixture cache 候选重试正反向场景，最终双架构 IPv4 **84/84 passed**，WMI Host PID 30664 / Runtime modules 0。修正后完整 suite 再验 **403/0/34**，Host PID 17372 / Runtime modules 0，build/test exit 0；默认 C ABI 最终双架构仍 certificate failure/No-Go。native cache 各步骤及时取消尚未支持，已明确作为正式启用前门禁，不以 fixture 取消通过代替。
 
 统一 review 的 Standards / Spec 两轴都必须包含未完成要求，不能因为阶段代码测试通过就宣称 49 或完整 Container 已完成。实现后按 Skill 在当前分支提交经过 review 的具体变更；不隐含 push、release、宿主驱动安装或外部提交。
+
+## 2026-10-06 后续：native cache 取消与受控 signed CTL
+
+基线 `b193fe9` 之后补齐上一切片保留的 native cache 步骤间取消门禁：caller-thread 非 Send RAII scope 保管完整 Budget，Send + Sync verifier 只保存不可复用的 thread/scope identity；foreign/retired scope 不调用 callback，外部 callback 前释放 registry borrow。首次取消锁存并在所有任务清理后优先返回 typed error，一次性 cancel pulse 不被 TLS General 错误吞掉。单个同步 CAPI 内部不可抢占。
+
+双架构实际 native cache-only collector 的入口、CDP 返回后、retrieval 返回后取消均通过；查询后 callback 恢复零，HTTP/canary 仍为零。包含原回归的 **92 个 IPv4 场景通过**；fresh WMI PID 4932 / Runtime modules 0。IPv6 10 项仍因用户禁用而未执行。
+
+新增 test/fixture-only signed CTL 受控子集：显式 DER signer pins 的 memory store，逐 signer index 真实验签，然后检查 usage/list identity/time/sequence/subject。未知属性严格拒绝；equal sequence 需要之前 encoded SHA-256；没有生产 AuthRoot 导入或持久化 rollback state。签名、篡改、多 signer、EKU、时间、算法、rollback 和 bounds 正反例双架构实际通过。Standards 审查发现的两阶段 CAPI actual-size/embedded pointer/OID 范围缺口已修正并加纯 helper 测试；Spec 没有新增 actionable finding。
+
+默认 staticlib/MSVC DLL/C ABI fresh WMI 复测仍 certificate failure，默认诊断 `UnknownIssuer`、研究 AuthRoot 变体 `UnknownRevocationStatus`。Google cache 候选 2、Cloudflare 0，仍不能证明完整吊销。真实 AuthRoot policy/provenance/rotation、公共离线信任和完整观测门禁不因受控 fixture 通过而解除；18 No-Go/19 off。完整回归、来源/hash 与审查见 [本切片证据](doh-signed-ctl-cancellation.md) 和 [双轴 review](doh-signed-ctl-cancellation-review.md)。P4–P8 驱动/Verifier/内核恢复仍需隔离 VM。
+
+最终修正后 fresh WMI PID 5584 / Runtime modules 0，Rust 1.99 workspace build/test exit 0，**414 passed / 0 failed / 34 ignored**；x64/i686 DoH crate各 **25 passed / 0 failed / 1 ignored**。Standards 原 P2 已经独立复审标记 resolved；Standards/Spec 当前新增未解决 actionable findings 均 0，完整规格仍 partial。

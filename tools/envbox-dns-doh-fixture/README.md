@@ -65,3 +65,15 @@ coverage, unknown CA revocation, inability to override known revoked, wrong
 name and untrusted chain. No Windows cache entry is seeded or read. This adds
 26 cases to the previous 58 executed IPv4 cases, for 84 when both architectures
 run; the 10 optional IPv6 cases remain separately qualified by preflight.
+
+Four further cases per architecture use `--native-cache true` to exercise the
+actual Windows CDP extraction and cache-only CRL collector with fixture roots.
+The randomly allocated loopback CDP has no seeded cache entry. A plain miss must
+return revocation-unknown before HTTP. `--cancel-cache-check` emits a single
+caller-thread cancellation pulse at cache check 1 (collector entry), 5 (after
+the first CDP CAPI call), or 10 (after cache-only retrieval). The query must
+return Cancelled even though the callback returns zero again after the query;
+the output records exact cache check and pulse counts. These cases require zero
+HTTP requests, canary connections, forbidden host API calls, and denied endpoint
+attempts. No cache or trust material is written. Both architectures now execute
+92 IPv4 cases; the 10 IPv6 cases still require the existing preflight.

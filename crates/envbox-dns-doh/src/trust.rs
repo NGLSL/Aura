@@ -1,4 +1,5 @@
 //! Offline local trust snapshot and explicit distrust; no chain or wire retrieval.
+use crate::verification_scope::VerificationBudget;
 use crate::{Budget, Error};
 use rustls::{
     client::{
@@ -619,12 +620,15 @@ impl Snapshot {
         let roots = Arc::new(roots);
         let verifier = standard_verifier(roots.clone(), self.crls.clone())?;
         budget.check()?;
-        let cache_deadline = self.use_url_cache.then_some(budget.deadline);
+        let cache_budget = self
+            .use_url_cache
+            .then(|| VerificationBudget::capture(budget))
+            .transpose()?;
         Ok(Arc::new(OfflineVerifier {
             inner: verifier,
             snapshot: self,
             roots,
-            cache_deadline,
+            cache_budget,
         }))
     }
 
@@ -687,6 +691,15 @@ impl Snapshot {
         self.use_url_cache = true;
         Ok(self)
     }
+
+    /// Use real cache-only CDP reads with controlled fixture roots. No material
+    /// is installed in Windows; this entry is absent from product builds.
+    #[cfg(any(test, feature = "fixture-trust"))]
+    pub fn with_fixture_native_cache(mut self) -> Self {
+        self.fixture_cached_crls = None;
+        self.use_url_cache = true;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -694,7 +707,7 @@ struct OfflineVerifier {
     inner: Arc<WebPkiServerVerifier>,
     snapshot: Snapshot,
     roots: Arc<RootCertStore>,
-    cache_deadline: Option<u64>,
+    cache_budget: Option<VerificationBudget>,
 }
 
 fn standard_verifier(
@@ -741,7 +754,7 @@ impl ServerCertVerifier for OfflineVerifier {
             self.inner
                 .verify_server_cert(end, &candidates, name, ocsp, now)
         };
-        let Some(deadline) = self.cache_deadline else {
+        let Some(cache_budget) = self.cache_budget else {
             return result;
         };
         let Err(error) = result else {
@@ -752,21 +765,24 @@ impl ServerCertVerifier for OfflineVerifier {
         }
         // This reads existing HTTP(S) cache keys only. It cannot download a
         // missing CRL or change trust anchors. Synchronous CryptoAPI work is
-        // deadline checked, but cannot be interrupted at arbitrary instructions.
+        // checked for deadline/cancellation, but cannot be interrupted mid-call.
         #[cfg(any(test, feature = "fixture-trust"))]
         let supplied = self.snapshot.fixture_cached_crls.clone();
         #[cfg(not(any(test, feature = "fixture-trust")))]
         let supplied: Option<Vec<Vec<u8>>> = None;
-        let cached = supplied
-            .map_or_else(
-                || {
-                    crate::offline_crl::for_certificates(
-                        std::iter::once(end.as_ref()).chain(candidates.iter().map(AsRef::as_ref)),
-                        Budget::until(deadline),
-                    )
-                },
-                Ok,
-            )
+        let cached = cache_budget
+            .collect(|budget| {
+                supplied.map_or_else(
+                    || {
+                        crate::offline_crl::for_certificates(
+                            std::iter::once(end.as_ref())
+                                .chain(candidates.iter().map(AsRef::as_ref)),
+                            budget,
+                        )
+                    },
+                    Ok,
+                )
+            })
             .map_err(|error| rustls::Error::General(format!("offline CRL cache: {error:?}")))?;
         if cached.is_empty() {
             return Err(error);

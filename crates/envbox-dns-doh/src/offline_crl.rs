@@ -4,8 +4,8 @@
 //! writes occur here. The caller must validate issuer, signature and freshness.
 //! Synchronous CAPI calls cannot be interrupted mid-call: check the shared
 //! deadline/cancellation before and after every call and supply a finite timeout.
-//! Cancellation checks require a callback in the supplied Budget. The native
-//! verifier supplies only a deadline; transport checks cancellation after TLS.
+//! The native verifier recovers the shared Budget from an active caller-thread
+//! query scope; callback/context never move into the Send + Sync verifier.
 use crate::{Budget, Error};
 use std::{collections::HashSet, ffi::c_void, mem, ptr, slice};
 use windows_sys::Win32::{

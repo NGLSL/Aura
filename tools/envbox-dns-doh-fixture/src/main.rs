@@ -14,8 +14,25 @@ use windows_sys::Win32::{
     },
 };
 
+struct CancelState {
+    cancel_at: u64,
+    cache_target: Option<usize>,
+    cache_checks: usize,
+    cache_pulses: usize,
+}
 unsafe extern "C" fn cancelled(context: *mut c_void) -> i32 {
-    (!context.is_null() && GetTickCount64() >= *context.cast::<u64>()) as i32
+    if context.is_null() {
+        return 0;
+    }
+    let state = &mut *context.cast::<CancelState>();
+    if envbox_dns_doh::fixture_cache_collection_active() {
+        state.cache_checks += 1;
+        if state.cache_target == Some(state.cache_checks) {
+            state.cache_pulses += 1;
+            return 1;
+        }
+    }
+    (GetTickCount64() >= state.cancel_at) as i32
 }
 fn materials(value: Option<&String>) -> Vec<Vec<u8>> {
     value
@@ -86,12 +103,28 @@ fn main() {
     let mut final_handles = 0;
     let started = Instant::now();
     let mut outcome = Ok(Vec::new());
+    let native_cache = options
+        .get("--native-cache")
+        .is_some_and(|value| value == "true");
+    let cache_target = options
+        .get("--cancel-cache-check")
+        .map(|value| value.parse::<usize>().expect("positive cache check index"));
+    assert!(cache_target.is_none_or(|index| native_cache && index > 0));
+    let mut cache_checks = 0;
+    let mut cache_pulses = 0;
+    let mut cancellation_after_query = 0;
     for index in 0..repeats {
         let now = unsafe { GetTickCount64() };
-        let mut cancel_at = options
+        let cancel_at = options
             .get("--cancel-ms")
             .map(|value| now + value.parse::<u64>().unwrap())
             .unwrap_or(u64::MAX);
+        let mut cancel_state = CancelState {
+            cancel_at,
+            cache_target,
+            cache_checks: 0,
+            cache_pulses: 0,
+        };
         let mut snapshot = Snapshot::fixture(
             materials(options.get("--roots")),
             materials(options.get("--ca")),
@@ -104,14 +137,23 @@ fn main() {
                 .with_fixture_cached_crls(materials(Some(candidates)))
                 .expect("fixture cache candidate bounds");
         }
+        if native_cache {
+            assert!(!options.contains_key("--cached-crls"));
+            snapshot = snapshot.with_fixture_native_cache();
+        }
         let budget = unsafe {
             Budget::from_callback(
                 now + budget_ms,
                 Some(cancelled),
-                ptr::addr_of_mut!(cancel_at).cast(),
+                ptr::addr_of_mut!(cancel_state).cast(),
             )
         };
         outcome = envbox_dns_doh::query_fixture(url, ip, &packet, budget, snapshot);
+        cache_checks += cancel_state.cache_checks;
+        cache_pulses += cancel_state.cache_pulses;
+        // A pulse has ended. The query must retain Cancelled even though this
+        // caller-thread callback now returns zero outside the cache scope.
+        cancellation_after_query = unsafe { cancelled(ptr::addr_of_mut!(cancel_state).cast()) };
         if index == 0 {
             unsafe {
                 GetProcessHandleCount(GetCurrentProcess(), &mut baseline);
@@ -125,7 +167,7 @@ fn main() {
         Ok(bytes) => (bytes.len(), Error::None),
         Err(error) => (0, error),
     };
-    println!("result={length} error={} elapsed_ms={} handles_before={baseline} handles_after={final_handles}", error as u32, started.elapsed().as_millis());
+    println!("result={length} error={} elapsed_ms={} handles_before={baseline} handles_after={final_handles} cache_checks={cache_checks} cache_pulses={cache_pulses} cancellation_after_query={cancellation_after_query}", error as u32, started.elapsed().as_millis());
     if let Some(snapshot) = snapshot_fn {
         let mut json = vec![0u8; 16384];
         assert_eq!(unsafe { snapshot(json.as_mut_ptr(), json.len() as u32) }, 0);

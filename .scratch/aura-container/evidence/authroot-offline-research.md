@@ -318,3 +318,9 @@ C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\wincrypt.h
 ```
 
 SDK 注释是实现和 fixture 的输入，不是对未来所有 Windows build 的无限兼容承诺。任何升级后的新增 symbol/attribute 都应先进入研究门禁。
+
+## 2026-10-06 受控实现进展
+
+已实现 test/fixture-only 的 signed CTL Stage 1/2 受控子集：显式 DER signer pins、memory-only store、逐 signer index 的真实验签，以及验签后 usage/list identity/time/sequence/subject 检查。未知 attributes/extensions/algorithm 拒绝，equal sequence 必须匹配之前 encoded SHA-256。固定时间与生成测试 pins 只用于 fixture，不证明 Microsoft publisher 的 pin 来源、signer chain/rotation/revocation、Root Program 属性或生产授权。没有持久化 rollback state、真实 root materialization 或默认 AuthRoot 导入。
+
+同时补齐 native cache caller-thread scope 与每个 CAPI 步骤间的取消传播；单个同步调用内部仍不能抢占。受控 fixture、默认公共目标仍失败的原生复测与剩余门禁见 [本切片证据](doh-signed-ctl-cancellation.md)。18/19 不因该研究实现而完成。

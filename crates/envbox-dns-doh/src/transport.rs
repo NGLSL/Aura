@@ -56,6 +56,7 @@ pub(crate) fn query(
     supplied: Option<Snapshot>,
 ) -> Result<Vec<u8>, Error> {
     budget.check()?;
+    let verification_scope = crate::verification_scope::VerificationScope::enter(budget)?;
     if !(12..=65535).contains(&packet.len()) {
         return Err(Error::Argument);
     }
@@ -98,6 +99,9 @@ pub(crate) fn query(
             }
         }; // Drop the exchange future and its sender/stream before cleanup.
         executor.close().await;
+        if let Some(error) = verification_scope.stop_reason() {
+            return Err(error);
+        }
         budget.check()?;
         if executor.exhausted() {
             return Err(Error::Http);

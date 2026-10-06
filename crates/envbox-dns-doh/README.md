@@ -24,10 +24,13 @@ Both Content-Length and streamed bodies enforce the byte limit.
 The current-thread runtime uses a bounded tracked executor for Hyper connection
 and HTTP/2 tasks. At exit, new work is disabled and every owned task is aborted
 and awaited. Trust preparation and network work check deadline/cancellation.
-Native CRL cache lookup within the TLS verifier receives a deadline-only budget;
-it cannot promptly observe caller cancellation between CAPI calls. Transport
-checks cancellation after TLS before HTTP and again after cleanup. Local native
-calls cannot be preempted mid-call. This limitation remains an enablement gate.
+Native CRL cache lookup recovers the shared budget from a caller-thread RAII
+scope and checks cancellation between CAPI calls. The Send + Sync verifier
+stores only a thread/scope identity; retired or foreign-thread identities fail
+closed without invoking callbacks. No registry borrow spans a callback.
+Cancellation is latched so a one-shot notification survives TLS error mapping
+and cleanup. Transport also checks before HTTP and after cleanup. A single
+synchronous native call cannot be preempted mid-call.
 Rust unwinding panics are isolated at the FFI
 boundary and asynchronous query boundary; allocator aborts or invalid caller
 pointers are not recoverable Rust panics.
@@ -55,9 +58,18 @@ the [rustls verifier builder](https://docs.rs/rustls/0.23.45/rustls/client/struc
 
 The standalone `fixture-trust` feature can supply explicit cache candidate DER
 to exercise that same retry branch without touching host caches. This input is
-absent from product builds and the C ABI. Native cache work currently has only
-a deadline budget; prompt cancellation between CAPI calls remains a product
-enablement gate. Transport checks cancellation after TLS before HTTP.
+absent from product builds and the C ABI. Fixture-only phase instrumentation
+also exercises the real cache-only collector with a one-shot cancellation at
+entry, after CDP enumeration and after retrieval. The public default trust
+acceptance gate remains separate.
+
+The test/fixture-only `signed_ctl` module verifies controlled signed CTLs with
+explicit DER signer pins in a memory store. Every signer is verified before
+policy metadata is read; list identity, time, sequence rollback and equal-sequence
+digest checks fail closed. Unknown policy attributes are rejected. This module
+does not authorize production AuthRoot anchors; signer provenance, rotation,
+chain/revocation and real Root Program policy semantics remain unproved. See
+[controlled fixtures](../../tools/envbox-authroot-fixture/README.md).
 
 This is a narrower local policy than Windows' complete native trust engine.
 Logical/Enterprise/GroupPolicy/SmartCard providers, all Windows CTL semantics and

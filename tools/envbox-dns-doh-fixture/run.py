@@ -119,7 +119,7 @@ tampered_crl[-1] ^= 1  # Preserve ASN.1, invalidate only the signature.
 def case(executable, trap, label, *, certificate="leaf", key=None, identity="fixture.test",
          roots="root", crls="root-crl", ca="", deny="", behavior="answer", protocol="h2",
          expected=0, budget=1800, cancel=None, repeats=1, tls12=False, bootstrap="127.0.0.1",
-         cached_crls=None):
+         cached_crls=None, native_cache=False, cancel_cache_check=None):
     address = ipaddress.ip_address(bootstrap)
     listener = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET)
     listener.bind((bootstrap, 0))
@@ -261,6 +261,10 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
         command += ["--cancel-ms", str(cancel)]
     if cached_crls is not None:
         command += ["--cached-crls", paths(cached_crls)]
+    if native_cache:
+        command += ["--native-cache", "true"]
+    if cancel_cache_check is not None:
+        command += ["--cancel-cache-check", str(cancel_cache_check)]
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=8)
     finally:
@@ -277,6 +281,15 @@ def case(executable, trap, label, *, certificate="leaf", key=None, identity="fix
     assert trap_result["connects_denied"] == 0 and trap_result["extension_denied"] == 0
     assert all(api["calls"] == 0 for api in trap_result["apis"] if api["name"] in ("sendto", "WSASendTo"))
     assert CANARY_COUNT == baseline_canary
+    if native_cache:
+        cache_checks = int(re.search(r"cache_checks=(\d+)", output).group(1))
+        cache_pulses = int(re.search(r"cache_pulses=(\d+)", output).group(1))
+        assert observed["requests"] == 0, label
+        if cancel_cache_check is None:
+            assert cache_checks > 0 and cache_pulses == 0, (label, output)
+        else:
+            assert cache_checks == cancel_cache_check and cache_pulses == 1, (label, output)
+            assert "cancellation_after_query=0" in output, (label, output)
     if expected == 0:
         assert result.returncode == 0 and observed["requests"] == repeats, label
         assert all(ipaddress.ip_address(value) == address for value in observed["peer"])
@@ -355,6 +368,16 @@ def main():
         case(exe, trap, "cached-cannot-clear-revoked", crls="revoked-leaf-crl", cached_crls="root-crl", expected=8)
         case(exe, trap, "cached-wrong-name", identity="wrong.fixture.test", crls="", cached_crls="root-crl", expected=9)
         case(exe, trap, "cached-untrusted", certificate="untrusted", crls="", cached_crls="root-crl", expected=6)
+        # Exercise real CAPI CDP extraction/cache-only retrieval against a
+        # random loopback cache key. Cancellation is one callback pulse within
+        # the collector, rather than a timing-dependent persistent flag.
+        case(exe, trap, "native-cache-miss", crls="", native_cache=True, expected=7)
+        case(exe, trap, "native-cache-cancel-entry", crls="", native_cache=True,
+             cancel_cache_check=1, expected=2)
+        case(exe, trap, "native-cache-cancel-after-cdp", crls="", native_cache=True,
+             cancel_cache_check=5, expected=2)
+        case(exe, trap, "native-cache-cancel-after-retrieve", crls="", native_cache=True,
+             cancel_cache_check=10, expected=2)
         case(exe, trap, "redirect", behavior="redirect", expected=12)
         case(exe, trap, "http-non2xx", behavior="http-error", expected=12)
         case(exe, trap, "media", behavior="bad-media", expected=13)

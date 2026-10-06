@@ -11,6 +11,8 @@ mod executor;
 mod offline_crl;
 #[path = "../../../../crates/envbox-dns-doh/src/transport.rs"]
 mod transport;
+#[path = "../../../../crates/envbox-dns-doh/src/verification_scope.rs"]
+mod verification_scope;
 pub mod trust {
     include!(concat!(env!("OUT_DIR"), "/trust.rs"));
 
