@@ -76,3 +76,8 @@ debug = "line-tables-only"
 # Third-party debug symbols add substantial disk and linker work on Windows.
 [profile.dev.package."*"]
 debug = false
+
+# Runtime integrity checks hash both DLLs during startup. Keep cryptographic
+# compression optimized in development while retaining every validation check.
+[profile.dev.package.sha2]
+opt-level = 3
