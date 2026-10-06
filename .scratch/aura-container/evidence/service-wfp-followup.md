@@ -5,6 +5,8 @@ Baseline: `6f40a80`
 Branch: `dev`
 Scope: 用户明确要求实现下一批可信控制服务、启动前绑定和 IPv4 WFP 原型。只做源码、构建和无需加载驱动的验证；不安装/启动服务、不加载驱动、不修改宿主网络或信任，IPv6 继续延期。
 
+后续范围修订（2026-10-06）：用户澄清容器目标是 Profile 环境信息视图，见[当前规格](../spec.md)。本文保留已执行增量及其验证边界；可信服务和WFP等未部署实验成果不再是该目标的必需后端，不由本记录授权继续安装或推进旧隔离路线。
+
 ## 实施契约
 
 - 服务名称固定 AuraPolicyService，primary token 要求 session-zero LocalSystem 与 enabled dedicated service SID。设备/IOCTL 仍仅接受该身份，不凭 JSON PID、句柄或 SID 自认领。

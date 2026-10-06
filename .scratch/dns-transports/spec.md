@@ -6,13 +6,13 @@ Date: 2026-10-04
 
 支持有序 UDP、TCP、DoT、DoH 上游；所有 QTYPE 共用报文与传输路径。`strict = true` 时，受支持的 Windows 解析 API 不调用 Host DNS，全部上游失败返回解析错误。协议类型不决定是否 strict；strict 也不等于必须加密。
 
-用户已授权完整 Container P0–P8 的实施，包括本文的 typed upstream、DoT、DoH 与 strict；后续确认无测试虚拟机，先完成可独立实现的部分。实现与验收进度见 `.scratch/aura-container/evidence/implementation-progress.md`，授权不等于各项能力已经交付。本文取代 `.scratch/envbox-v02/issues/24-dns-routing-design.md` 中“其他 type / 上游失败直接 Fail Open、DoH 非目标”的后续设计限制；未支持的地址查询和异步入口必须明确拒绝或独立验收后支持。
+2026-10-06 用户澄清容器目标为 Profile 环境信息视图，取代旧 P0–P8 存储/权限隔离路线。本文的 typed upstream、任意 QTYPE、DoT、DoH 与 strict 继续有效，不依赖驱动或虚拟机。当前总范围见[环境信息容器规格](../aura-container/spec.md)，实现与验收进度见 `.scratch/aura-container/evidence/implementation-progress.md`；授权不等于各项能力已经交付。本文取代 `.scratch/envbox-v02/issues/24-dns-routing-design.md` 中“其他 type / 上游失败直接 Fail Open、DoH 非目标”的后续设计限制；未支持的地址查询和异步入口必须明确拒绝或独立验收后支持。
 
 范围是 Aura 注入进程的 Windows resolver 路由，不是网络安全边界。应用自带 UDP/TCP/DoH/DoT/DoQ 和未拦截的新 API 仍可能绕过；本文不引入 WFP 驱动或透明流量重定向。
 
 2026-10-06 用户排期决定：当前交付先按 IPv4 上游连接验收，IPv6 连接/路由单列后续专项，不作为当前完成门槛，也不阻塞四传输或其他独立工作的推进。保留历史 IPv6 未执行记录，不能把它算通过或据此宣称 IPv4 未完成。AAAA QTYPE 在 IPv4 DNS transport 上仍可查询，属于当前任意 QTYPE 支持。
 
-## 当前实现约束
+## 设计时基线（2026-10-04，非当前缺口清单）
 
 - `crates/envbox-core/src/lib.rs`：`DnsProfile { mode, servers: Vec<IpAddr> }`，无协议、端口、TLS 身份和 strict。
 - CLI `--dns` 和 GUI 的 DNS 文本编辑器只接受 IP；保留 `--dns IP` 作为 UDP/53 简写，GUI 后续改成可排序的上游行。

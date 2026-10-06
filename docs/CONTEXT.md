@@ -7,7 +7,9 @@
 | 术语 | 含义 |
 |------|------|
 | **Application** | 用户配置的可启动应用（名称、LaunchTarget、默认 Profile、工作目录等） |
-| **Environment Profile（Profile）** | 一套可复用的环境视图：Locale、UI Language、Region、Timezone、DNS View、Environment Variables、Registry 白名单 |
+| **Environment Profile（Profile）** | 一套可复用的环境信息配置：Locale、UI Language、Region、Timezone、DNS 配置视图与解析策略、Environment Variables、Registry 白名单、浏览器/WebRTC 策略 |
+| **环境容器 / 环境工作区（Container）** | 持久保存身份和 Profile 引用，管理使用该环境信息视图启动的实例；目标继续使用宿主资源与权限，不表示文件或 Registry 写入隔离 |
+| **RunSnapshot** | 一次运行的不可变有效配置，绑定 Container、Profile 与 RuntimeInstance；后续 Profile 编辑只影响之后的运行 |
 | **EnvironmentSession** | 一次 Run 的控制面聚合：目标、Profile、Root/子进程集合、Package Identity、IsolationGuarantee、AttachStrategy、状态 |
 | **RuntimeInstance** | 一次 Run 的运行记录；同一 Application 可并存多个实例 |
 | **Detached RuntimeInstance** | Aura 控制面退出后仍继续运行的 RuntimeInstance 进程树；保持启动时的不可变 Profile，但不属于重新打开的 Aura 所维护的实例列表 |
@@ -58,7 +60,7 @@
 | **DNS View** | 虚拟化程序读取到的 DNS 配置（GetNetworkParams / GetAdaptersAddresses）；非透明 DNS 劫持。DnsMode：`Host` / `VirtualView` |
 | **Registry Virtual View** | 仅白名单路径的注册表读值虚拟化；非完整 Registry Sandbox。白名单路径字段记为 `whitelist_paths` |
 | **Runtime（envbox-runtime）** | 注入目标进程的 Detours DLL；负责 API Hook 与子进程继承 |
-| **Fail Open** | 多数 Hook 失败时回退原 Windows API，兼容优先 |
+| **Fail Open** | 多数 Hook 失败时回退原 Windows API，兼容优先；strict DNS 的受支持解析入口禁止宿主回退 |
 | **Job Object** | 用于生命周期跟踪/统计/一键停止；不是安全隔离边界 |
 | **Audit Mode** | 可选观测开关（默认关）：记录进程树读取过的地域相关 API；不改变虚拟化语义 |
 | **Audit Event** | 单条审计记录（JSONL）：API、pid/ppid/tid、是否虚拟化、非敏感摘要 |

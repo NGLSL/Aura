@@ -5,7 +5,7 @@ Status: independent-slices-implemented-and-reviewed
 Review baseline: `a5baed8`
 Branch: `dev`
 
-用户授权按 implement Skill 推进全部 P0–P8，并在最后统一 code-review。49 张票的总目标保持不变；本文件只记录进度，不将计划或原型当作完整交付。
+范围修订（2026-10-06）：用户明确容器是 Profile 环境信息视图，旧 P0–P8 存储/权限隔离总目标已被[当前规格](../spec.md)取代。下方阶段、缺口和“完整容器”措辞保留为历史执行记录，不再作为新目标的完成门槛；已有 DNS、快照、监管和恢复成果继续复用。最新服务/WFP源码与测试证据见[增量记录](service-wfp-followup.md)，未部署实验代码保持未启用。本次修订不将旧49票标完成，不清除既有失败证据。
 
 ## 当前状态摘要（2026-10-06，优先于下方历史记录）
 
