@@ -106,8 +106,10 @@ jobs:
             Copy-Item -LiteralPath $dll -Destination (Join-Path $debug "envbox-$($runtime.dll).dll") -Force
           }
 
+      # Native acceptance tests launch real processes and measure latency.
+      # Serialize test cases to avoid sibling workloads on the shared runner.
       - name: Test workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --test-threads=1
 
       - name: Test CPU renderer SVG DPI regressions
         run: cargo test -p iced_tiny_skia --lib --locked
