@@ -129,6 +129,7 @@ fn missing_job_with_absent_sealed_generations_stays_tracking_lost() {
         runtime_module_sha256: "fixture-sha".into(),
         runtime_config_sha256: expected_config_sha256.clone(),
         runtime_version: env!("CARGO_PKG_VERSION").into(),
+        environment_facts: None,
         audit: false,
         inherit_children: true,
         known_members: vec![ProcessIdentity {
@@ -142,6 +143,7 @@ fn missing_job_with_absent_sealed_generations_stays_tracking_lost() {
             module_sha256: "fixture-sha".into(),
             config_sha256: expected_config_sha256,
             runtime_version: env!("CARGO_PKG_VERSION").into(),
+            environment_facts: None,
         }],
         root_pid: absent_pid,
         creation_time: absent_generation,

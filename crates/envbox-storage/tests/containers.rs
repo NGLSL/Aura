@@ -324,65 +324,48 @@ fn old_container_schema_defaults_empty_storage_and_policy_errors_keep_bytes() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(windows)]
 #[test]
-#[ignore = "requires actual local fixed NTFS C and D volumes; run explicitly on the Windows fixture host"]
-fn actual_c_and_d_shared_rules_do_not_inherit_cow_volume_restriction() {
+fn historical_cross_volume_rules_do_not_block_profile_edits_or_snapshots() {
     use envbox_core::storage_policy::{StorageAction, StorageRule, StorageTarget};
     let (store, root) = fixture();
-    let application = root.with_extension("application");
-    assert!(application
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .starts_with("c:"));
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let shared = workspace
-        .join("target")
-        .join(format!("policy26-shared-{}", uuid::Uuid::new_v4()));
-    assert!(shared
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .starts_with("d:"));
-    std::fs::create_dir_all(&application).unwrap();
-    std::fs::create_dir_all(&shared).unwrap();
     let mut container = Container::new("A", uuid::Uuid::from_u128(1));
-    for (path, action) in [
-        (application.clone(), StorageAction::IsolatedWrite),
-        (shared.clone(), StorageAction::SharedReadOnly),
-        (shared.join("writable"), StorageAction::SharedReadWrite),
-        (shared.join("denied"), StorageAction::Deny),
-    ] {
+    // These are metadata strings only: no target volume or directory is accessed.
+    for path in [r"C:\AuraLegacyState", r"D:\AuraLegacyState"] {
         container.storage_policy.rules.push(StorageRule {
             target: StorageTarget::FileDirectory,
-            path: path.to_string_lossy().into_owned(),
-            action,
+            path: path.into(),
+            action: StorageAction::IsolatedWrite,
         });
     }
+    let historical = container.storage_policy.clone();
     let mut doc = ContainerDocument {
         schema_version: 1,
         containers: vec![container],
     };
     store.save_containers(&doc).unwrap();
+    doc.containers[0].name = "renamed information container".into();
+    store.save_containers(&doc).unwrap();
     assert_eq!(store.load_containers().unwrap(), doc);
-    let before = std::fs::read(store.containers_path()).unwrap();
-    doc.containers[0].storage_policy.rules.push(StorageRule {
-        target: StorageTarget::FileDirectory,
-        path: shared.join("second-cow").to_string_lossy().into_owned(),
-        action: StorageAction::IsolatedWrite,
-    });
-    assert!(store
-        .save_containers(&doc)
-        .unwrap_err()
-        .to_string()
-        .contains("isolated-write"));
-    assert_eq!(std::fs::read(store.containers_path()).unwrap(), before);
-    std::fs::remove_dir_all(application).unwrap();
-    std::fs::remove_dir_all(shared).unwrap();
-    std::fs::remove_dir_all(root).unwrap();
+    let snapshot = store
+        .prepare_run_snapshot(doc.containers[0].id, uuid::Uuid::new_v4())
+        .unwrap();
+    assert_eq!(snapshot.storage_policy, historical);
+    assert_eq!(snapshot.effective_profile.id, uuid::Uuid::from_u128(1));
+    assert_eq!(
+        store
+            .load_run_snapshot(snapshot.container_id, snapshot.instance_id)
+            .unwrap(),
+        snapshot
+    );
+    let resolved = std::fs::canonicalize(&root).unwrap();
+    let fixture_parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    assert_eq!(resolved.parent(), Some(fixture_parent.as_path()));
+    assert!(resolved
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("aura-container-"));
+    std::fs::remove_dir_all(resolved).unwrap();
 }
 
 #[test]

@@ -23,7 +23,7 @@ impl Nav {
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Nav::Workspaces => "工作区",
+            Nav::Workspaces => "环境容器",
             Nav::Apps => "应用",
             Nav::Profiles => "环境配置",
             Nav::Instances => "运行实例",
@@ -203,11 +203,6 @@ pub enum Message {
     WorkspaceStopAll,
     WorkspaceRunStatus,
     WorkspaceManagementResult(crate::app::workspace_management::ManagementReply),
-    WorkspaceRuleTarget(envbox_core::storage_policy::StorageTarget),
-    WorkspaceRuleAction(envbox_core::storage_policy::StorageAction),
-    WorkspaceRulePath(String),
-    WorkspaceRuleAdd,
-    WorkspaceRuleRemove(usize),
     Nav(Nav),
     Search(String),
     // Application form

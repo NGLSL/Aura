@@ -388,11 +388,17 @@ fn dns_editor_view(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::app::dns_editor::TransportChoice;
     let editor = &app.profile_draft.dns_editor;
     let mut content = column![
-        checkbox("Strict：全部上游失败时禁止回退宿主 DNS", editor.strict)
-            .on_toggle(Message::ProfileDnsStrict),
-        text("按列表顺序尝试，不自动添加上游。Host 模式单独使用宿主 DNS。"),
+        checkbox(
+            "Strict：受支持的 DNS API 失败时禁止回退宿主 DNS",
+            editor.strict
+        )
+        .on_toggle(Message::ProfileDnsStrict),
+        text("UDP、TCP、DoT、DoH 按列表顺序尝试，不自动添加上游。Host 模式使用宿主 DNS。"),
     ]
     .spacing(8);
+    content = content.push(text(
+        "应用自带 DNS/DoH/DoT/DoQ 可能绕过这些 API；浏览器 renderer 的信息覆盖需单独验证。",
+    ));
     if editor
         .upstreams
         .iter()

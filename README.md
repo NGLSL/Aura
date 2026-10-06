@@ -1,6 +1,6 @@
 # EnvBox
 
-Run Windows applications with isolated locale, region, timezone and network profiles — without a VM.
+Run Windows applications with consistent Profile environment information — without a VM.
 
 Windows process-level environment virtualization launcher. Target apps run on the host (full access to filesystem, GPU, network, user profile, Git/SSH/IDE) but see **Environment Profile** values for locale, region, UI language, timezone, DNS view, environment variables, and whitelisted internationalization registry reads.
 
@@ -67,7 +67,16 @@ When a newer version is available, choose **Download and install**. Aura downloa
 
 ## Instance lifecycle
 
-Closing Aura, or replacing Aura during an installer upgrade, leaves applications already launched by Aura running. Those detached instances keep the immutable Profile they received at launch, including for later child processes. The **Stop** action still explicitly terminates the tracked process tree. After Aura exits, its in-memory tracking is gone, so a reopened Aura cannot stop or inspect the detached instance.
+An **environment container** is a persistent workspace that selects a Profile and manages runs using immutable configuration snapshots. It changes the supported environment information that applications read; applications retain host resources and permissions. Container runs use the user-level Supervisor for background ownership, reconnect and Stop. No driver or LocalSystem service is required for this environment-information workflow.
+
+Closing Aura leaves launched applications running. Container runs can be managed after reconnecting to their Supervisor; recovery must reconfirm process generations and Runtime identity, and reports TrackingLost when ownership cannot be established. Legacy direct runs retain their detached-instance behavior: reopening Aura does not automatically take ownership of their process trees.
+
+The container view and CLI show observed Profile matching, configuration completeness and installed Hook groups. Hook installation is evidence of attachment, not proof that every API or application behaves as configured. Unobserved legacy records remain unknown. Historical storage policy metadata is retained for configuration compatibility, but is not enforced or exposed as an editable container feature.
+
+```powershell
+envbox container create --name US --profile <profile-uuid>
+envbox container list
+```
 
 ## Performance
 
@@ -84,7 +93,7 @@ Extra launch latency target: ideal &lt; 100 ms, acceptable &lt; 300 ms. Runtime 
 
 With `VirtualView` and working DNS hooks, supported `DnsQuery_A/W/UTF8` and version-1 `DnsQueryEx` queries send every resource-record type to the Profile DNS servers, including HTTPS (65), SVCB (64), TXT, PTR, SRV and unknown types. Responses are decoded by Windows' DNS message parser; record formats depend on the installed Windows version. Profile timeouts, DNS errors and unsupported query inputs return an error instead of retrying through host DNS. Query names currently require ASCII (including pre-encoded IDN punycode); Unicode names return an error. `Host` mode keeps Windows resolution unchanged.
 
-Profile DNS uses an explicit ordered list of UDP, TCP or DoT upstreams and requires `strict = true`. UDP truncation retries over TCP to the same endpoint. DoT connects to a literal IP, verifies the configured certificate identity and fails closed when local certificate or revocation checks cannot establish trust. A plaintext fallback occurs only when you configure a later UDP/TCP upstream. DoH configuration can be saved, but starting a Profile with DoH is rejected while its bootstrap isolation remains unverified. See [.scratch/dns-transports/spec.md](.scratch/dns-transports/spec.md).
+Profile DNS uses an explicit ordered list of UDP, TCP, DoT or DoH upstreams and requires `strict = true`. UDP truncation retries over TCP to the same endpoint. DoT uses a configured IP and TLS server identity; DoH uses configured bootstrap IPs and the HTTPS server identity. TLS trust, protocol or upstream failures return a resolution error or try the next explicitly configured upstream. A plaintext fallback occurs only when you configure a later UDP/TCP upstream. IPv4 upstream connections are the current delivery scope; IPv6 transport qualification is deferred, while AAAA records remain supported. See [.scratch/dns-transports/spec.md](.scratch/dns-transports/spec.md).
 
 Supported Profile lookups through address-resolution hooks (`getaddrinfo` / `GetAddrInfo*`) return a resolution error when Profile DNS fails. Unsupported asynchronous resolver inputs are rejected without calling Windows resolution; `DnsQueryRaw`, when present and hooked, is explicitly rejected in strict Profile mode. Required DNS hook failures reject Runtime initialization. Local-machine passthrough, uninjected processes and application-owned UDP/TCP DNS, DoH, DoT or DoQ remain outside this resolver guarantee. Aura does not provide a network security boundary or change the host DNS configuration.
 

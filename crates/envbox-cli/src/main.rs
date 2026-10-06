@@ -15,6 +15,12 @@ mod profile_dns;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Reject retired storage commands before default_root can inspect or migrate configuration.
+    if args.first().map(String::as_str) == Some("container")
+        && args.get(1).map(String::as_str) == Some("policy")
+    {
+        return containers::reject_legacy_policy();
+    }
     let store =
         ConfigStore::new(terminal_store_root(&args).unwrap_or_else(ConfigStore::default_root));
 
@@ -76,10 +82,6 @@ fn usage() -> ExitCode {
     eprintln!("  envbox container instances UUID");
     eprintln!("  envbox container stop UUID --instance UUID --application UUID [--request UUID]");
     eprintln!("  envbox container stop-all UUID [--request UUID]");
-    eprintln!("  envbox container policy show UUID");
-    eprintln!("  envbox container policy add UUID --target file|registry --path P --action isolated_write|shared_read_only|shared_read_write|deny");
-    eprintln!("  envbox container policy remove UUID --index N");
-    eprintln!("  envbox container policy preview UUID --target file|registry --path P");
     eprintln!("  envbox profile list");
     eprintln!("  envbox profile dns show UUID | add UUID --type udp|tcp|dot|doh [--address IP] [--port N] [--server-name NAME] [--url HTTPS_URL] [--bootstrap IP]... [--tls-revocation standard|strict_offline]");
     eprintln!("  envbox profile dns move UUID --from INDEX --to INDEX | remove UUID --index INDEX | set UUID [--mode host|virtual_view] [--strict true|false]");

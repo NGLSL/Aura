@@ -420,6 +420,7 @@ fn exercise_crash(child_tree: bool, root32: bool, child32: bool, live_root: bool
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             journal.record_schema = 2;
             journal.member_runtimes.clear();
+            journal.environment_facts = None;
             std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
         }
     }
@@ -502,7 +503,9 @@ fn exercise_crash(child_tree: bool, root32: bool, child32: bool, live_root: bool
             ))
             .unwrap();
         assert_eq!(response.status, "Running", "{:?}", response.run);
-        assert_eq!(response.run.unwrap().supervisor_generation, next.generation);
+        let result = response.run.unwrap();
+        assert_eq!(result.supervisor_generation, next.generation);
+        assert_reobserved_environment_facts(&result);
     }
     // A second real crash consumes the newly sealed record, rather than the
     // original root's proof. This catches stale known_members after root exit.
@@ -525,6 +528,7 @@ fn exercise_crash(child_tree: bool, root32: bool, child32: bool, live_root: bool
         let result = response.run.unwrap();
         assert_eq!(result.member_runtimes.len(), result.known_members.len());
         assert_eq!(result.supervisor_generation, next.generation);
+        assert_reobserved_environment_facts(&result);
     }
     let stopped = client
         .request(request(
@@ -621,4 +625,30 @@ fn exercise_crash(child_tree: bool, root32: bool, child32: bool, live_root: bool
     third_server.kill().unwrap();
     third_server.wait().unwrap();
     println!("supervisor_crash child_tree={child_tree} root32={root32} child32={child32} fresh_reconfirmed=A,B stale_generation_rejected=true stopA_keepsB_and_host=true corruptA_visibleLost_B_newRun=true");
+}
+
+fn assert_reobserved_environment_facts(result: &RunResult) {
+    assert!(!result.member_runtimes.is_empty());
+    for member in &result.member_runtimes {
+        let facts = member
+            .environment_facts
+            .as_ref()
+            .expect("fresh member observation");
+        assert!(facts.config_complete && facts.profile_matches_snapshot);
+        for group in [
+            "locale", "geo", "language", "time", "registry", "dns", "process",
+        ] {
+            assert!(facts
+                .hooks
+                .iter()
+                .any(|hook| hook.group == group && hook.attached_api_count > 0));
+        }
+    }
+    let root = result.member_runtimes.iter().find(|member| {
+        member.pid == result.root_pid && member.creation_time == result.creation_time
+    });
+    assert_eq!(
+        result.environment_facts.as_ref(),
+        root.and_then(|member| member.environment_facts.as_ref())
+    );
 }

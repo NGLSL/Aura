@@ -36,7 +36,8 @@ impl ConfigStore {
             .find(|profile| profile.id == container.profile_id)
             .ok_or_else(|| invalid(format!("Profile {} not found", container.profile_id)))?;
         validate_profile(profile)?;
-        super::containers::validate_policy_volumes(&container.storage_policy)?;
+        // Retain historical storage metadata in the immutable digest, without
+        // making unused volume qualification a Profile startup requirement.
         let snapshot = RunSnapshot::new(container, profile, instance_id)?;
         if self
             .run_snapshot_path(container_id, instance_id)

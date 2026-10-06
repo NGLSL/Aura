@@ -206,7 +206,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         info_row("控制台程序", format!("{PRODUCT_NAME} {PRODUCT_VERSION} (Native GUI)")),
         info_row(
             "虚拟化引擎",
-            format!("{ENGINE_NAME} {PRODUCT_VERSION} · 进程级环境隔离"),
+            format!("{ENGINE_NAME} {PRODUCT_VERSION} · 进程级环境信息视图"),
         ),
         info_row("底层注入框架", "Microsoft Detours 4.0.1 x64".into()),
         info_row(
@@ -276,8 +276,8 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let invariants_content = column![
         row![
-            container(badge("进程级隔离", ACCENT_BG, ACCENT_TEXT)).width(Length::Fixed(86.0)),
-            text("仅作用于 RuntimeInstance 及其派生子进程树，零宿主污染。")
+            container(badge("进程级视图", ACCENT_BG, ACCENT_TEXT)).width(Length::Fixed(86.0)),
+            text("Profile 信息视图作用于实例及受支持子进程；未覆盖的读取入口仍可能返回宿主信息。")
                 .size(12)
                 .color(INK_2)
                 .font(font::ui_font()),
@@ -294,8 +294,8 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         .spacing(12)
         .align_y(Alignment::Center),
         row![
-            container(badge("安全降级", SUCCESS_BG, SUCCESS_TEXT)).width(Length::Fixed(86.0)),
-            text("Hook 异常或未处理 API 时优先直通 Windows 原生调用，禁止静默失败。")
+            container(badge("兼容回退", SUCCESS_BG, SUCCESS_TEXT)).width(Length::Fixed(86.0)),
+            text("多数 Hook 遇到异常或未处理入口时兼容回退；Strict DNS 失败时禁止回退宿主 DNS，注入失败则拒绝启动。")
                 .size(12)
                 .color(INK_2)
                 .font(font::ui_font()),
@@ -316,8 +316,8 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let invariants_card = section_card(
         Icon::Check,
-        "核心设计原则与安全保证",
-        "遵循 EnvBox 架构设计准则，保证系统稳定可靠",
+        "环境视图与覆盖边界",
+        "Profile 覆盖已支持入口；应用自带 DNS 与浏览器沙箱进程需单独验证",
         invariants_content.into(),
     );
 

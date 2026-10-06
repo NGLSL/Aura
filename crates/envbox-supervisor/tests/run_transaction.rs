@@ -129,6 +129,19 @@ fn public_run_uses_immutable_snapshot_and_is_idempotent() {
     assert_eq!(first.status, "Running", "{:?}", first.run);
     let first_run = first.run.unwrap();
     assert!(first_run.root_pid > 0);
+    let environment = first_run
+        .environment_facts
+        .as_ref()
+        .expect("actual root observation");
+    assert!(environment.config_complete && environment.profile_matches_snapshot);
+    assert!(environment
+        .hooks
+        .iter()
+        .any(|hook| hook.group == "dns" && hook.attached_api_count > 0));
+    assert_eq!(
+        first_run.member_runtimes[0].environment_facts.as_ref(),
+        Some(environment)
+    );
     assert!(!first_run.storage_policy_enforced);
     assert_eq!(first_run.configuration_id, snapshot.configuration_id);
     let replay = client.request(request.clone()).unwrap();

@@ -50,7 +50,7 @@ impl Container {
         }
         if self.mode != ContainerMode::Compatibility {
             return Err(DomainError::InvalidContainer(format!(
-                "unsupported mode {:?}; no isolation backend is available",
+                "unsupported mode {:?}; environment information containers use Compatibility mode",
                 self.mode
             )));
         }

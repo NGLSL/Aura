@@ -392,6 +392,7 @@ mod tests {
                 runtime_module_sha256: String::new(),
                 runtime_config_sha256: String::new(),
                 runtime_version: String::new(),
+                environment_facts: None,
                 audit: false,
                 inherit_children: true,
                 known_members: vec![],

@@ -3,6 +3,13 @@ use envbox_storage::ConfigStore;
 use std::process::ExitCode;
 use uuid::Uuid;
 
+const LEGACY_POLICY_UNSUPPORTED: &str = "container policy is unsupported: environment-information containers do not isolate file or Registry writes; historical storage policy configuration is preserved and inactive";
+
+pub fn reject_legacy_policy() -> ExitCode {
+    eprintln!("error: {LEGACY_POLICY_UNSUPPORTED}");
+    ExitCode::FAILURE
+}
+
 pub fn command(store: &ConfigStore, args: &[String]) -> ExitCode {
     match execute(store, args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -30,7 +37,7 @@ fn execute(store: &ConfigStore, args: &[String]) -> Result<(), String> {
         return snapshot_command(store, args);
     }
     if args.first().map(String::as_str) == Some("policy") {
-        return policy_command(store, &args[1..]);
+        return Err(LEGACY_POLICY_UNSUPPORTED.into());
     }
     let mut doc = store.load_containers().map_err(|err| err.to_string())?;
     if args.first().map(String::as_str) == Some("list") && args.len() == 1 {
@@ -70,8 +77,7 @@ fn execute(store: &ConfigStore, args: &[String]) -> Result<(), String> {
             "--mode" => {
                 workspace.mode = match value.as_str() {
                     "compatibility" => ContainerMode::Compatibility,
-                    "container" => ContainerMode::Container,
-                    "strong" => ContainerMode::Strong,
+                    "container" | "strong" => return Err("environment-information containers support only compatibility mode; container/strong resource isolation is outside this product scope".into()),
                     _ => return Err(format!("unknown mode {value}")),
                 }
             }
@@ -167,18 +173,19 @@ fn control_command(args: &[String]) -> Result<(), String> {
             "status\t{}\nrequest_id\t{}\ncontainer_id\t{}\nscope\tcurrent_supervisor_generation\nrestart_recovery\tverified_job_and_runtime_only\nrecovery_limit\tunknown_members_or_missing_job_reports_tracking_lost",
             response.status, request_id, container_id
         );
-        println!("instance_id\tapplication_id\tstate\troot_pid\tactive_members\tmode\tstorage_policy_enforced");
+        print_environment_limits();
+        println!("instance_id\tapplication_id\tstate\troot_pid\tactive_members\tmode");
         for view in response.instances {
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 view.result.instance_id,
                 view.result.application_id,
                 view.result.state,
                 view.result.root_pid,
                 view.process_ids.len(),
-                view.result.mode,
-                view.result.storage_policy_enforced
+                view.result.mode
             );
+            print_runtime_observations(&view.result);
             if let Some(error) = view.result.error {
                 eprintln!("instance {}: {error}", view.result.instance_id);
             }
@@ -263,7 +270,9 @@ fn run_command(store: &ConfigStore, args: &[String]) -> Result<(), String> {
         let result = response
             .run
             .ok_or_else(|| format!("Supervisor {}", response.status))?;
-        println!("status\t{}\nrequest_id\t{}\ncontainer_id\t{}\ninstance_id\t{}\nroot_pid\t{}\nmode\t{}\nentry_guarantee\t{}\nstorage_policy_enforced\t{}\nconfiguration_id\t{}", response.status, request_id, result.container_id, result.instance_id, result.root_pid, result.mode, result.entry_guarantee, result.storage_policy_enforced, result.configuration_id);
+        println!("status\t{}\nrequest_id\t{}\ncontainer_id\t{}\ninstance_id\t{}\nroot_pid\t{}\nmode\t{}\nentry_guarantee\t{}\nconfiguration_id\t{}", response.status, request_id, result.container_id, result.instance_id, result.root_pid, result.mode, result.entry_guarantee, result.configuration_id);
+        print_environment_limits();
+        print_runtime_observations(&result);
         if let Some(error) = result.error {
             return Err(error);
         }
@@ -312,107 +321,61 @@ fn toml_snapshot(snapshot: &envbox_core::RunSnapshot) -> Result<String, String> 
     toml::to_string_pretty(snapshot).map_err(|err| err.to_string())
 }
 
-fn policy_command(store: &ConfigStore, args: &[String]) -> Result<(), String> {
-    use envbox_core::storage_policy::{StorageAction, StorageRule, StorageTarget};
-    let action = args
-        .first()
-        .map(String::as_str)
-        .ok_or("policy requires show|add|remove|preview")?;
-    let id: Uuid = args
-        .get(1)
-        .ok_or("policy requires Container UUID")?
-        .parse()
-        .map_err(|_| "invalid Container UUID")?;
-    let mut doc = store.load_containers().map_err(|err| err.to_string())?;
-    let workspace = doc
-        .containers
-        .iter_mut()
-        .find(|workspace| workspace.id == id)
-        .ok_or("Container UUID not found")?;
-    if action == "show" && args.len() == 2 {
-        println!("container\t{id}\nschema\t{}\nbackend\tunsupported\ndefault_write\tdeny\npreview_only\ttrue", workspace.storage_policy.schema_version);
-        for (index, rule) in workspace.storage_policy.rules.iter().enumerate() {
-            println!(
-                "{index}\t{:?}\t{:?}\t{}\thost_write_exception={}",
-                rule.target,
-                rule.action,
-                rule.path,
-                rule.action == StorageAction::SharedReadWrite
-            );
-        }
-        return Ok(());
+#[cfg(windows)]
+fn print_environment_limits() {
+    println!("environment_scope\tprofile_information_view");
+    println!("coverage_limit\tapplication_owned_dns_can_bypass_windows_dns_api_hooks");
+    println!("coverage_limit\tun_injected_processes_and_sandboxed_browser_renderers_may_read_host_information");
+    println!("entry_limit\tentry_gate_excludes_tls_callbacks_and_import_initializers");
+    println!("observation_limit\thook_installation_does_not_verify_api_semantics_or_complete_process_tree_coverage");
+}
+
+#[cfg(windows)]
+fn print_runtime_observations(result: &envbox_supervisor::RunResult) {
+    print_runtime_facts(
+        result.instance_id,
+        result.root_pid,
+        "root",
+        result.environment_facts.as_ref(),
+    );
+    for member in &result.member_runtimes {
+        print_runtime_facts(
+            result.instance_id,
+            member.pid,
+            "observed_member",
+            member.environment_facts.as_ref(),
+        );
     }
-    let mut target = None;
-    let mut path = None;
-    let mut configured_action = None;
-    let mut rule_index = None;
-    let mut seen = std::collections::HashSet::new();
-    let mut cursor = 2;
-    while cursor < args.len() {
-        let flag = &args[cursor];
-        if !seen.insert(flag) {
-            return Err(format!("duplicate flag {flag}"));
+}
+
+#[cfg(windows)]
+fn print_runtime_facts(
+    instance_id: Uuid,
+    pid: u32,
+    subject: &str,
+    facts: Option<&envbox_supervisor::EnvironmentRuntimeFacts>,
+) {
+    let (config_complete, profile_matches_snapshot) = facts.map_or_else(
+        || ("unknown".into(), "unknown".into()),
+        |facts| {
+            (
+                facts.config_complete.to_string(),
+                facts.profile_matches_snapshot.to_string(),
+            )
+        },
+    );
+    println!(
+        "runtime_observation\t{instance_id}\t{pid}\t{subject}\tconfig_complete={config_complete}\tprofile_matches_snapshot={profile_matches_snapshot}"
+    );
+    match facts {
+        Some(facts) => {
+            for hook in &facts.hooks {
+                println!(
+                    "installed_hook\t{instance_id}\t{pid}\t{}\t{}",
+                    hook.group, hook.attached_api_count,
+                );
+            }
         }
-        let value = args
-            .get(cursor + 1)
-            .ok_or_else(|| format!("{flag} requires value"))?;
-        match flag.as_str() {
-            "--target" => {
-                target = Some(match value.as_str() {
-                    "file" => StorageTarget::FileDirectory,
-                    "registry" => StorageTarget::RegistrySubtree,
-                    _ => return Err("target must be file|registry".into()),
-                })
-            }
-            "--path" => path = Some(value.clone()),
-            "--action" => {
-                configured_action =
-                    Some(match value.as_str() {
-                        "isolated_write" => StorageAction::IsolatedWrite,
-                        "shared_read_only" => StorageAction::SharedReadOnly,
-                        "shared_read_write" => StorageAction::SharedReadWrite,
-                        "deny" => StorageAction::Deny,
-                        _ => return Err(
-                            "action must be isolated_write|shared_read_only|shared_read_write|deny"
-                                .into(),
-                        ),
-                    })
-            }
-            "--index" => {
-                rule_index = Some(value.parse::<usize>().map_err(|_| "invalid rule index")?)
-            }
-            _ => return Err(format!("unknown policy flag {flag}")),
-        }
-        cursor += 2;
+        None => println!("installed_hooks\t{instance_id}\t{pid}\tunknown"),
     }
-    match action {
-        "add" if rule_index.is_none() => workspace.storage_policy.rules.push(StorageRule {
-            target: target.ok_or("--target required")?,
-            path: path.ok_or("--path required")?,
-            action: configured_action.ok_or("--action required")?,
-        }),
-        "remove" if target.is_none() && path.is_none() && configured_action.is_none() => {
-            let index = rule_index.ok_or("--index required")?;
-            if index >= workspace.storage_policy.rules.len() {
-                return Err("rule index not found".into());
-            }
-            workspace.storage_policy.rules.remove(index);
-        }
-        "preview" if configured_action.is_none() && rule_index.is_none() => {
-            let preview = workspace
-                .storage_policy
-                .preview(
-                    target.ok_or("--target required")?,
-                    &path.ok_or("--path required")?,
-                    &store.root().to_string_lossy(),
-                )
-                .map_err(|err| err.to_string())?;
-            println!("configured_action\t{:?}\nmatched_rule\t{:?}\nhost_write_exception\t{}\ncan_authorize\tfalse\nbackend\tunsupported\nreason\tfinal object identity/reparse/volume must be verified by backend; this is lexical preview", preview.configured_action, preview.matched_rule, preview.host_write_exception);
-            return Ok(());
-        }
-        _ => return Err("invalid policy command or flags; use show|add|remove|preview".into()),
-    }
-    store.save_containers(&doc).map_err(|err| err.to_string())?;
-    println!("saved configuration for {id}; backend unsupported, no host write authorization");
-    Ok(())
 }

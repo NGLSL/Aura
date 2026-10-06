@@ -69,7 +69,8 @@ impl ConfigStore {
         let existing = self.load_containers()?;
         let profiles = self.load_profiles()?;
         for workspace in &doc.containers {
-            validate_policy_volumes(&workspace.storage_policy)?;
+            // Historical storage metadata is preserved, not enforced by the
+            // environment information container. It must not require a volume backend.
             if !profiles
                 .profiles
                 .iter()
@@ -122,78 +123,6 @@ impl ConfigStore {
         }
         result
     }
-}
-
-pub(super) fn validate_policy_volumes(
-    policy: &envbox_core::storage_policy::StoragePolicy,
-) -> Result<(), StorageError> {
-    use envbox_core::storage_policy::{normalize_storage_path, StorageAction, StorageTarget};
-    let mut drive = None;
-    for rule in &policy.rules {
-        if rule.target != StorageTarget::FileDirectory {
-            continue;
-        }
-        let normalized = normalize_storage_path(rule.target, &rule.path)?;
-        let current = &normalized[..2];
-        if rule.action == StorageAction::IsolatedWrite
-            && drive.as_ref().is_some_and(|previous| previous != current)
-        {
-            return Err(DomainError::InvalidContainer(
-                "storage policy: cross-volume isolated-write scopes are unsupported".into(),
-            )
-            .into());
-        }
-        if rule.action == StorageAction::IsolatedWrite {
-            drive = Some(current.to_owned());
-        }
-        #[cfg(windows)]
-        {
-            use windows::core::PCWSTR;
-            use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
-            let root: Vec<u16> = format!("{current}\\")
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            if unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 3 {
-                return Err(DomainError::InvalidContainer(
-                    "storage policy: only local fixed NTFS volumes are supported".into(),
-                )
-                .into());
-            }
-            let mut filesystem = [0u16; 64];
-            unsafe {
-                GetVolumeInformationW(
-                    PCWSTR(root.as_ptr()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&mut filesystem),
-                )
-            }
-            .map_err(|err| {
-                DomainError::InvalidContainer(format!(
-                    "storage policy: volume qualification failed: {err}"
-                ))
-            })?;
-            let end = filesystem
-                .iter()
-                .position(|ch| *ch == 0)
-                .unwrap_or(filesystem.len());
-            if !String::from_utf16_lossy(&filesystem[..end]).eq_ignore_ascii_case("NTFS") {
-                return Err(DomainError::InvalidContainer(
-                    "storage policy: volume is not NTFS".into(),
-                )
-                .into());
-            }
-        }
-        #[cfg(not(windows))]
-        return Err(DomainError::InvalidContainer(
-            "storage policy: NTFS qualification requires Windows".into(),
-        )
-        .into());
-    }
-    Ok(())
 }
 
 pub(super) fn atomic_replace(

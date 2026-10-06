@@ -1,5 +1,6 @@
 use crate::{
-    ManagedTarget, MemberRuntimeIdentity, ProcessIdentity, RunCommand, RunResult, RunView,
+    EnvironmentRuntimeFacts, InstalledHookFact, ManagedTarget, MemberRuntimeIdentity,
+    ProcessIdentity, RunCommand, RunResult, RunView,
 };
 use envbox_core::{ConsoleHost, ContainerMode, LaunchTarget, RunSnapshot};
 use envbox_launcher::{
@@ -666,6 +667,7 @@ impl Runs {
                             next.record_schema = 3;
                             next.known_members = known;
                             next.member_runtimes = facts;
+                            next.environment_facts = root_environment_facts(&next);
                             next.state = next_state.into();
                             next.error = None;
                             let path = self
@@ -949,6 +951,7 @@ impl Runs {
             runtime_module_sha256: String::new(),
             runtime_config_sha256: String::new(),
             runtime_version: String::new(),
+            environment_facts: None,
             audit: application.audit,
             inherit_children: true,
             known_members: vec![],
@@ -1022,6 +1025,7 @@ impl Runs {
                 runtime_module_sha256: observed.module_sha256.clone(),
                 runtime_config_sha256: observed.config_sha256.clone(),
                 runtime_version: observed.identity.runtime_version.clone(),
+                environment_facts: Some(environment_facts(&observed.identity)),
                 member_runtimes: vec![MemberRuntimeIdentity {
                     pid: identity.pid,
                     creation_time: identity.creation_time,
@@ -1029,6 +1033,7 @@ impl Runs {
                     module_sha256: observed.module_sha256.clone(),
                     config_sha256: observed.config_sha256.clone(),
                     runtime_version: observed.identity.runtime_version.clone(),
+                    environment_facts: Some(environment_facts(&observed.identity)),
                 }],
                 known_members: vec![ProcessIdentity {
                     pid: identity.pid,
@@ -1235,6 +1240,32 @@ fn control_status(results: &[RunView]) -> &'static str {
     }
 }
 
+/// Call only after broker authentication and immutable Profile equality checks.
+fn environment_facts(identity: &envbox_launcher::ipc::RuntimeIdentity) -> EnvironmentRuntimeFacts {
+    EnvironmentRuntimeFacts {
+        config_complete: identity.config_complete,
+        profile_matches_snapshot: true,
+        hooks: identity
+            .hooks
+            .iter()
+            .map(|(group, count)| InstalledHookFact {
+                group: group.clone(),
+                attached_api_count: *count,
+            })
+            .collect(),
+    }
+}
+
+fn root_environment_facts(result: &RunResult) -> Option<EnvironmentRuntimeFacts> {
+    result
+        .member_runtimes
+        .iter()
+        .find(|member| {
+            member.pid == result.root_pid && member.creation_time == result.creation_time
+        })
+        .and_then(|member| member.environment_facts.clone())
+}
+
 fn member_facts(
     run: &OwnedRun,
     members: &[ManagedTarget],
@@ -1294,6 +1325,7 @@ fn member_facts(
             module_sha256: observed.module_sha256.clone(),
             config_sha256: observed.config_sha256.clone(),
             runtime_version: observed.identity.runtime_version.clone(),
+            environment_facts: Some(environment_facts(&observed.identity)),
         });
     }
     facts.sort_by_key(|fact| (fact.pid, fact.creation_time));
@@ -1334,6 +1366,7 @@ fn sealed_member_facts(
                 module_sha256: result.runtime_module_sha256.clone(),
                 config_sha256: result.runtime_config_sha256.clone(),
                 runtime_version: result.runtime_version.clone(),
+                environment_facts: None,
             })
             .collect());
     }
@@ -1462,6 +1495,7 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         ));
     }
     let sealed = sealed_member_facts(&result, &members)?;
+    let mut fresh_facts = Vec::with_capacity(sealed.len());
     for fact in &sealed {
         if fact.config_sha256 != result.runtime_config_sha256
             || fact.runtime_version != env!("CARGO_PKG_VERSION")
@@ -1528,6 +1562,9 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
                 "fresh Runtime identity does not match sealed instance",
             ));
         }
+        let mut fresh = fact.clone();
+        fresh.environment_facts = Some(environment_facts(&observed.identity));
+        fresh_facts.push(fresh);
     }
     let confirmed = job
         .stats()
@@ -1546,7 +1583,8 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
     run.result.supervisor_generation = generation.into();
     run.result.error = None;
     run.result.record_schema = 3;
-    run.result.member_runtimes = sealed;
+    run.result.member_runtimes = fresh_facts;
+    run.result.environment_facts = root_environment_facts(&run.result);
     run.result.known_members = members
         .iter()
         .map(|member| ProcessIdentity {
@@ -1631,7 +1669,7 @@ fn validate_launch(
     if snapshot.mode != ContainerMode::Compatibility {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Container and Strong isolation backends are unavailable",
+            "Container and Strong storage/access isolation modes are outside the current Compatibility environment-information container scope",
         ));
     }
     if !application.inherit_children
@@ -1662,6 +1700,7 @@ pub(crate) fn failed(command: &RunCommand, error: &str) -> (String, RunResult) {
             runtime_module_sha256: String::new(),
             runtime_config_sha256: String::new(),
             runtime_version: String::new(),
+            environment_facts: None,
             audit: false,
             inherit_children: false,
             known_members: vec![],
@@ -1681,6 +1720,78 @@ pub(crate) fn failed(command: &RunCommand, error: &str) -> (String, RunResult) {
 #[cfg(test)]
 mod member_evidence_tests {
     use super::*;
+
+    #[test]
+    fn legacy_records_do_not_invent_environment_facts() {
+        let mut value = serde_json::to_value(record(3)).unwrap();
+        value.as_object_mut().unwrap().remove("environment_facts");
+        for member in value["member_runtimes"].as_array_mut().unwrap() {
+            member.as_object_mut().unwrap().remove("environment_facts");
+        }
+        let restored: RunResult = serde_json::from_value(value).unwrap();
+        assert!(restored.environment_facts.is_none());
+        assert!(restored
+            .member_runtimes
+            .iter()
+            .all(|member| member.environment_facts.is_none()));
+        let legacy_candidates = sealed_member_facts(
+            &record(2),
+            &[ManagedTarget {
+                pid: 1,
+                creation_time: 11,
+            }],
+        )
+        .unwrap();
+        assert!(legacy_candidates[0].environment_facts.is_none());
+    }
+
+    #[test]
+    fn observed_hook_counts_survive_durable_record_without_implying_coverage() {
+        let identity = envbox_launcher::ipc::RuntimeIdentity {
+            pid: 1,
+            creation_time: 11,
+            protocol: envbox_launcher::ipc::RUNTIME_IDENTITY_PROTOCOL,
+            runtime_version: env!("CARGO_PKG_VERSION").into(),
+            module_path: "fixture.dll".into(),
+            actual_profile: "fixture profile already verified by caller".into(),
+            config_complete: true,
+            hooks: vec![
+                ("locale".into(), 14),
+                ("dns".into(), 2),
+                ("future_group".into(), 0),
+            ],
+        };
+        let facts = environment_facts(&identity);
+        assert!(facts.config_complete && facts.profile_matches_snapshot);
+        assert_eq!(facts.hooks[2].attached_api_count, 0);
+        let mut result = record(3);
+        result.root_pid = 1;
+        result.creation_time = 11;
+        result.member_runtimes[0].environment_facts = Some(facts.clone());
+        result.environment_facts = root_environment_facts(&result);
+        let root = std::env::temp_dir().join(format!("aura-environment-facts-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("run.json");
+        atomic_record(&path, &result).unwrap();
+        let restored: RunResult = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.environment_facts, Some(facts.clone()));
+        assert_eq!(restored.member_runtimes[0].environment_facts, Some(facts));
+        result.creation_time = 12;
+        assert!(root_environment_facts(&result).is_none());
+        result.member_runtimes.remove(0);
+        assert!(root_environment_facts(&result).is_none());
+        let cleanup_root = std::fs::canonicalize(&root).unwrap();
+        let temporary_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(cleanup_root.is_absolute());
+        assert_eq!(cleanup_root.parent(), Some(temporary_root.as_path()));
+        assert!(cleanup_root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("aura-environment-facts-"));
+        std::fs::remove_dir_all(cleanup_root).unwrap();
+    }
 
     #[test]
     fn bundle_resolution_is_bound_to_the_original_stable_file_identity() {
@@ -2255,6 +2366,7 @@ mod member_evidence_tests {
                 module_sha256: format!("sha-{}", member.pid),
                 config_sha256: "config-sha".into(),
                 runtime_version: env!("CARGO_PKG_VERSION").into(),
+                environment_facts: None,
             })
             .collect();
         result
@@ -2372,6 +2484,7 @@ mod member_evidence_tests {
                 module_sha256: expected_hash.clone(),
                 config_sha256: String::new(),
                 runtime_version: String::new(),
+                environment_facts: None,
             }],
             std::time::Instant::now() + std::time::Duration::from_secs(4),
         )
@@ -2390,6 +2503,7 @@ mod member_evidence_tests {
                 module_sha256: expected_hash,
                 config_sha256: String::new(),
                 runtime_version: String::new(),
+                environment_facts: None,
             }],
             std::time::Instant::now() + std::time::Duration::from_secs(4),
         )

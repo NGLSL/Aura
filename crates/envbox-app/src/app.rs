@@ -732,19 +732,6 @@ impl EnvBoxApp {
             Message::WorkspaceManagementResult(value) => {
                 return self.finish_workspace_management(value)
             }
-            Message::WorkspaceRuleTarget(value) => self.workspaces.rule_draft.target = value,
-            Message::WorkspaceRuleAction(value) => self.workspaces.rule_draft.action = value,
-            Message::WorkspaceRulePath(value) => self.workspaces.rule_draft.path = value,
-            Message::WorkspaceRuleAdd => {
-                if let Err(err) = self.workspaces.add_rule(&self.store) {
-                    self.workspaces.error = Some(err);
-                }
-            }
-            Message::WorkspaceRuleRemove(index) => {
-                if index < self.workspaces.draft.storage_policy.rules.len() {
-                    self.workspaces.draft.storage_policy.rules.remove(index);
-                }
-            }
             Message::AppNew => return self.request_navigation(PendingNavigation::NewApp),
             Message::AppPickerQuery(q) => {
                 if let Some(p) = self.app_picker.as_mut() {

@@ -46,6 +46,9 @@ pub struct RunResult {
     pub runtime_config_sha256: String,
     #[serde(default)]
     pub runtime_version: String,
+    /// Last authenticated root observation; absent on legacy/unobserved records.
+    #[serde(default)]
+    pub environment_facts: Option<EnvironmentRuntimeFacts>,
     #[serde(default)]
     pub audit: bool,
     #[serde(default)]
@@ -79,6 +82,22 @@ pub struct MemberRuntimeIdentity {
     pub module_sha256: String,
     pub config_sha256: String,
     pub runtime_version: String,
+    #[serde(default)]
+    pub environment_facts: Option<EnvironmentRuntimeFacts>,
+}
+
+/// Installation facts, not proof of API semantics or complete process coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentRuntimeFacts {
+    pub config_complete: bool,
+    pub profile_matches_snapshot: bool,
+    pub hooks: Vec<InstalledHookFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledHookFact {
+    pub group: String,
+    pub attached_api_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
