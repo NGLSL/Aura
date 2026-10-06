@@ -13,8 +13,12 @@ foreach ($name in @('LIB','LIBPATH','INCLUDE','VSINSTALLDIR','VCINSTALLDIR','VCT
     'VSCMD_VER','VSCMD_ARG_TGT_ARCH','VSCMD_ARG_HOST_ARCH')) {
     [Environment]::SetEnvironmentVariable($name, $null, 'Process')
 }
+# Git for Windows also ships link.exe. Hide PATH-provided linkers so rustc
+# discovers MSVC with the correct host/target SDK library environment.
 $env:PATH = (($env:PATH -split ';') | Where-Object {
-    $_ -notmatch '(?i)[\\/]VC[\\/]Tools[\\/]MSVC[\\/].*[\\/]bin(?:[\\/]|$)'
+    $_ -and
+    $_ -notmatch '(?i)[\\/]VC[\\/]Tools[\\/]MSVC[\\/].*[\\/]bin(?:[\\/]|$)' -and
+    !(Test-Path -LiteralPath (Join-Path $_ 'link.exe'))
 }) -join ';'
 New-Item -ItemType Directory -Path $BuildDirectory -Force | Out-Null
 $product = Join-Path $BuildDirectory 'doh-product'
