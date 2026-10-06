@@ -370,6 +370,7 @@ mod tests {
 
     fn sample_profile() -> EnvironmentProfile {
         EnvironmentProfile {
+            identity: Default::default(),
             id: Uuid::nil(),
             name: "US Development".into(),
             locale: LocaleProfile {

@@ -51,7 +51,7 @@ pub use package_discovery::{
 pub use process_tracker::{ProcessTracker, TrackMode};
 pub use recovery::{
     read_runtime_capabilities, request_runtime_reconnect, validate_runtime_for_profile,
-    RecoveryError, RuntimeCapabilities,
+    validate_runtime_identity, RecoveryError, RuntimeCapabilities,
 };
 pub use session::{
     belongs, register_child, start_session, start_session_gated, start_session_in_named_job,

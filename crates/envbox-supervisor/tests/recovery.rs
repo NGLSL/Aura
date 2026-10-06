@@ -221,6 +221,7 @@ fn exercise_crash(child_tree: bool, root32: bool, child32: bool, live_root: bool
         ]),
         registry: Default::default(),
         browser: Default::default(),
+        identity: Default::default(),
     };
     let a = Container::new("A", profile.id);
     let b = Container::new("B", profile.id);

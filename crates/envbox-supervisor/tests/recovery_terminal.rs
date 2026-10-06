@@ -67,6 +67,7 @@ fn missing_job_with_absent_sealed_generations_stays_tracking_lost() {
         environment: Default::default(),
         registry: Default::default(),
         browser: Default::default(),
+        identity: Default::default(),
     };
     let container = Container::new("NoJob terminal", profile.id);
     let instance_id = Uuid::new_v4();

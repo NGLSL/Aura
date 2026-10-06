@@ -89,6 +89,7 @@ fn native_entry_marker_requires_approved_runtime() {
         let marker = root.join("entry.txt");
         let tls_marker = root.join("tls.txt");
         let profile = EnvironmentProfile {
+            identity: Default::default(),
             id: uuid::Uuid::new_v4(),
             name: "gate-fixture".into(),
             locale: LocaleProfile {
@@ -271,6 +272,7 @@ fn public_gated_session_publishes_only_approved_entry() {
         let marker = root.join("entry.txt");
         let tls_marker = root.join("tls.txt");
         let profile = EnvironmentProfile {
+            identity: Default::default(),
             id: uuid::Uuid::new_v4(),
             name: "public-gate-fixture".into(),
             locale: LocaleProfile {
@@ -391,6 +393,7 @@ fn cmd_intermediary_preserves_child_identity_gate_and_job() {
         let marker = root.join("entry.txt");
         let facts = root.join("process.txt");
         let profile = EnvironmentProfile {
+            identity: Default::default(),
             id: uuid::Uuid::new_v4(),
             name: "cmd-child-fixture".into(),
             locale: LocaleProfile {
@@ -530,6 +533,7 @@ fn creation_job_membership_precedes_resume_and_injection_failure_is_clean() {
             std::fs::create_dir(&root).unwrap();
             let marker = root.join("entry.txt");
             let profile = EnvironmentProfile {
+                identity: Default::default(),
                 id: uuid::Uuid::new_v4(),
                 name: "atomic-job-fixture".into(),
                 locale: LocaleProfile {

@@ -258,6 +258,38 @@ unsafe extern "system" fn dns_query_ex_reentry_completion(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--identity-json") {
+        let mut values: std::collections::BTreeMap<String, String> =
+            envbox_probe::identity::collect()
+                .fields
+                .into_iter()
+                .map(|field| (field.name, field.value))
+                .collect();
+        values.insert("RuntimeLoaded".into(), runtime_loaded().to_string());
+        println!(
+            "{}",
+            serde_json::to_string(&values).expect("identity strings serialize")
+        );
+        if let Some(index) = args.iter().position(|arg| arg == "--identity-child") {
+            let Some(path) = args.get(index + 1) else {
+                return ExitCode::FAILURE;
+            };
+            // Child propagation must restore immutable Profile identity rather than
+            // trust a caller's rewritten inherited environment.
+            let status = Command::new(path)
+                .arg("--identity-json")
+                .env("ENVBOX_IDENTITY_COMPUTER_NAME", "POISON")
+                .env("ENVBOX_IDENTITY_USER_NAME", "POISON")
+                .env("COMPUTERNAME", "POISON")
+                .env("USERNAME", "POISON")
+                .status();
+            return match status {
+                Ok(status) if status.success() => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            };
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Some(index) = args.iter().position(|arg| arg == "--udp-send-to") {
         let Some(target) = args
             .get(index + 1)

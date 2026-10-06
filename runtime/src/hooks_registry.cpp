@@ -158,6 +158,8 @@ static int IsWhitelisted(const wchar_t* path) {
   if (path == nullptr || path[0] == L'\0') {
     return 0;
   }
+  if (EnvBoxProfile()->identity_machine_guid[0] &&
+      _wcsicmp(path, L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography") == 0) return 1;
   if (PathEqualsOrUnder(path, kIntlPath) || PathEqualsOrUnder(path, kTzPath) ||
       IsDnsVirtualPath(path)) {
     return 1;
@@ -321,6 +323,11 @@ static VirtualResult VirtualValue(const wchar_t* path, const wchar_t* value_name
   if (value_name == nullptr) {
     return kVirtualMiss;
   }
+
+  if (pfl->identity_machine_guid[0] &&
+      _wcsicmp(path, L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography") == 0 &&
+      _wcsicmp(value_name, L"MachineGuid") == 0)
+    return WriteSz(pfl->identity_machine_guid, lpType, lpData, lpcbData);
 
   if (IsHiddenDnsValue(path, value_name)) {
     return kVirtualHidden;
@@ -533,6 +540,7 @@ static LSTATUS WINAPI HookRegGetValueW(HKEY hkey, LPCWSTR lpSubKey,
                                        LPDWORD pcbData) {
   wchar_t path[260];
   if (JoinPath(hkey, lpSubKey, path, 260) && IsWhitelisted(path)) {
+    const DWORD original_capacity = pcbData ? *pcbData : 0;
     DWORD type = 0;
     LPDWORD type_out = pdwType ? pdwType : &type;
     VirtualResult v =
@@ -556,7 +564,7 @@ static LSTATUS WINAPI HookRegGetValueW(HKEY hkey, LPCWSTR lpSubKey,
         if ((want & RRF_RT_REG_EXPAND_SZ) && t == REG_EXPAND_SZ) match = 1;
         if (!match) {
           if ((dwFlags & RRF_ZEROONFAILURE) && pvData && pcbData) {
-            memset(pvData, 0, *pcbData);
+            memset(pvData, 0, original_capacity);
           }
           EnvBoxAuditEventW("RegGetValueW", 1, lpValue ? lpValue : L"(default)");
           return ERROR_UNSUPPORTED_TYPE;
@@ -565,7 +573,7 @@ static LSTATUS WINAPI HookRegGetValueW(HKEY hkey, LPCWSTR lpSubKey,
       LSTATUS st = VirtualToStatus(v);
       if (st != ERROR_SUCCESS && (dwFlags & RRF_ZEROONFAILURE) && pvData &&
           pcbData) {
-        memset(pvData, 0, *pcbData);
+        memset(pvData, 0, original_capacity);
       }
       EnvBoxAuditEventW("RegGetValueW", 1, lpValue ? lpValue : L"(default)");
       return st;

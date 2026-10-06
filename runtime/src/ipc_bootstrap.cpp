@@ -539,7 +539,14 @@ int FillProfileFromMsg(const IpcMsg* m, RuntimeProfile* out) {
   }
   out->inherit_children = ParseFlag(m, "inherit_children", 1);
   out->audit = ParseFlag(m, "audit", 0);
-  if (!DecodeDnsMessage(m, out)) return 0;
+  const char* identity_keys[] = {"identity_computer_name", "identity_user_name", "identity_mac_address", "identity_machine_guid"};
+  for (int i = 0; i < m->count; ++i) if (strncmp(m->key[i], "identity_", 9) == 0) {
+    bool known = false;
+    for (const char* key : identity_keys) if (strcmp(key, m->key[i]) == 0) known = true;
+    if (!known) return 0;
+    for (int j = 0; j < i; ++j) if (strcmp(m->key[j], m->key[i]) == 0) return 0;
+  }
+  if (!DecodeDnsMessage(m, out) || !EnvBoxDecodeIdentityConfiguration(out, DnsMessageField, const_cast<IpcMsg*>(m))) return 0;
   // VirtualView + empty dns_servers stays VirtualView: no virtual resolve, but
   // Network Guard can close external UDP/53 (empty allowlist).
   out->registry_path_count =
@@ -783,7 +790,7 @@ extern "C" DWORD WINAPI EnvBoxRuntimeReconnect(void* parameter) {
 int EnvBoxIpcNotifyRuntimeIdentity(HINSTANCE module, const int* counts,
                                     size_t count) {
   const RuntimeProfile* p = EnvBoxProfile();
-  if (p == nullptr || counts == nullptr || count != 10) return 0;
+  if (p == nullptr || counts == nullptr || count != 11) return 0;
   // Serialize actual immutable Runtime values, not a supplied snapshot token.
   auto wide = [](const wchar_t* value) {
     int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1,
@@ -822,7 +829,8 @@ int EnvBoxIpcNotifyRuntimeIdentity(HINSTANCE module, const int* counts,
     } else AppendKv(config, key, value);
     return config->size() < kMaxLine;
   };
-  if (!EnvBoxEmitDnsConfiguration(p, dns_field, &actual)) return 0;
+  if (!EnvBoxEmitDnsConfiguration(p, dns_field, &actual) ||
+      !EnvBoxEmitIdentityConfiguration(p, dns_field, &actual)) return 0;
   for (int i = 0; i < p->registry_path_count; ++i)
     kvw("registry_path", p->registry_paths[i]);
   bool complete = EnvBoxProfileEnvironmentComplete() != 0;
@@ -863,7 +871,7 @@ int EnvBoxIpcNotifyRuntimeIdentity(HINSTANCE module, const int* counts,
   AppendKv(&body, "actual_profile", actual.c_str());
   AppendKvU32(&body, "config_complete", complete ? 1 : 0);
   const char* groups[] = {"time", "winrt_time", "geo", "locale", "crt_locale",
-                          "language", "dns", "registry", "process", "network_policy"};
+                          "language", "dns", "registry", "process", "network_policy", "identity"};
   for (size_t i = 0; i < count; ++i) {
     std::string entry = groups[i]; entry += ":"; entry += std::to_string(counts[i]);
     AppendKv(&body, "hook", entry.c_str());

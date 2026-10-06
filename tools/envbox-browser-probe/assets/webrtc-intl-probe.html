@@ -86,6 +86,7 @@
 
       function classify(addr) {
         if (!addr) return null;
+        if (addr.toLowerCase().endsWith(".local")) return "link_local";
         if (addr.startsWith("127.") || addr === "::1") return "loopback";
         if (addr.startsWith("fe80") || addr.startsWith("169.254.")) return "link_local";
         if (addr.startsWith("10.") || addr.startsWith("192.168.") ||

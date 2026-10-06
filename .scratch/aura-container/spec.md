@@ -1,9 +1,9 @@
 # Aura 环境信息容器规格
 
-Status: ready-for-agent
+Status: ready-for-human
 Date: 2026-10-06
 Scope revision: 用户明确澄清，容器是 Profile 环境信息视图；撤销此前将文件/Registry 写入隔离、内核网络策略和驱动交付作为总目标的扩展。
-Implementation status: 已有用户态基础与 DNS 成果可复用；当前范围仍须按信息读取入口和真实应用重新验收，不因改规格自动标完成。
+Implementation status: 当前声明的信息视图范围已实现并完成验证。已有 DNS 与用户态成果、四个可选身份字段、真实 Win32/Edge 对照及双架构恢复证据见[最终身份与 IPC 验收](evidence/profile-identity-and-ipc.md)；不延伸为任意读取入口或安全隔离保证。
 
 ## 目标
 
@@ -33,7 +33,7 @@ Implementation status: 已有用户态基础与 DNS 成果可复用；当前范�
 | Registry 信息读视图 | 现有白名单内的地域、时区、DNS 等读入口 | 与其他视图一致；不扩展为完整 Registry Sandbox |
 | DNS 配置视图与解析 | 受支持 Windows resolver API、任意 QTYPE | UDP/TCP/DoT/DoH；VirtualView strict 无 Host fallback |
 | 浏览器/WebRTC 策略 | 已识别 engine 的 policy 与现有 Runtime guard | 报告政策和实际覆盖；不把 policy 当作全 renderer 保证 |
-| Hostname、用户名、MAC、设备/硬件身份等 | 当前 Profile 无专门模型 | 候选清单，先明确必要性、真实读取入口和一致性，再另行规格化；未实现不显示支持 |
+| Hostname、用户名、MAC、MachineGuid | 可选 IdentityProfile，指定 Win32 读入口 | 按[身份读视图规格](identity-spec.md)实现与验收；CPU/GPU/磁盘身份后置 |
 
 不能通过设置 USERNAME、COMPUTERNAME 等环境变量，就宣称同名系统 API、WMI 或其他通道已虚拟化。候选字段不得生成无意义随机值或通过伪造检测结果取得“通过”。不实现反检测或隐藏 Aura。
 
@@ -79,4 +79,4 @@ Profile 不改变真实公网出口 IP，不是 VPN/代理，也不保证网络�
 
 复用已有 Profile、快照、用户态监管、DNS、Runtime 和恢复成果。保留可信服务与内核原型源码及已有证据，不安装、启用、删除或回滚；其未部署状态不阻塞环境信息容器验收。是否清理实验代码另立有明确范围的任务。
 
-新执行顺序见 [实施规划](implementation-plan.md)，旧票如何复用见 [地图](map.md)。本次只修改规划与领域文档，不改运行逻辑或用户数据。
+新执行顺序见 [实施规划](implementation-plan.md)，旧票如何复用见 [地图](map.md)。身份字段的实现与兼容验收见 [身份读视图规格](identity-spec.md)，运行结果按实际读取入口记录。

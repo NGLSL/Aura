@@ -9,6 +9,7 @@ name = "envbox-probe"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
 windows = { workspace = true, features = ["Globalization", "Win32_System_WinRT"] }
 
 [dev-dependencies]

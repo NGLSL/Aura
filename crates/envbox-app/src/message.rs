@@ -240,6 +240,10 @@ pub enum Message {
     AppBrowseWorkDir,
     // Profile form
     ProfileName(String),
+    ProfileComputerName(String),
+    ProfileUserName(String),
+    ProfileMacAddress(String),
+    ProfileMachineGuid(String),
     ProfileLocale(String),
     ProfileUi(String),
     ProfileRegion(String),

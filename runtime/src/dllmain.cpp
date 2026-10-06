@@ -14,7 +14,7 @@
 #include "ipc_bootstrap.h"
 #include "startup_gate.h"
 
-static int g_hook_counts[10] = {};
+static int g_hook_counts[11] = {};
 
 static int InstallAllHooks() {
   DetourTransactionBegin();
@@ -35,6 +35,13 @@ static int InstallAllHooks() {
     return 0;
   }
   ok += g_hook_counts[7] = EnvBoxInstallRegistryHooks();
+  ok += g_hook_counts[10] = EnvBoxInstallIdentityHooks();
+  const RuntimeProfile* identity = EnvBoxProfile();
+  if (g_hook_counts[10] != EnvBoxIdentityHooksRequired() ||
+      (identity->identity_mac_address[0] && !EnvBoxAdapterAddressIdentityReady()) ||
+      (identity->identity_machine_guid[0] && g_hook_counts[7] != 7)) {
+    DetourTransactionAbort(); return 0;
+  }
   ok += g_hook_counts[8] = EnvBoxInstallProcessHooks();
   if (g_hook_counts[8] < 0 ||
       (EnvBoxControlledStartup() && g_hook_counts[8] != 4)) {
@@ -90,7 +97,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
       return FALSE;
     }
     SetEnvironmentVariableA("ENVBOX_RUNTIME_LOADED", "1");
-    if (!EnvBoxIpcNotifyRuntimeIdentity(instance, g_hook_counts, 10)) {
+    if (!EnvBoxIpcNotifyRuntimeIdentity(instance, g_hook_counts, 11)) {
       EnvBoxRecoveryJobClose();
       return FALSE;
     }

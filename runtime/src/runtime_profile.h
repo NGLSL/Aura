@@ -34,6 +34,11 @@ struct RuntimeDnsUpstream {
 };
 
 struct RuntimeProfile {
+  wchar_t identity_computer_name[16];
+  wchar_t identity_user_name[65];
+  wchar_t identity_mac_address[18];
+  wchar_t identity_machine_guid[37];
+  BYTE identity_mac_bytes[6];
   wchar_t locale_name[85];
   wchar_t ui_language[85];
   wchar_t region[16];
@@ -77,6 +82,9 @@ int EnvBoxDecodeDnsConfiguration(RuntimeProfile* out, EnvBoxDnsFieldGetter gette
 using EnvBoxDnsFieldSetter = int (*)(void*, const char*, const char*);
 int EnvBoxEmitDnsConfiguration(const RuntimeProfile* profile,
                                EnvBoxDnsFieldSetter setter, void* context);
+int EnvBoxDecodeIdentityConfiguration(RuntimeProfile*, EnvBoxDnsFieldGetter, void*);
+int EnvBoxEmitIdentityConfiguration(const RuntimeProfile*, EnvBoxDnsFieldSetter, void*);
+void EnvBoxApplyIdentityEnvironment(const RuntimeProfile*);
 
 // Process-wide immutable profile after successful init. Never mutated later.
 const RuntimeProfile* EnvBoxProfile();

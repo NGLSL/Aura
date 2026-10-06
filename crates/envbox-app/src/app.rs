@@ -15,11 +15,19 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[path = "app/dns_editor.rs"]
 pub mod dns_editor;
+#[path = "app/identity_editor.rs"]
+pub mod identity_editor;
+#[path = "app/picker.rs"]
 mod picker;
+#[path = "app/update.rs"]
 mod update;
+#[path = "app/window.rs"]
 mod window;
+#[path = "app/workspace_management.rs"]
 pub mod workspace_management;
+#[path = "app/workspaces.rs"]
 mod workspaces;
 
 use crate::close_behavior::{self, CloseBehavior};
@@ -75,6 +83,7 @@ pub struct ProfileDraft {
     pub dns_mode: DnsChoice,
     pub dns_editor: dns_editor::DnsEditor,
     pub webrtc: WebRtcChoice,
+    pub identity: identity_editor::IdentityDraft,
     pub env: String,
 }
 
@@ -190,6 +199,7 @@ impl EnvBoxApp {
             dns_mode: DnsChoice::Host,
             dns_editor: Default::default(),
             webrtc: WebRtcChoice::Host,
+            identity: Default::default(),
             env: String::new(),
         };
         let close_behavior = close_behavior::load(store.root());
@@ -462,6 +472,7 @@ impl EnvBoxApp {
             dns_mode: DnsChoice::Host,
             dns_editor: Default::default(),
             webrtc: WebRtcChoice::Host,
+            identity: Default::default(),
             env: String::new(),
         }
     }
@@ -847,6 +858,10 @@ impl EnvBoxApp {
                 return self.run_app(id, selection);
             }
             Message::ProfileName(v) => self.profile_draft.name = v,
+            Message::ProfileComputerName(v) => self.profile_draft.identity.computer_name = v,
+            Message::ProfileUserName(v) => self.profile_draft.identity.user_name = v,
+            Message::ProfileMacAddress(v) => self.profile_draft.identity.mac_address = v,
+            Message::ProfileMachineGuid(v) => self.profile_draft.identity.machine_guid = v,
             Message::ProfileLocale(v) => self.profile_draft.locale = v,
             Message::ProfileUi(v) => self.profile_draft.ui = v,
             Message::ProfileRegion(v) => self.profile_draft.region = v,
@@ -1368,6 +1383,7 @@ impl EnvBoxApp {
             },
             dns,
             environment,
+            identity: self.profile_draft.identity.to_profile(),
             registry: RegistryProfile::default(),
             browser: BrowserPrivacyProfile {
                 webrtc: self.profile_draft.webrtc.to_policy(),
@@ -1393,6 +1409,8 @@ impl EnvBoxApp {
             Ok(()) => {
                 self.profiles = doc.profiles;
                 self.profile_draft.id = Some(profile.id);
+                self.profile_draft.identity =
+                    identity_editor::IdentityDraft::from_profile(&profile.identity);
                 self.profile_saved_draft = self.profile_draft.clone();
                 self.profile_edit_mode = false;
                 self.set_status(StatusKind::Success, "环境配置已保存");
@@ -1464,6 +1482,7 @@ pub fn profile_to_draft(p: &EnvironmentProfile) -> ProfileDraft {
         dns_mode: DnsChoice::from_mode(&p.dns.mode),
         dns_editor: dns_editor::DnsEditor::from_profile(&p.dns),
         webrtc: WebRtcChoice::from_policy(&p.browser.webrtc),
+        identity: identity_editor::IdentityDraft::from_profile(&p.identity),
         env: p
             .environment
             .iter()

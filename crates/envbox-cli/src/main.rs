@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use uuid::Uuid;
 mod containers;
 mod profile_dns;
+mod profile_identity;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
         Some("container") => containers::command(&store, &args[1..]),
         Some("profile") => match args.get(1).map(String::as_str) {
             Some("dns") => profile_dns::command(&store, &args[2..]),
+            Some("identity") => profile_identity::command(&store, &args[2..]),
             Some("list") => cmd_profile_list(&store),
             Some("add") => cmd_profile_add(&store, &args[2..]),
             _ => usage(),
@@ -83,6 +85,8 @@ fn usage() -> ExitCode {
     eprintln!("  envbox container stop UUID --instance UUID --application UUID [--request UUID]");
     eprintln!("  envbox container stop-all UUID [--request UUID]");
     eprintln!("  envbox profile list");
+    eprintln!("  Profile creation also accepts --computer-name N --user-name N --mac-address MAC --machine-guid UUID (optional Win32 read views)");
+    eprintln!("  envbox profile identity show UUID | reset UUID | set UUID [--computer-name N] [--user-name N] [--mac-address XX:XX:XX:XX:XX:XX] [--machine-guid UUID] [--clear computer_name|user_name|mac_address|machine_guid]");
     eprintln!("  envbox profile dns show UUID | add UUID --type udp|tcp|dot|doh [--address IP] [--port N] [--server-name NAME] [--url HTTPS_URL] [--bootstrap IP]... [--tls-revocation standard|strict_offline]");
     eprintln!("  envbox profile dns move UUID --from INDEX --to INDEX | remove UUID --index INDEX | set UUID [--mode host|virtual_view] [--strict true|false]");
     eprintln!("  envbox profile add --name N --locale L --ui-language U --region R \\");
@@ -663,7 +667,7 @@ fn cmd_profile_list(store: &ConfigStore) -> ExitCode {
             }
             for profile in &doc.profiles {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\twebrtc={}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\twebrtc={}\tidentity={}",
                     profile.id,
                     profile.name,
                     profile.locale.locale_name,
@@ -671,6 +675,11 @@ fn cmd_profile_list(store: &ConfigStore) -> ExitCode {
                     profile.timezone.windows_id,
                     profile.dns.mode_label(),
                     profile.browser.webrtc.as_str(),
+                    if profile.identity.is_host() {
+                        "host"
+                    } else {
+                        "profile"
+                    },
                 );
             }
             ExitCode::SUCCESS
@@ -720,6 +729,7 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
     let mut servers: Vec<IpAddr> = Vec::new();
     let mut environment = HashMap::new();
     let mut webrtc = WebRtcPolicy::Host;
+    let mut identity = envbox_core::IdentityProfile::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -729,6 +739,14 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
             args.get(*i).cloned()
         };
         match key {
+            "--computer-name" | "--user-name" | "--mac-address" | "--machine-guid" => {
+                let field = key.trim_start_matches("--").replace('-', "_");
+                let raw = take(&mut i).unwrap_or_default();
+                if let Err(err) = profile_identity::set_field(&mut identity, &field, Some(&raw)) {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
             "--name" => name = take(&mut i).unwrap_or_default(),
             "--locale" => locale_name = take(&mut i).unwrap_or_default(),
             "--ui-language" => ui_language = take(&mut i).unwrap_or_default(),
@@ -820,6 +838,7 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         environment,
         registry: RegistryProfile::default(),
         browser: BrowserPrivacyProfile { webrtc },
+        identity,
     };
 
     if let Err(err) = validate_profile(&profile) {

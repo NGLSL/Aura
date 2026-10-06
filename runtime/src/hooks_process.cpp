@@ -16,6 +16,7 @@
 #include "audit.h"
 #include "ipc_bootstrap.h"
 #include "service_bootstrap.h"
+#include "browser_child_locale.h"
 
 static bool g_controlled_startup = false;
 static bool g_startup_policy_latched = false;
@@ -180,7 +181,7 @@ static int EnsureWebView2ArgsW(std::vector<std::pair<std::wstring, std::wstring>
 }
 
 // Apply Browser Policy to child command line + env before create.
-// Unknown engines leave the command line alone. Host policy: no changes.
+// Locale is independent of WebRTC policy; unknown engines remain unchanged.
 static void ApplyBrowserChildPolicy(const wchar_t* image_or_cmd, std::wstring* cmd,
                                     std::vector<std::pair<std::wstring, std::wstring>>* vars) {
   const RuntimeProfile* pfl = EnvBoxProfile();
@@ -188,13 +189,11 @@ static void ApplyBrowserChildPolicy(const wchar_t* image_or_cmd, std::wstring* c
     return;
   }
   int policy_code = WebrtcPolicyCode(pfl);
-  if (policy_code == 0) {
-    return;  // Host: never overwrite user args.
-  }
   // Classify from application name or first token of command line.
   BrowserEngineKind engine = ClassifyBrowserEngine(image_or_cmd);
   if (engine == kEngineUnknown && cmd != nullptr) {
-    engine = ClassifyBrowserEngine(cmd->c_str());
+    const std::wstring image = EnvBoxCommandImage(cmd->c_str());
+    engine = ClassifyBrowserEngine(image.c_str());
   }
   if (engine == kEngineUnknown) {
     if (pfl->audit) {
@@ -202,6 +201,9 @@ static void ApplyBrowserChildPolicy(const wchar_t* image_or_cmd, std::wstring* c
     }
     return;
   }
+  if (cmd && pfl->has_locale && (engine == kEngineChromium || engine == kEngineEdge))
+    EnvBoxEnsureChromiumLocale(cmd, pfl->locale_name);
+  if (policy_code == 0) return;
   if (engine == kEngineWebView2) {
     if (EnsureWebView2ArgsW(vars, policy_code) && pfl->audit) {
       EnvBoxAuditEvent("CreateProcessW", 1, "BrowserPolicyApplied");
@@ -390,7 +392,8 @@ static bool UpsertProfileKeys(std::vector<wchar_t>* block) {
   // Rebuild the full ordered DNS snapshot. Caller-supplied stale indexed
   // fields must not survive alongside the immutable parent's configuration.
   vars.erase(std::remove_if(vars.begin(), vars.end(), [](const auto& kv) {
-    return _wcsnicmp(kv.first.c_str(), L"ENVBOX_DNS_", 11) == 0;
+    return _wcsnicmp(kv.first.c_str(), L"ENVBOX_DNS_", 11) == 0 ||
+           _wcsnicmp(kv.first.c_str(), L"ENVBOX_IDENTITY_", 16) == 0;
   }), vars.end());
   auto dns_setter = [](void* context, const char* key, const char* value) -> int {
     auto* values = static_cast<std::vector<std::pair<std::wstring, std::wstring>>*>(context);
@@ -402,7 +405,10 @@ static bool UpsertProfileKeys(std::vector<wchar_t>* block) {
     if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, text.data(), size)) return 0;
     text.pop_back(); values->emplace_back(name, text); return 1;
   };
-  if (!EnvBoxEmitDnsConfiguration(pfl, dns_setter, &vars)) return false;
+  if (!EnvBoxEmitDnsConfiguration(pfl, dns_setter, &vars) ||
+      !EnvBoxEmitIdentityConfiguration(pfl, dns_setter, &vars)) return false;
+  if (pfl->identity_computer_name[0]) upsert(L"COMPUTERNAME", pfl->identity_computer_name);
+  if (pfl->identity_user_name[0]) upsert(L"USERNAME", pfl->identity_user_name);
   if (GetEnvironmentVariableW(L"ENVBOX_CONFIG_ROOT", root, MAX_PATH) > 0) {
     upsert(L"ENVBOX_CONFIG_ROOT", root);
   }
@@ -546,7 +552,7 @@ static BOOL SpawnInjected(
       cmd_ptr = cmd_storage.data();
     }
   } else if (lpApplicationName != nullptr) {
-    std::wstring only_app(lpApplicationName);
+    std::wstring only_app = EnvBoxQuoteWindowsArgument(lpApplicationName);
     std::vector<std::pair<std::wstring, std::wstring>> dummy;
     ApplyBrowserChildPolicy(lpApplicationName, &only_app, &dummy);
     if (only_app != lpApplicationName) {

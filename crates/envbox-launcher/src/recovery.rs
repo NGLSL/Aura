@@ -357,6 +357,53 @@ pub fn validate_runtime_for_profile(
     Ok(())
 }
 
+/// Optional identity views require a separate capability export; old Host profiles remain compatible.
+pub fn validate_runtime_identity(
+    path: &Path,
+    identity: &envbox_core::IdentityProfile,
+) -> Result<(), RecoveryError> {
+    if identity.is_host() {
+        return Ok(());
+    }
+    identity.validate().map_err(refused)?;
+    let bytes = read_image(path)?;
+    let (_, _, _, offset) = export_rva(&bytes, b"EnvBoxIdentityCapabilities\0", false)?;
+    let data = &bytes[offset..offset + 256];
+    let end = data
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| refused("unterminated identity capability"))?;
+    let text = std::str::from_utf8(&data[..end]).map_err(refused)?;
+    let mut fields = std::collections::HashMap::new();
+    for item in text.split(';') {
+        let (key, value) = item
+            .split_once('=')
+            .ok_or_else(|| refused("invalid identity capability"))?;
+        if ![
+            "version",
+            "computer_name",
+            "user_name",
+            "mac_address",
+            "machine_guid",
+        ]
+        .contains(&key)
+            || fields.insert(key, value).is_some()
+            || !matches!(value, "0" | "1")
+        {
+            return Err(refused("unknown/duplicate identity capability"));
+        }
+    }
+    if fields.len() != 5 || fields["version"] != "1" {
+        return Err(refused("unsupported identity capability version"));
+    }
+    for (key, _) in identity.flat_fields() {
+        if fields[&key[9..]] != "1" {
+            return Err(refused("Runtime lacks requested identity view"));
+        }
+    }
+    Ok(())
+}
+
 pub fn read_runtime_capabilities(path: &Path) -> Result<RuntimeCapabilities, RecoveryError> {
     let bytes = read_image(path)?;
     let (_, _, _, offset) = export_rva(&bytes, b"EnvBoxRuntimeCapabilities\0", false)?;
@@ -535,6 +582,46 @@ mod tests {
         bytes[0x300..0x400].fill(b'a');
         std::fs::write(&path, &bytes).unwrap();
         assert!(read_runtime_capabilities(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn identity_capability_is_required_only_for_opt_in_and_validated_offline() {
+        let path = std::env::temp_dir().join(format!(
+            "aura-identity-capability-{}.dll",
+            uuid::Uuid::new_v4()
+        ));
+        let mut identity = envbox_core::IdentityProfile::default();
+        assert!(validate_runtime_identity(&path, &identity).is_ok());
+        identity.user_name = Some("tester".into());
+        let mut bytes = image();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(validate_runtime_identity(&path, &identity).is_err());
+        let name = b"EnvBoxIdentityCapabilities\0";
+        bytes[0x280..0x2c0].fill(0);
+        bytes[0x280..0x280 + name.len()].copy_from_slice(name);
+        for (data, valid) in [
+            (
+                "version=1;computer_name=1;user_name=1;mac_address=1;machine_guid=1",
+                true,
+            ),
+            (
+                "version=1;computer_name=1;user_name=0;mac_address=1;machine_guid=1",
+                false,
+            ),
+            (
+                "version=2;computer_name=1;user_name=1;mac_address=1;machine_guid=1",
+                false,
+            ),
+            (
+                "version=1;computer_name=1;user_name=1;mac_address=1;unknown=1",
+                false,
+            ),
+        ] {
+            bytes[0x300..0x400].fill(0);
+            bytes[0x300..0x300 + data.len()].copy_from_slice(data.as_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(validate_runtime_identity(&path, &identity).is_ok(), valid);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

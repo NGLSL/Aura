@@ -229,6 +229,11 @@ static void ApplyIpcProfile(const RuntimeProfile* src) {
   if (src->tz_iana[0] != L'\0') {
     wcsncpy_s(g_profile.tz_iana, src->tz_iana, _TRUNCATE);
   }
+  wcscpy_s(g_profile.identity_computer_name, src->identity_computer_name);
+  wcscpy_s(g_profile.identity_user_name, src->identity_user_name);
+  wcscpy_s(g_profile.identity_mac_address, src->identity_mac_address);
+  wcscpy_s(g_profile.identity_machine_guid, src->identity_machine_guid);
+  memcpy(g_profile.identity_mac_bytes, src->identity_mac_bytes, 6);
   g_profile.inherit_children = src->inherit_children;
   g_profile.audit = src->audit;
   g_profile.dns_mode = src->dns_mode;
@@ -354,6 +359,7 @@ static void ApplyCurrentProcessEnvironment(const RuntimeProfile* profile,
   }
   SetEnvironmentVariableW(L"ENVBOX_REGISTRY_PATHS", registry_paths.c_str());
   SetEnvironmentVariableW(L"ENVBOX_WEBRTC_POLICY", profile->webrtc_policy);
+  EnvBoxApplyIdentityEnvironment(profile);
 }
 
 // Split `a;b;c` into rows. Returns count, or -1 on overflow (caller Fail Open).
@@ -480,6 +486,22 @@ static int LoadFromEnvValues() {
   }
   ReadEnvW(L"ENVBOX_TZ_IANA", g_profile.tz_iana, 128);
 
+  wchar_t* identity_env = GetEnvironmentStringsW();
+  if (!identity_env) return 0;
+  bool identity_shape = true;
+  for (const wchar_t* entry = identity_env; *entry; entry += wcslen(entry) + 1) {
+    if (_wcsnicmp(entry, L"ENVBOX_IDENTITY_", 16) != 0) continue;
+    const wchar_t* eq = wcschr(entry, L'=');
+    if (!eq) { identity_shape = false; break; }
+    std::wstring key(entry, eq - entry);
+    if (_wcsicmp(key.c_str(), L"ENVBOX_IDENTITY_COMPUTER_NAME") &&
+        _wcsicmp(key.c_str(), L"ENVBOX_IDENTITY_USER_NAME") &&
+        _wcsicmp(key.c_str(), L"ENVBOX_IDENTITY_MAC_ADDRESS") &&
+        _wcsicmp(key.c_str(), L"ENVBOX_IDENTITY_MACHINE_GUID")) { identity_shape = false; break; }
+  }
+  FreeEnvironmentStringsW(identity_env);
+  if (!identity_shape) return 0;
+  if (!EnvBoxDecodeIdentityConfiguration(&g_profile, DnsEnvironmentField, nullptr)) return 0;
   if (!EnvBoxDecodeDnsConfiguration(&g_profile, DnsEnvironmentField, nullptr) ||
       !DnsEnvironmentShapeValid(&g_profile)) {
     OutputDebugStringA("EnvBox: invalid/incomplete DNS snapshot\n");

@@ -46,6 +46,9 @@ add_library(${ENVBOX_RT_TARGET} SHARED
   src/dns_doh.cpp
   src/dns_profile_config.cpp
   src/hooks_registry.cpp
+  src/browser_child_locale.cpp
+  src/hooks_identity.cpp
+  src/identity_profile_config.cpp
   src/hooks_process.cpp
   src/hooks_network.cpp
 )
@@ -59,7 +62,7 @@ set_target_properties(${ENVBOX_RT_TARGET} PROPERTIES OUTPUT_NAME "${ENVBOX_RT_NA
 # Rust's MSVC staticlib uses the dynamic release CRT in both Cargo profiles.
 # Match it for C++ Debug too; retain debug symbols and disabled optimization.
 set_property(TARGET ${ENVBOX_RT_TARGET} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
-target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE advapi32 iphlpapi ws2_32 runtimeobject secur32 crypt32)
+target_link_libraries(${ENVBOX_RT_TARGET} PRIVATE advapi32 iphlpapi ws2_32 runtimeobject secur32 crypt32 shell32)
 
 # DoH is part of the shipped Runtime, not a separately enabled prototype. Each
 # CMake build tree owns its Rust target directory, avoiding concurrent installer

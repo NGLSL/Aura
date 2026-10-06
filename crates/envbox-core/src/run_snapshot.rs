@@ -68,7 +68,7 @@ impl Serialize for RunSnapshot {
     }
 }
 fn decode_effective_profile(
-    value: serde_json::Value,
+    mut value: serde_json::Value,
     version: u32,
 ) -> Result<EnvironmentProfile, String> {
     fn fields(value: &serde_json::Value, required: &[&str]) -> Result<(), String> {
@@ -80,26 +80,41 @@ fn decode_effective_profile(
         }
         Ok(())
     }
-    fields(
-        &value,
-        &[
-            "id",
-            "name",
-            "locale",
-            "timezone",
-            "dns",
-            "environment",
-            "registry",
-            "browser",
-        ],
-    )?;
+    let mut required = vec![
+        "id",
+        "name",
+        "locale",
+        "timezone",
+        "dns",
+        "environment",
+        "registry",
+        "browser",
+    ];
+    if version == 3 {
+        required.push("identity");
+    }
+    fields(&value, &required)?;
+    if version == 3 {
+        fields(
+            &value["identity"],
+            &["computer_name", "user_name", "mac_address", "machine_guid"],
+        )?;
+        for key in ["computer_name", "user_name", "mac_address", "machine_guid"] {
+            let text = value["identity"][key]
+                .as_str()
+                .ok_or("expected identity string")?;
+            if text.is_empty() {
+                value["identity"][key] = serde_json::Value::Null;
+            }
+        }
+    }
     let dns_fields = match version {
         1 => &["mode", "servers"][..],
-        2 => &["mode", "strict", "upstreams"][..],
+        2 | 3 => &["mode", "strict", "upstreams"][..],
         _ => return Err("unsupported Profile snapshot schema".into()),
     };
     fields(&value["dns"], dns_fields)?;
-    if version == 2 {
+    if version >= 2 {
         let upstreams = value["dns"]["upstreams"]
             .as_array()
             .ok_or("expected complete DNS upstream array")?;
@@ -129,6 +144,24 @@ fn profile_wire_value(
 ) -> Result<serde_json::Value, DomainError> {
     let mut value =
         serde_json::to_value(profile).map_err(|_| invalid("Profile serialization failed"))?;
+    if version == 3 {
+        // TOML cannot encode JSON null. Four explicit strings bind disabled fields as well.
+        value["identity"] = serde_json::json!({
+            "computer_name": profile.identity.computer_name.as_deref().unwrap_or(""),
+            "user_name": profile.identity.user_name.as_deref().unwrap_or(""),
+            "mac_address": profile.identity.mac_address.as_deref().unwrap_or(""),
+            "machine_guid": profile.identity.machine_guid.as_deref().unwrap_or(""),
+        });
+    }
+    if matches!(version, 1 | 2) {
+        if !profile.identity.is_host() {
+            return Err(invalid("legacy snapshot cannot represent identity views"));
+        }
+        value
+            .as_object_mut()
+            .expect("Profile object")
+            .remove("identity");
+    }
     if version == 1 {
         if !profile.dns.strict {
             return Err(invalid("legacy snapshot cannot represent non-strict DNS"));
@@ -161,10 +194,10 @@ impl RunSnapshot {
             return Err(invalid("invalid Instance identity or Profile binding"));
         }
         let configuration_id =
-            configuration_digest(container.mode, profile, &container.storage_policy, 2)?;
+            configuration_digest(container.mode, profile, &container.storage_policy, 3)?;
         let mut snapshot = Self {
             schema_version: 1,
-            profile_schema_version: 2,
+            profile_schema_version: 3,
             snapshot_id: instance_id,
             instance_id,
             container_id: container.id,
@@ -185,7 +218,7 @@ impl RunSnapshot {
 
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != 1
-            || !matches!(self.profile_schema_version, 1 | 2)
+            || !matches!(self.profile_schema_version, 1 | 2 | 3)
             || self.storage_policy.schema_version != 1
         {
             return Err(invalid("unsupported snapshot/Profile/storage schema"));
@@ -293,4 +326,33 @@ fn canonical_json(value: &impl Serialize) -> Result<String, DomainError> {
     let mut output = String::new();
     write(&value, &mut output);
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn old_snapshot_schemas_preserve_digest_and_cannot_drop_identity() {
+        let old: RunSnapshot = toml::from_str(include_str!(
+            "../../envbox-storage/tests/fixtures/run-snapshot-v1.toml"
+        ))
+        .unwrap();
+        assert!(old.effective_profile.identity.is_host());
+        assert_eq!(
+            configuration_digest(old.mode, &old.effective_profile, &old.storage_policy, 2).unwrap(),
+            "d4359919f3d4caec8913da1b155051d9bbec052d4e5c2896f736ff3260f58be9"
+        );
+        let mut profile = old.effective_profile.clone();
+        profile.identity.user_name = Some("tester".into());
+        assert!(profile_wire_value(&profile, 1).is_err());
+        assert!(profile_wire_value(&profile, 2).is_err());
+        let wire = profile_wire_value(&profile, 3).unwrap();
+        assert_eq!(decode_effective_profile(wire.clone(), 3).unwrap(), profile);
+        let mut incomplete = wire;
+        incomplete["identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mac_address");
+        assert!(decode_effective_profile(incomplete, 3).is_err());
+    }
 }

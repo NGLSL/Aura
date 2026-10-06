@@ -82,6 +82,29 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         ]
         .spacing(10),
     );
+    if let Some(profile) = app
+        .profiles
+        .iter()
+        .find(|profile| profile.id == state.draft.profile_id)
+    {
+        let enabled = [
+            ("主机名", profile.identity.computer_name.is_some()),
+            ("用户名", profile.identity.user_name.is_some()),
+            ("MAC", profile.identity.mac_address.is_some()),
+            ("MachineGuid", profile.identity.machine_guid.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, configured)| configured.then_some(name))
+        .collect::<Vec<_>>();
+        items = items.push(text(if enabled.is_empty() {
+            "身份信息视图：跟随宿主".to_string()
+        } else {
+            format!(
+                "身份信息视图：{} 已配置（仅支持的读取入口）",
+                enabled.join("、")
+            )
+        }));
+    }
     let management = &app.workspace_management;
     let applications: Vec<ProfileChoice> = app
         .applications

@@ -102,6 +102,23 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                 ));
             }
 
+            let identity_count = [
+                &p.identity.computer_name,
+                &p.identity.user_name,
+                &p.identity.mac_address,
+                &p.identity.machine_guid,
+            ]
+            .into_iter()
+            .filter(|value| value.is_some())
+            .count();
+            if identity_count != 0 {
+                badges = badges.push(badge(
+                    &format!("身份: {identity_count} 项"),
+                    ACCENT_BG,
+                    ACCENT_TEXT,
+                ));
+            }
+
             col.push(
                 button(
                     row![

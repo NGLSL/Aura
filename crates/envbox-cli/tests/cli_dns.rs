@@ -471,7 +471,10 @@ fn build_fixture_response(query: &[u8], mode: FixtureMode) -> Vec<u8> {
 
     let answer = match mode {
         FixtureMode::Address | FixtureMode::DelayedAddress => {
-            if (qname == FIXTURE_NAME || qname == ASYNC_FIXTURE_NAME || qname == ASYNC_CANCEL_NAME)
+            if (qname == FIXTURE_NAME
+                || qname == ASYNC_FIXTURE_NAME
+                || qname == ASYNC_CANCEL_NAME
+                || qname == "aura-dns-view")
                 && qtype == 1
             {
                 Answer::A(FIXTURE_A)
@@ -670,6 +673,45 @@ fn lock_fixture() -> MutexGuard<'static, ()> {
     FIXTURE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A virtual computer name must not become a Host resolver exemption.
+#[test]
+fn strict_virtual_computer_name_queries_profile_dns() {
+    let dll = test_runtime_dll().expect("runtime DLL required");
+    let _guard = lock_fixture();
+    let server = spawn_fixture_dns(
+        try_bind_fixture_dns().expect("fixture bind"),
+        FixtureMode::Address,
+    );
+    let root = std::env::temp_dir().join(format!("envbox-dns-identity-{}", Uuid::new_v4()));
+    let profile = make_profile(&root, &["127.0.0.1"], true);
+    let name = "AURA-DNS-VIEW";
+    let update = envbox_with_root(&root)
+        .args([
+            "profile",
+            "identity",
+            "set",
+            &profile,
+            "--computer-name",
+            name,
+        ])
+        .output()
+        .unwrap();
+    assert!(update.status.success(), "{update:?}");
+    for run in [run_probe_resolve, run_probe_dnsquery, run_probe_dnsquery_ex] {
+        let before = server.queries.load(Ordering::SeqCst);
+        let output = run(&root, &dll, &profile, name);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            server.queries.load(Ordering::SeqCst) > before,
+            "virtual computer name bypassed Profile upstream: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("10.99.0.1"),
+            "must return the fixture address rather than a Host result: {output:?}"
+        );
+    }
 }
 
 /// Unsupported native providers must reject synchronously before creating work.

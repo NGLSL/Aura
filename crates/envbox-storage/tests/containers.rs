@@ -8,6 +8,7 @@ fn fixture() -> (ConfigStore, std::path::PathBuf) {
     store
         .save_profiles(&envbox_storage::ProfileDocument {
             profiles: vec![EnvironmentProfile {
+                identity: Default::default(),
                 id: uuid::Uuid::from_u128(1),
                 name: "US".into(),
                 locale: LocaleProfile {
@@ -473,5 +474,35 @@ fn unsupported_mode_and_schema_fail_explicitly() {
         .unwrap_err()
         .to_string()
         .contains("unsupported"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn identity_snapshot_schema_three_round_trips_disabled_and_partial_fields() {
+    let (store, root) = fixture();
+    let mut profiles = store.load_profiles().unwrap();
+    let container = Container::new("identity", profiles.profiles[0].id);
+    for user_name in [None, Some("tester".to_string())] {
+        profiles.profiles[0].identity.user_name = user_name.clone();
+        store.save_profiles(&profiles).unwrap();
+        let snapshot =
+            envbox_core::RunSnapshot::new(&container, &profiles.profiles[0], uuid::Uuid::new_v4())
+                .unwrap();
+        store.save_run_snapshot(&snapshot).unwrap();
+        let loaded = store
+            .load_run_snapshot(container.id, snapshot.instance_id)
+            .unwrap();
+        assert_eq!(loaded, snapshot);
+        let path = store.run_snapshot_path(container.id, snapshot.instance_id);
+        let wire = std::fs::read_to_string(&path).unwrap();
+        assert!(wire.contains("mac_address = \"\""));
+        let incomplete = wire.replace("mac_address = \"\"\n", "");
+        assert!(toml::from_str::<envbox_core::RunSnapshot>(&incomplete).is_err());
+    }
+    profiles.profiles[0].identity.user_name = Some(String::new());
+    assert!(
+        envbox_core::RunSnapshot::new(&container, &profiles.profiles[0], uuid::Uuid::new_v4())
+            .is_err()
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

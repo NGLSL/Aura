@@ -150,6 +150,35 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
             )
             .width(Fill)
             .style(inner_card_style),
+            container(
+                column![
+                    field_label("身份信息视图"),
+                    kv_row(
+                        "主机名",
+                        p.identity.computer_name.as_deref().unwrap_or("跟随宿主")
+                    ),
+                    kv_row(
+                        "用户名",
+                        p.identity.user_name.as_deref().unwrap_or("跟随宿主")
+                    ),
+                    kv_row(
+                        "MAC",
+                        p.identity.mac_address.as_deref().unwrap_or("跟随宿主")
+                    ),
+                    kv_row(
+                        "MachineGuid",
+                        p.identity.machine_guid.as_deref().unwrap_or("跟随宿主")
+                    ),
+                    text("仅影响支持的读取入口；真实账户、网卡和系统注册表保持原值。")
+                        .size(10)
+                        .color(FAINT)
+                        .font(font::ui_font()),
+                ]
+                .spacing(7)
+                .padding(10),
+            )
+            .width(Fill)
+            .style(inner_card_style),
             button(text("编辑配置").size(12).color(INK_2).font(font::ui_font()))
                 .padding(Padding::from([7, 12]))
                 .style(secondary_btn)
@@ -257,7 +286,7 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
                 .size(12)
                 .color(INK_2)
                 .font(font::name_font()),
-            text("IANA、DNS、WebRTC 和变量")
+            text("身份、IANA、DNS、WebRTC 和变量")
                 .size(11)
                 .color(MUTED)
                 .font(font::ui_font()),
@@ -273,6 +302,47 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
     let advanced: Element<_> = if app.profile_advanced {
         container(
             column![
+                field_label("身份信息视图 · 留空跟随宿主"),
+                form_row(
+                    "主机名",
+                    text_input("1–15 位 ASCII 主机名", &app.profile_draft.identity.computer_name)
+                        .on_input(Message::ProfileComputerName)
+                        .padding(Padding::from([5, 8]))
+                        .style(input_style)
+                        .font(font::ui_font()),
+                ),
+                form_row(
+                    "用户名",
+                    text_input("字母、数字、点、下划线或连字符", &app.profile_draft.identity.user_name)
+                        .on_input(Message::ProfileUserName)
+                        .padding(Padding::from([5, 8]))
+                        .style(input_style)
+                        .font(font::ui_font()),
+                ),
+                form_row(
+                    "MAC",
+                    text_input("02:AA:BB:CC:DD:EE", &app.profile_draft.identity.mac_address)
+                        .on_input(Message::ProfileMacAddress)
+                        .padding(Padding::from([5, 8]))
+                        .style(input_style)
+                        .font(font::ui_font()),
+                ),
+                form_row(
+                    "MachineGuid",
+                    text_input("Windows 安装标识 UUID", &app.profile_draft.identity.machine_guid)
+                        .on_input(Message::ProfileMachineGuid)
+                        .padding(Padding::from([5, 8]))
+                        .style(input_style)
+                        .font(font::ui_font()),
+                ),
+                text("提供 Win32 主机名 / 用户名、网卡信息和 MachineGuid 注册表读取视图。真实账户、网卡和系统安装标识保持原值；CPU、GPU、磁盘身份暂不覆盖。")
+                    .size(10)
+                    .color(FAINT)
+                    .font(font::ui_font()),
+                text("GetUserNameEx、WMI、Native Registry API 和设备 IOCTL 暂不覆盖。")
+                    .size(10)
+                    .color(FAINT)
+                    .font(font::ui_font()),
                 form_row(
                     "IANA 时区",
                     searchable_select(

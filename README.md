@@ -97,6 +97,14 @@ Profile DNS uses an explicit ordered list of UDP, TCP, DoT or DoH upstreams and 
 
 Supported Profile lookups through address-resolution hooks (`getaddrinfo` / `GetAddrInfo*`) return a resolution error when Profile DNS fails. Unsupported asynchronous resolver inputs are rejected without calling Windows resolution; `DnsQueryRaw`, when present and hooked, is explicitly rejected in strict Profile mode. Required DNS hook failures reject Runtime initialization. Local-machine passthrough, uninjected processes and application-owned UDP/TCP DNS, DoH, DoT or DoQ remain outside this resolver guarantee. Aura does not provide a network security boundary or change the host DNS configuration.
 
+### Profile identity read views
+
+Profiles optionally configure `identity.computer_name`, `user_name`, `mac_address`, and `machine_guid`. Empty fields retain the Host view. The GUI exposes these in Profile advanced settings; the CLI provides `profile identity show UUID`, `set UUID --computer-name NAME --user-name NAME --mac-address MAC --machine-guid UUID`, `set UUID --clear FIELD`, and `reset UUID`.
+
+The current read APIs are `GetComputerNameA/W`, `GetComputerNameExA/W`, Winsock `gethostname` / `GetHostNameW`, `GetUserNameA/W`, `GetAdaptersAddresses`, `GetAdaptersInfo`, `GetIfEntry`, `GetIfTable`, `GetIfEntry2`, `GetIfTable2`, and `RegQueryValueExA/W` / `RegGetValueA/W` for `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`. Computer DNS domain views are empty, and the FQDN view is the configured single label. MAC applies to six-byte physical addresses returned by the listed APIs, including permanent addresses in MIB rows. With an explicit computer name, that virtual label cannot bypass strict Profile DNS as a local-machine lookup.
+
+These views do not rename the host, change accounts, tokens, SIDs, permissions, adapter settings, registry data, or public IP. `GetUserNameEx`, WMI, Native Registry APIs, device IOCTLs and application-owned identity caches remain outside this API coverage. CPU/GPU/disk identity support is deferred. New immutable snapshots use Profile schema 3; legacy schema 1/2 snapshots retain their original digests. An identity Profile requires a Runtime that explicitly advertises and installs the necessary hooks.
+
 ## Community
 
 Thanks to the [LINUX DO](https://linux.do/) community for supporting open-source projects.

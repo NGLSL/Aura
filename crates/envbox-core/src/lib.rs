@@ -12,6 +12,8 @@ pub mod browser_policy;
 pub mod container;
 pub use container::{Container, ContainerMode};
 pub mod dns;
+pub mod identity;
+pub use identity::IdentityProfile;
 pub mod run_snapshot;
 pub mod session;
 pub mod storage_policy;
@@ -250,6 +252,8 @@ pub struct RegistryProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentProfile {
+    #[serde(default)]
+    pub identity: IdentityProfile,
     pub id: Uuid,
     pub name: String,
     pub locale: LocaleProfile,
@@ -270,7 +274,25 @@ impl EnvironmentProfile {
         self.locale.validate()?;
         self.timezone.validate()?;
         self.dns.validate()?;
-        for (key, _) in &self.environment {
+        self.identity.validate()?;
+        for (key, value) in &self.environment {
+            if key.to_ascii_uppercase().starts_with("ENVBOX_IDENTITY_") {
+                return Err(DomainError::InvalidProfile(
+                    "ENVBOX_IDENTITY_* is reserved".into(),
+                ));
+            }
+            for (name, expected) in [
+                ("COMPUTERNAME", self.identity.computer_name.as_ref()),
+                ("USERNAME", self.identity.user_name.as_ref()),
+            ] {
+                if key.eq_ignore_ascii_case(name)
+                    && expected.is_some_and(|expected| expected != value)
+                {
+                    return Err(DomainError::InvalidProfile(format!(
+                        "{name} conflicts with identity"
+                    )));
+                }
+            }
             if !is_valid_env_name(key) {
                 return Err(DomainError::InvalidProfile(format!(
                     "invalid environment variable name {key:?}"
@@ -408,6 +430,7 @@ mod tests {
 
     fn valid_profile() -> EnvironmentProfile {
         EnvironmentProfile {
+            identity: Default::default(),
             id: Uuid::nil(),
             name: "US Development".into(),
             locale: LocaleProfile {
@@ -741,4 +764,22 @@ mod tests {
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Wrap(LaunchTarget);
+    #[test]
+    fn identity_defaults_and_rejects_conflicting_environment() {
+        let mut p = valid_profile();
+        let mut value = serde_json::to_value(&p).unwrap();
+        value.as_object_mut().unwrap().remove("identity");
+        assert!(serde_json::from_value::<EnvironmentProfile>(value)
+            .unwrap()
+            .identity
+            .is_host());
+        p.identity.user_name = Some("tester".into());
+        p.environment.insert("username".into(), "host".into());
+        assert!(p.validate().is_err());
+        p.environment.insert("username".into(), "tester".into());
+        assert!(p.validate().is_ok());
+        p.environment
+            .insert("envbox_identity_future".into(), "x".into());
+        assert!(p.validate().is_err());
+    }
 }

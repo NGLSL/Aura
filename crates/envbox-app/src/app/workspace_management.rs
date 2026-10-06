@@ -545,6 +545,7 @@ mod tests {
             environment: Default::default(),
             registry: Default::default(),
             browser: Default::default(),
+            identity: Default::default(),
         };
         store
             .save_profiles(&envbox_storage::ProfileDocument {

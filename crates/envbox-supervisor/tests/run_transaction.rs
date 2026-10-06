@@ -36,6 +36,12 @@ fn public_run_uses_immutable_snapshot_and_is_idempotent() {
         )]),
         registry: RegistryProfile::default(),
         browser: Default::default(),
+        identity: envbox_core::IdentityProfile {
+            computer_name: Some("AURA-RUN".into()),
+            user_name: Some("run_user".into()),
+            mac_address: Some("02:AA:00:00:00:03".into()),
+            machine_guid: Some("44444444-4444-4444-8444-444444444444".into()),
+        },
     };
     let container = Container::new("fixture", profile.id);
     let application = Application {

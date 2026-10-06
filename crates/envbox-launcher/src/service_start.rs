@@ -578,6 +578,7 @@ mod tests {
             let instance = uuid::Uuid::new_v4();
             let marker = std::env::temp_dir().join(format!("aura-service-entry-{instance}.txt"));
             let mut profile = EnvironmentProfile {
+                identity: Default::default(),
                 id: uuid::Uuid::new_v4(),
                 name: "trusted-service-fixture".into(),
                 locale: LocaleProfile {

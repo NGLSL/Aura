@@ -45,6 +45,7 @@ pub fn collect() -> HostSnapshot {
             collect_timezone(),
             collect_dns(),
             collect_registry(),
+            crate::identity::collect(),
             collect_env(),
         ],
     }

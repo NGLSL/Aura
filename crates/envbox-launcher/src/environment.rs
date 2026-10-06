@@ -55,6 +55,7 @@ pub fn build_environment_block(
     env.retain(|k, _| {
         !DROP.contains(&lower(k).as_str())
             && !lower(k).starts_with("envbox_dns_upstream_")
+            && !lower(k).starts_with("envbox_identity_")
             && !matches!(
                 lower(k).as_str(),
                 "envbox_dns_config_version" | "envbox_dns_strict" | "envbox_dns_config_error"
@@ -91,11 +92,24 @@ pub fn insert_profile_value_fallback(
     env.retain(|key, _| {
         let key = key.to_ascii_lowercase();
         !key.starts_with("envbox_dns_upstream_")
+            && !key.starts_with("envbox_identity_")
             && !matches!(
                 key.as_str(),
                 "envbox_dns_config_version" | "envbox_dns_strict" | "envbox_dns_config_error"
             )
     });
+    for (key, value) in profile.identity.flat_fields() {
+        env.insert(format!("ENVBOX_{}", key.to_ascii_uppercase()), value);
+    }
+    for (key, value) in [
+        ("COMPUTERNAME", &profile.identity.computer_name),
+        ("USERNAME", &profile.identity.user_name),
+    ] {
+        if let Some(value) = value {
+            env.retain(|name, _| !name.eq_ignore_ascii_case(key));
+            env.insert(key.into(), value.clone());
+        }
+    }
     // Startup validates the complete payload first. Invalid sentinels also prevent a
     // typed decoder from interpreting encoding failure as an empty Host configuration.
     match checked_dns_environment(&profile.dns) {
@@ -190,6 +204,7 @@ mod tests {
 
     fn profile() -> EnvironmentProfile {
         EnvironmentProfile {
+            identity: Default::default(),
             id: Uuid::nil(),
             name: "US Development".into(),
             locale: LocaleProfile {
@@ -517,5 +532,33 @@ mod tests {
         );
         assert!(merged.contains_key("ENVBOX_DNS_CONFIG_ERROR"));
         assert!(!merged.contains_key("ENVBOX_DNS_UPSTREAM_0_ADDRESS"));
+    }
+    #[test]
+    fn identity_environment_clears_stale_namespace_and_overrides_labels() {
+        let host = HashMap::from([
+            ("envbox_identity_user_name".into(), "old".into()),
+            ("ENVBOX_IDENTITY_FUTURE".into(), "old".into()),
+            ("computername".into(), "host".into()),
+        ]);
+        let mut p = profile();
+        p.identity.computer_name = Some("aura-test".into());
+        let env = build_environment_block(&host, Some(&p), Uuid::new_v4(), p.id, true, false);
+        assert_eq!(
+            env.get("COMPUTERNAME").map(String::as_str),
+            Some("aura-test")
+        );
+        assert_eq!(
+            env.get("ENVBOX_IDENTITY_COMPUTER_NAME").map(String::as_str),
+            Some("aura-test")
+        );
+        assert!(!env
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("ENVBOX_IDENTITY_USER_NAME")
+                || key.eq_ignore_ascii_case("ENVBOX_IDENTITY_FUTURE")));
+        let env = build_environment_block(&host, None, Uuid::new_v4(), Uuid::nil(), true, false);
+        assert!(!env
+            .keys()
+            .any(|key| key.to_ascii_uppercase().starts_with("ENVBOX_IDENTITY_")));
+        assert_eq!(env.get("computername").map(String::as_str), Some("host"));
     }
 }

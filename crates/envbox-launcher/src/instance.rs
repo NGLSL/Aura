@@ -745,6 +745,7 @@ mod tests {
 
     fn sample_profile() -> EnvironmentProfile {
         EnvironmentProfile {
+            identity: Default::default(),
             id: Uuid::new_v4(),
             name: "US".into(),
             locale: LocaleProfile {

@@ -19,6 +19,8 @@ Parent: [当前总规格](spec.md)
 | R3 DNS 与浏览器路径 | 保留四传输、任意 QTYPE、strict；分开验证 Windows resolver、应用 resolver、renderer 和 WebRTC | E04；既有失败/未验证项保留，实际浏览器覆盖记录准确；IPv6 后置 |
 | R4 产品用语与保证 | 核对 GUI/CLI 的容器、Profile、字段和 Coverage 用语；保留原配置兼容性 | E07；信息视图不显示文件写保护/完整匿名，失败行为按当前声明能力判断 |
 | R5 最终矩阵 | 汇总不可变快照、子进程、恢复、Host/A/B、真实应用与资源检查 | E01–E08逐项验收；缺项不自动标完成，虚拟机/驱动资格不作为新门槛 |
+| R6 显式身份字段 | 主机名、用户名、MAC、MachineGuid，空值 Host；CPU/GPU/磁盘后置 | [身份规格](identity-spec.md)：双架构、原始读值、缓冲契约、继承污染、旧快照兼容及真实 hostname.exe |
+| R7 IPC 维护性 | 按协议、Profile 转换、会话管理拆分大文件，保留调用入口 | Wire 字节、严格校验、消息大小、身份安装门槛与恢复行为保持；原测试与真实运行回归 |
 
 R1先于新增信息能力或扩大应用保证。R2与R3有独立模块和稳定契约时可并行；R4使用已核对的事实，R5在修复冻结后执行。新增 hostname/MAC 等字段需先确定目标读取链路、字段语义与多入口一致性，再生成独立票，不能把“所有可能泄漏信息”视为无限开发范围。
 
@@ -41,8 +43,9 @@ Profile一致性以实际未注入Host和已注入A/B读取作对照。API支持
 ## 当前证据入口
 
 - [已有用户态与DNS进度](evidence/implementation-progress.md)
+- [身份、真实应用与 IPC 最终验收](evidence/profile-identity-and-ipc.md)
 - [最近服务/WFP增量及真实验证边界](evidence/service-wfp-followup.md)
 - [DNS独立规格](../dns-transports/spec.md)
 - [历史隔离规划](history/2026-10-06-isolation-implementation-plan.md)
 
-这些证据描述已经执行的工作，不替代本次R1读取矩阵或E01–E08终验。下一项具体工作是R1，不是申请签名、安装驱动或等待VM。
+这些证据描述已经执行的工作，不替代当前读取矩阵或E01–E08终验。用户已授权新增身份字段及 IPC 职责拆分，当前按 R6/R7 与最终矩阵交付；无需申请签名、安装驱动或等待 VM。

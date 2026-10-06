@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(envbox-profile-contracts LANGUAGES CXX)
+add_executable(envbox-profile-contracts contracts.cpp ../../src/identity_profile_config.cpp ../../src/browser_child_locale.cpp)
+target_compile_features(envbox-profile-contracts PRIVATE cxx_std_17)
+target_link_libraries(envbox-profile-contracts PRIVATE shell32)
+enable_testing()
+add_test(NAME profile-contracts COMMAND envbox-profile-contracts)

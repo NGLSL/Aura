@@ -528,9 +528,11 @@ pub(crate) fn start_session_with_options(
     };
 
     if let (Some(runtime), Some(profile)) = (&runtime_dll, &req.profile) {
-        crate::recovery::validate_runtime_for_profile(runtime, &profile.dns, entry_gate).map_err(
-            |error| SessionError::Unsupported(format!("Runtime capability preflight: {error}")),
-        )?;
+        crate::recovery::validate_runtime_for_profile(runtime, &profile.dns, entry_gate)
+            .and_then(|_| crate::recovery::validate_runtime_identity(runtime, &profile.identity))
+            .map_err(|error| {
+                SessionError::Unsupported(format!("Runtime capability preflight: {error}"))
+            })?;
     }
 
     let activation_req = ActivationRequest {
@@ -860,6 +862,7 @@ mod tests {
 
     fn profile() -> EnvironmentProfile {
         EnvironmentProfile {
+            identity: Default::default(),
             id: Uuid::new_v4(),
             name: "US".into(),
             locale: LocaleProfile {

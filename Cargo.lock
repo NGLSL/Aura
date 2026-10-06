@@ -1084,6 +1084,7 @@ dependencies = [
 name = "envbox-probe"
 version = "0.3.7"
 dependencies = [
+ "serde_json",
  "windows 0.58.0",
 ]
 

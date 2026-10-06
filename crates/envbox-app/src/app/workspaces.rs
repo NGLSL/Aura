@@ -120,6 +120,7 @@ mod tests {
                     environment: Default::default(),
                     registry: Default::default(),
                     browser: Default::default(),
+                    identity: Default::default(),
                 }],
             })
             .unwrap();

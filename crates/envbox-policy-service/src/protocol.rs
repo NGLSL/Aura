@@ -160,6 +160,7 @@ pub(crate) mod tests {
             environment: Default::default(),
             registry: Default::default(),
             browser: Default::default(),
+            identity: Default::default(),
         };
         let container = envbox_core::Container::new("service test", profile.id);
         let instance = Uuid::new_v4();

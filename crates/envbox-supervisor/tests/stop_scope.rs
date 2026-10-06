@@ -29,6 +29,7 @@ fn profile(marker: &std::path::Path) -> EnvironmentProfile {
         ]),
         registry: Default::default(),
         browser: Default::default(),
+        identity: Default::default(),
     }
 }
 fn message(command: &str, generation: &str, scope: Uuid, run: Option<RunCommand>) -> Request {

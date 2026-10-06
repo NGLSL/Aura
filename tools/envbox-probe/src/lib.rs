@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 pub mod host;
+pub mod identity;
 
 /// Stable section headers used as independent expected values in tests.
 pub const SECTION_GEO: &str = "GEO";
@@ -13,6 +14,7 @@ pub const SECTION_TIMEZONE: &str = "TIMEZONE";
 pub const SECTION_DNS: &str = "DNS";
 pub const SECTION_ENV: &str = "ENV";
 pub const SECTION_REGISTRY: &str = "REGISTRY";
+pub const SECTION_IDENTITY: &str = "IDENTITY";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {

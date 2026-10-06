@@ -627,6 +627,7 @@ fn sample_profile() -> envbox_core::EnvironmentProfile {
         environment: Default::default(),
         registry: RegistryProfile::default(),
         browser: Default::default(),
+        identity: Default::default(),
     }
 }
 

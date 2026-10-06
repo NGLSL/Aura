@@ -1977,6 +1977,7 @@ mod member_evidence_tests {
             environment: Default::default(),
             registry: Default::default(),
             browser: Default::default(),
+            identity: Default::default(),
         };
         let mut container = envbox_core::Container::new("cleanup", profile.id);
         container.id = command.container_id;

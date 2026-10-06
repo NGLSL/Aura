@@ -237,6 +237,7 @@ fn injected_runtime_reports_actual_identity() {
     let child_target = std::env::var("AURA_CHILD_TARGET").ok();
     let inherit = child_target.is_some();
     let mut profile = EnvironmentProfile {
+        identity: Default::default(),
         id: uuid::Uuid::new_v4(),
         name: "identity-fixture".into(),
         locale: LocaleProfile {

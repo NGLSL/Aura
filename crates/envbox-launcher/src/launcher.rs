@@ -436,6 +436,9 @@ pub fn launch(req: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
         let runtime_dll = crate::injection::stage_runtime_dll(&source_runtime, req.instance_id)?;
         if let Some(profile) = &req.profile {
             crate::recovery::validate_runtime_for_profile(&runtime_dll, &profile.dns, false)
+                .and_then(|_| {
+                    crate::recovery::validate_runtime_identity(&runtime_dll, &profile.identity)
+                })
                 .map_err(|error| {
                     LaunchError::InvalidProfile(format!("Runtime capability preflight: {error}"))
                 })?;

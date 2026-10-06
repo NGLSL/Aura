@@ -374,6 +374,13 @@ static ULONG WINAPI HookGetAdaptersAddresses(
     EnvBoxAuditEvent("GetAdaptersAddresses", 0, "fail-open");
     return status;
   }
+  const RuntimeProfile* identity = EnvBoxProfile();
+  if (identity->identity_mac_address[0]) {
+    for (auto* a = AdapterAddresses; a != nullptr; a = a->Next) {
+      if (a->Length >= offsetof(IP_ADAPTER_ADDRESSES, PhysicalAddressLength) + sizeof(a->PhysicalAddressLength) && a->PhysicalAddressLength == 6)
+        memcpy(a->PhysicalAddress, identity->identity_mac_bytes, 6);
+    }
+  }
   if (!g_view_active) {
     EnvBoxAuditEvent("GetAdaptersAddresses", 0, "dns-host");
     return status;
@@ -2662,6 +2669,9 @@ static int DnsNameEqualsW(const wchar_t* query, const wchar_t* local) {
 // does not invoke a supplied callback. Preserve that API shape for local names.
 static int IsLocalMachineDnsNameW(const wchar_t* name) {
   if (DnsNameEqualsW(name, L"localhost")) return 1;
+  // A configured name is an information view, not a host-resolver alias.
+  // Both that label and the real host name must follow Profile DNS routing.
+  if (EnvBoxProfile()->identity_computer_name[0]) return 0;
   wchar_t local[256] = {};
   DWORD cap = ARRAYSIZE(local);
   if (GetComputerNameW(local, &cap) && DnsNameEqualsW(name, local)) return 1;
@@ -3049,6 +3059,8 @@ static DNS_STATUS WINAPI HookDnsQueryRaw(void* request, void* cancel) {
   return ERROR_NOT_SUPPORTED;
 }
 
+static int g_identity_adapter_ready = 0;
+int EnvBoxAdapterAddressIdentityReady() { return g_identity_adapter_ready; }
 int EnvBoxDnsHooksReady() { return g_dns_hooks_ready; }
 
 int EnvBoxInstallDnsHooks() {
@@ -3057,6 +3069,7 @@ int EnvBoxInstallDnsHooks() {
   int ok = 0;
   const int network_params = EnvBoxAttach(&TrueGetNetworkParams, HookGetNetworkParams);
   const int adapters = EnvBoxAttach(&TrueGetAdaptersAddresses, HookGetAdaptersAddresses);
+  g_identity_adapter_ready = adapters;
   ok += network_params + adapters;
 
   // DNS routing only under VirtualView + Profile servers (Host path untouched).
