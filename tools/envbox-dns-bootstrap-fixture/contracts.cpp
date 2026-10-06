@@ -188,8 +188,18 @@ DNS_STATUS WINAPI LegacyOpaqueExtractor(PDNS_MESSAGE_BUFFER message, WORD length
   bool has_binding = false;
   if (ScanDnsOpaqueWireRecords(wire.data(), length, nullptr, &mapped, &has_binding) != ERROR_SUCCESS)
     return DNS_ERROR_BAD_PACKET;
-  if (has_binding) { *records = nullptr; return DNS_INFO_NO_RECORDS; }
-  return DnsExtractRecordsFromMessage_W(message, length, records);
+  DNS_STATUS status = DnsExtractRecordsFromMessage_W(message, length, records);
+  if (status != ERROR_SUCCESS) return status;
+  PDNS_RECORD* cursor = records;
+  while (*cursor) {
+    if (IsDnsFlatWireType((*cursor)->wType)) {
+      PDNS_RECORD dropped = *cursor;
+      *cursor = dropped->pNext;
+      dropped->pNext = nullptr;
+      TrueDnsFree(dropped, DnsFreeRecordList);
+    } else cursor = &(*cursor)->pNext;
+  }
+  return *records ? ERROR_SUCCESS : DNS_INFO_NO_RECORDS;
 }
 std::vector<unsigned char> OpaqueCompatibilityPacket() {
   std::vector<unsigned char> packet(12, 0);
@@ -197,7 +207,7 @@ std::vector<unsigned char> OpaqueCompatibilityPacket() {
   WriteU16(packet.data() + 4, 1);
   WriteU16(packet.data() + 6, 4);
   WriteU16(packet.data() + 8, 1);
-  WriteU16(packet.data() + 10, 1);
+  WriteU16(packet.data() + 10, 2);
   AddName(packet, "compat.fixture.test");
   packet.insert(packet.end(), {0, DNS_TYPE_HTTPS, 0, 1});
   const std::vector<unsigned char> opaque{0, 1, 0};
@@ -209,12 +219,13 @@ std::vector<unsigned char> OpaqueCompatibilityPacket() {
   AddRecord(packet, "compat.fixture.test", DNS_TYPE_SVCB, opaque);
   AddRecord(packet, "authority.fixture.test", DNS_TYPE_NULL, opaque);
   AddRecord(packet, ".", DNS_TYPE_HTTPS, opaque);
+  AddRecord(packet, ".", kDnsOpaqueCarrierType, opaque);
   return packet;
 }
 void CheckOpaqueCompatibilityRecords(PDNS_RECORD records, const char* phase) {
   // Windows puts the CNAME before the remaining answer records.
   const WORD types[] = {DNS_TYPE_CNAME, DNS_TYPE_NULL, DNS_TYPE_HTTPS,
-                        DNS_TYPE_SVCB, DNS_TYPE_NULL, DNS_TYPE_HTTPS};
+                        DNS_TYPE_SVCB, DNS_TYPE_NULL, DNS_TYPE_HTTPS, kDnsOpaqueCarrierType};
   const unsigned char bytes[] = {0, 1, 0};
   for (unsigned i = 0; i < ARRAYSIZE(types); ++i) {
     if (!records || records->wType != types[i])
@@ -240,10 +251,14 @@ void TestDownlevelOpaqueExtraction() {
   DNS_BYTE_FLIP_HEADER_COUNTS(&reinterpret_cast<PDNS_MESSAGE_BUFFER>(native_input.data())->MessageHead);
   PDNS_RECORD records = nullptr;
   Require(LegacyOpaqueExtractor(reinterpret_cast<PDNS_MESSAGE_BUFFER>(native_input.data()),
-          static_cast<WORD>(native_input.size()), &records) == DNS_INFO_NO_RECORDS && !records,
-          "downlevel extractor seam reproduces dropped 64/65 records");
+          static_cast<WORD>(native_input.size()), &records) == ERROR_SUCCESS && records &&
+          records->wType == DNS_TYPE_CNAME && !records->pNext,
+          "downlevel extractor drops NULL/64/65/unknown but preserves parsed CNAME");
+  TrueDnsFree(records, DnsFreeRecordList);
+  records = nullptr;
   Require(ExtractProfileDnsRecords(packet.data(), static_cast<int>(packet.size()), &records) == ERROR_SUCCESS,
           "opaque compatibility succeeds against downlevel extractor");
+  Require(packet == OpaqueCompatibilityPacket(), "record extraction preserves cached network-order wire bytes");
   CheckOpaqueCompatibilityRecords(records, "native");
   for (auto charset : {DnsCharSetUnicode, DnsCharSetAnsi, DnsCharSetUtf8}) {
     PDNS_RECORD copied = DnsRecordSetCopyEx(records, DnsCharSetUnicode, charset);
@@ -260,6 +275,18 @@ void TestDownlevelOpaqueExtraction() {
   Require(ExtractProfileDnsRecords(truncated.data(), static_cast<int>(truncated.size()), &records) ==
           DNS_ERROR_BAD_PACKET && !records && legacy_extract_calls == before,
           "truncated opaque RDATA is rejected before native extraction");
+  auto bad_owner = packet;
+  unsigned count = 0;
+  bool has_flat = false;
+  DnsOpaqueWireRecord mappings[6] = {};
+  Require(ScanDnsOpaqueWireRecords(packet.data(), static_cast<int>(packet.size()), mappings,
+                                  &count, &has_flat) == ERROR_SUCCESS && count == 6,
+          "mixed opaque scanner maps every future RR");
+  bad_owner[mappings[0].owner_offset] = 0xff;
+  bad_owner[mappings[0].owner_offset + 1] = 0xff;
+  Require(ExtractProfileDnsRecords(bad_owner.data(), static_cast<int>(bad_owner.size()), &records) ==
+          DNS_ERROR_BAD_PACKET && !records && legacy_extract_calls == before,
+          "invalid compressed owner rejected before native extraction");
   g_extract_dns_records = native_extractor;
 }
 

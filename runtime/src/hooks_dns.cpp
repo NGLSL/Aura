@@ -696,10 +696,9 @@ static int DnsBootstrapFromProfile(const char* name, char (&addresses)[ENVBOX_DN
                                   int* count, ULONGLONG deadline, HANDLE cancel_event);
 static int IsAsciiNameA(const char* s);
 
-// Downlevel dnsapi can silently discard SVCB/HTTPS records. Their default API
-// representation is a flat wire buffer. Use a private unknown type as carrier
-// (native extraction drops NULL records too), then restore mapped wire types.
-// ownership, charset conversion and public DnsFree remain entirely native.
+// Downlevel dnsapi silently discards some flat records, including 64/65 and
+// unknown future types. Native copying allocates these records on dnsapi's heap,
+// so charset conversion and public DnsFree retain their normal ownership contract.
 static decltype(&DnsExtractRecordsFromMessage_W) g_extract_dns_records =
     DnsExtractRecordsFromMessage_W;
 static int DnsNameEqualsW(const wchar_t* query, const wchar_t* local);
@@ -711,7 +710,21 @@ struct DnsOpaqueWireRecord {
   WORD type;
   WORD section;
   DWORD ttl;
+  bool present;
 };
+static bool IsDnsFlatWireType(WORD type) {
+  // Types parsed by the default Windows DNS API. Everything else is opaque
+  // wire RDATA, including NULL and future RR types (no PARSE_ALL_RECORDS option).
+  switch (type) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9:
+    case 11: case 12: case 13: case 14: case 15: case 16: case 17: case 18:
+    case 19: case 20: case 21: case 24: case 25: case 28: case 33: case 34:
+    case 35: case 39: case 41: case 43: case 46: case 47: case 48: case 49:
+    case 50: case 51: case 52: case 249: case 250: case 65281: case 65282:
+      return false;
+    default: return true;
+  }
+}
 struct DnsOpaqueExtractionBuffers {
   unsigned char* packet = nullptr;
   DnsOpaqueWireRecord* mapping = nullptr;
@@ -745,10 +758,16 @@ static DNS_STATUS ScanDnsOpaqueWireRecords(const unsigned char* packet, int leng
       const DWORD ttl = ReadU32(packet + offset + 4);
       offset += 10;
       if (data_length > length - offset) return DNS_ERROR_BAD_PACKET;
-      if (type == DNS_TYPE_NULL || type == DNS_TYPE_SVCB || type == DNS_TYPE_HTTPS || type == kDnsOpaqueCarrierType) {
-        if (mapping) mapping[*mapped] = {owner_offset, offset, data_length, type, section, ttl};
+      if ((type == DNS_TYPE_A && data_length != 4) ||
+          (type == DNS_TYPE_AAAA && data_length != 16)) return DNS_ERROR_BAD_PACKET;
+      if (IsDnsFlatWireType(type)) {
+        char owner[256] = {};
+        int decoded_offset = owner_offset;
+        if (!DecodeDnsName(packet, length, &decoded_offset, owner, sizeof(owner)))
+          return DNS_ERROR_BAD_PACKET;
+        if (mapping) mapping[*mapped] = {owner_offset, offset, data_length, type, section, ttl, false};
         ++*mapped;
-        *has_service_binding |= type != kDnsOpaqueCarrierType;
+        *has_service_binding = true;
       }
       offset += data_length;
     }
@@ -781,35 +800,67 @@ static DNS_STATUS ExtractProfileDnsRecords(unsigned char* packet, int length,
   buffers.packet = static_cast<unsigned char*>(HeapAlloc(GetProcessHeap(), 0, length));
   if (!buffers.packet) return ERROR_NOT_ENOUGH_MEMORY;
   memcpy(buffers.packet, packet, length);
-  for (unsigned i = 0; i < mapped; ++i) {
-    // The RR header is ten bytes immediately before its RDATA.
-    WriteU16(buffers.packet + buffers.mapping[i].data_offset - 10, kDnsOpaqueCarrierType);
-  }
   DNS_BYTE_FLIP_HEADER_COUNTS(&reinterpret_cast<PDNS_MESSAGE_BUFFER>(buffers.packet)->MessageHead);
   DNS_STATUS status = g_extract_dns_records(
       reinterpret_cast<PDNS_MESSAGE_BUFFER>(buffers.packet), static_cast<WORD>(length), records);
-  if (status == ERROR_SUCCESS) {
-    PDNS_RECORD cursor = *records;
-    for (unsigned i = 0; i < mapped; ++i) {
-      while (cursor && cursor->wType != kDnsOpaqueCarrierType) cursor = cursor->pNext;
+  if (status == ERROR_SUCCESS || status == DNS_INFO_NO_RECORDS) {
+    // Match every native flat record once, including duplicate owner/type pairs.
+    for (PDNS_RECORD cursor = *records; cursor; cursor = cursor->pNext) {
+      for (unsigned i = 0; i < mapped; ++i) {
+        auto& source = buffers.mapping[i];
+        if (source.present || cursor->wType != source.type ||
+            cursor->Flags.S.Section != source.section || cursor->dwTtl != source.ttl ||
+            cursor->wDataLength != source.length ||
+            memcmp(&cursor->Data, packet + source.data_offset, source.length)) continue;
+        char owner[256] = {};
+        wchar_t owner_w[256] = {};
+        int owner_offset = source.owner_offset;
+        if (!DecodeDnsName(packet, length, &owner_offset, owner, sizeof(owner)) ||
+            !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, owner, -1, owner_w, ARRAYSIZE(owner_w))) {
+          status = DNS_ERROR_BAD_PACKET;
+          break;
+        }
+        if (DnsNameEqualsW(reinterpret_cast<const wchar_t*>(cursor->pName), owner_w)) {
+          source.present = true;
+          break;
+        }
+      }
+      if (status == DNS_ERROR_BAD_PACKET) break;
+    }
+    for (unsigned i = 0; i < mapped &&
+         (status == ERROR_SUCCESS || status == DNS_INFO_NO_RECORDS); ++i) {
       const auto& source = buffers.mapping[i];
+      if (source.present) continue;
       char owner[256] = {};
       wchar_t owner_w[256] = {};
       int owner_offset = source.owner_offset;
-      if (!cursor || !DecodeDnsName(packet, length, &owner_offset, owner, sizeof(owner)) ||
-          !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, owner, -1, owner_w, ARRAYSIZE(owner_w)) ||
-          !DnsNameEqualsW(reinterpret_cast<const wchar_t*>(cursor->pName), owner_w) ||
-          cursor->Flags.S.Section != source.section || cursor->dwTtl != source.ttl ||
-          cursor->wDataLength != source.length ||
-          memcmp(&cursor->Data, packet + source.data_offset, source.length) != 0) {
+      if (!DecodeDnsName(packet, length, &owner_offset, owner, sizeof(owner)) ||
+          !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, owner, -1, owner_w, ARRAYSIZE(owner_w))) {
         status = DNS_ERROR_BAD_PACKET;
         break;
       }
-      cursor->wType = source.type;
-      cursor = cursor->pNext;
+      const size_t allocation = FIELD_OFFSET(DNS_RECORD, Data) +
+          (source.length > sizeof(DNS_RECORD::Data) ? source.length : sizeof(DNS_RECORD::Data));
+      PDNS_RECORD temporary = static_cast<PDNS_RECORD>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, allocation));
+      if (!temporary) { status = ERROR_NOT_ENOUGH_MEMORY; break; }
+      temporary->pName = reinterpret_cast<decltype(temporary->pName)>(owner_w);
+      temporary->wType = source.type;
+      temporary->wDataLength = source.length;
+      temporary->Flags.S.Section = source.section;
+      temporary->Flags.S.CharSet = DnsCharSetUnicode;
+      temporary->dwTtl = source.ttl;
+      memcpy(&temporary->Data, packet + source.data_offset, source.length);
+      PDNS_RECORD copied = DnsRecordCopyEx(temporary, DnsCharSetUnicode, DnsCharSetUnicode);
+      HeapFree(GetProcessHeap(), 0, temporary);
+      if (!copied) { status = ERROR_NOT_ENOUGH_MEMORY; break; }
+      // Keep native parsed ordering (notably CNAME-first), and section ordering.
+      PDNS_RECORD* insertion = records;
+      while (*insertion && (*insertion)->Flags.S.Section <= source.section)
+        insertion = &(*insertion)->pNext;
+      copied->pNext = *insertion;
+      *insertion = copied;
+      status = ERROR_SUCCESS;
     }
-    while (cursor && cursor->wType != kDnsOpaqueCarrierType) cursor = cursor->pNext;
-    if (cursor) status = DNS_ERROR_BAD_PACKET;
   }
   if (status != ERROR_SUCCESS && *records) {
     TrueDnsFree(*records, DnsFreeRecordList);
