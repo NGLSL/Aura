@@ -7,6 +7,17 @@ Branch: `dev`
 
 用户授权按 implement Skill 推进全部 P0–P8，并在最后统一 code-review。49 张票的总目标保持不变；本文件只记录进度，不将计划或原型当作完整交付。
 
+## 当前状态摘要（2026-10-06，优先于下方历史记录）
+
+- 已实现用户态工作区/不可变快照、Supervisor/Job 监管、受控启动与子进程传播、双架构及混合架构恢复；真实应用/特殊启动入口和故障恢复矩阵仍有未验项。
+- DNS 已接入 UDP/TCP/DoT/DoH、任意 QTYPE 与 strict 无 Host fallback；DoH 公共 IPv4 和最终 Runtime 双架构真实 Profile 验证通过。此前“18 No-Go / 19 off / dns_doh=0”是历史状态，已由提交 `5e8f929` 的修复取代。
+- 最新完整 Rust 1.99 工作区验证：418 passed / 0 failed / 34 ignored；实际范围见 [DoH 修复证据](doh-standard-tls-runtime.md)。忽略项不算通过。
+- 2026-10-06 用户明确决定 **IPv6 延期，当前不实施，不作为当前阶段完成、IPv4 DNS 交付或后续独立工作的阻塞项**。既有未执行记录保留，只表示 IPv6 未验证，不表示 IPv4 实现失败。AAAA QTYPE 支持与 IPv6 上游连接是不同维度，不因延期删除 AAAA 解析。
+- 无 VM 可继续：20 号四传输统一验收、真实应用/管理/恢复缺口、资源长跑和用户态产品整合。未交付的新安装包不等于源码未完成，打包/安装/发布单独记录。
+- 完整轻量容器仍缺：有效 WFP 网络策略/进程归属后端、文件和 Registry 隔离后端、基于私有状态的数据管理、驱动签名/加载/Verifier/故障恢复及最终安装兼容性资格。当前只有空功能驱动构建证据；存储规则预检不是强制隔离。
+
+以下各段按历史来源保留；当前 DoH 和 IPv6 排期以本摘要及最新证据为准，不从历史未通过状态重新阻塞已经交付的能力。
+
 ## 开始前已有工作
 
 工作区已有 DNS 全 QTYPE 修复、Probe/CLI DNS 测试、Rust 1.99 toolchain、三份 CI workflows 与 README 修改；容器规格、研究及 DNS transports 规格也已存在。实施不得回退它们。Review 区分此前 DNS 工作与本轮 Container 新实现，不把原有改动当作未知作者的废弃文件。

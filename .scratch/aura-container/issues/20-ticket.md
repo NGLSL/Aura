@@ -7,6 +7,8 @@ Parent: [总规格](../spec.md) · [完整实施规划](../implementation-plan.m
 
 **What to build:** 确认 UDP/TCP/DoT/DoH、任意 QTYPE、严格失败和父子解析在真实 Runtime 中工作，关闭 GUI 后保持相同行为。
 
+2026-10-06 排期更新：按用户决定，本票当前以 IPv4 上游连接验收；IPv6 网络路径延期，不是本票当前阻塞项。AAAA QTYPE 保持当前要求。DoH 已接线且公共 IPv4 双架构实际 Profile 验证通过，后续推进统一矩阵，不能继续以历史 DoH off 或 IPv6 未执行阻塞。
+
 ## 负责模块与契约
 
 Probe、DNS/Host 本地 fixtures与 GUI/CLI能力呈现。检验已实现路径，不用测试通过替代应用自带 DNS/WFP 保证。

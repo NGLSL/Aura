@@ -10,6 +10,8 @@ Date: 2026-10-04
 
 范围是 Aura 注入进程的 Windows resolver 路由，不是网络安全边界。应用自带 UDP/TCP/DoH/DoT/DoQ 和未拦截的新 API 仍可能绕过；本文不引入 WFP 驱动或透明流量重定向。
 
+2026-10-06 用户排期决定：当前交付先按 IPv4 上游连接验收，IPv6 连接/路由单列后续专项，不作为当前完成门槛，也不阻塞四传输或其他独立工作的推进。保留历史 IPv6 未执行记录，不能把它算通过或据此宣称 IPv4 未完成。AAAA QTYPE 在 IPv4 DNS transport 上仍可查询，属于当前任意 QTYPE 支持。
+
 ## 当前实现约束
 
 - `crates/envbox-core/src/lib.rs`：`DnsProfile { mode, servers: Vec<IpAddr> }`，无协议、端口、TLS 身份和 strict。

@@ -2,10 +2,12 @@
 
 Status: ready-for-agent
 Date: 2026-10-04
-Implementation status: 规划；未开始本规划中的容器实现
+Implementation status: 用户态基础与 IPv4 DNS 已实现并分项验证；完整容器后端仍在后续阶段，见 [当前进度](evidence/implementation-progress.md)
 Parent: [总规格](spec.md)
 
 ## 目标与完成定义
+
+2026-10-06 用户调整排期：IPv6 单列为后续专项，当前不实施、不阻塞本阶段 IPv4 DNS 或其他独立能力的完成。以下 IPv6 要求保留为延期阶段的契约；当前 F03/F04 按声明的 IPv4 支持范围验收，不因 IPv6 尚未执行判定该范围未完成。未来启用 IPv6 时补地址/路由、四传输、bootstrap、双架构和无 Host fallback 验证；AAAA 查询支持仍属于当前任意 QTYPE 能力。完整容器的 WFP、文件/Registry 后端和驱动资格等其他必需项不因这次延期被取消。
 
 长期目标是共享宿主 Windows 内核、按持久 Container 保存配置和应用状态的轻量环境容器。普通 Win32 应用可在不同环境运行；受保护作用域内的写入、删除及 Registry 状态彼此隔离；共享目录和出口由明确策略控制；GUI 退出后后台继续监管。目标不是实现独立 Windows、虚拟 GPU 或完整网络命名空间。
 
