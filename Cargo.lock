@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-app"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-broker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-browser-probe"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "serde",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-cli"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-core"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-dns-doh"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-dns-doh-fixture"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-dns-doh",
  "http",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-launcher"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "sha2",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-policy-service"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-probe"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "serde_json",
  "windows 0.58.0",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-storage"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "serde",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-supervisor"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "envbox-core",
  "envbox-launcher",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "envbox-suspended-helper"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "windows 0.58.0",
 ]

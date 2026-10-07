@@ -137,7 +137,7 @@ impl EnvBoxApp {
 mod tests {
     use super::*;
     use envbox_core::storage_policy::{StorageAction, StorageRule, StorageTarget};
-    use envbox_core::DnsProfile;
+    use envbox_core::{DnsProfile, LocaleProfile, TimezoneProfile};
 
     #[test]
     fn profile_scope_is_persisted_stable_and_preserves_all_legacy_records() {

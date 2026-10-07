@@ -496,6 +496,7 @@ fn management_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envbox_core::{LaunchTarget, LocaleProfile, TimezoneProfile};
     use envbox_supervisor::RunResult;
 
     fn view(container: Uuid, instance: Uuid, generation: &str) -> RunView {
