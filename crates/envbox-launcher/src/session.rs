@@ -132,6 +132,8 @@ pub struct SessionHandle {
     pub broker: Option<crate::ipc_server::HostBroker>,
     /// Process Tracker (Job + Package/PID dual backend).
     pub tracker: crate::process_tracker::ProcessTracker,
+    /// Startup observation transferred by the independent session host.
+    hosted_identity: Option<crate::ipc::ObservedRuntimeIdentity>,
     #[cfg(windows)]
     process: Option<crate::launcher::win::SafeHandle>,
     /// Primary thread handle kept for lifetime / resume bookkeeping.
@@ -141,9 +143,41 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    #[cfg(windows)]
+    pub(crate) fn process_handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        self.process.as_ref().map(|process| process.0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_host(
+        session: EnvironmentSession,
+        instance: RuntimeInstance,
+        job: InstanceJob,
+        tracker: crate::process_tracker::ProcessTracker,
+        process: crate::launcher::win::SafeHandle,
+        identity: Option<crate::ipc::ObservedRuntimeIdentity>,
+    ) -> Self {
+        Self {
+            session,
+            instance,
+            job: Some(job),
+            attached: None,
+            child: None,
+            profile_payload: None,
+            broker: None,
+            tracker,
+            hosted_identity: identity,
+            process: Some(process),
+            thread: None,
+        }
+    }
+
     /// Runtime facts independently observed by the broker. Absence means
     /// pending/unverified, never a successful identity handshake.
     pub fn runtime_identity(&self) -> Option<crate::ipc::ObservedRuntimeIdentity> {
+        if let Some(identity) = &self.hosted_identity {
+            return Some(identity.clone());
+        }
         let table = self.broker.as_ref()?.table();
         let identity = table
             .lock()
@@ -192,7 +226,7 @@ impl SessionHandle {
 }
 
 /// Start request for one Run (CLI/GUI share this seam).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionStartRequest {
     pub application_id: Uuid,
     pub launch: LaunchTarget,
@@ -285,8 +319,31 @@ pub(crate) fn start_session_with_options(
     requested_job_name: Option<String>,
     create_new_console: bool,
     entry_gate: bool,
+    #[cfg(windows)] service: Option<crate::service_start::ServiceStartOptions<'_>>,
+    #[cfg(not(windows))] service: Option<()>,
+) -> Result<SessionHandle, SessionError> {
+    start_session_with_options_and_tracking(
+        req,
+        requested_instance_id,
+        requested_job_name,
+        create_new_console,
+        entry_gate,
+        service,
+        false,
+    )
+}
+
+/// A session host uses a named tracking Job even for ordinary packaged runs.
+/// Naming that Job must not strengthen the original best-effort assignment.
+pub(crate) fn start_session_with_options_and_tracking(
+    req: SessionStartRequest,
+    requested_instance_id: Option<Uuid>,
+    requested_job_name: Option<String>,
+    create_new_console: bool,
+    entry_gate: bool,
     #[cfg(windows)] mut service: Option<crate::service_start::ServiceStartOptions<'_>>,
     #[cfg(not(windows))] _service: Option<()>,
+    allow_packaged_job_failure: bool,
 ) -> Result<SessionHandle, SessionError> {
     // Safety net: every caller (GUI/CLI/tests) gets Packaged for AUMID /
     // WindowsApps targets. Never CreateProcess a WindowsApps exe (package
@@ -638,7 +695,7 @@ pub(crate) fn start_session_with_options(
     // best effort because it can return a previously running application.
     if is_packaged {
         if let Err(err) = job.assign_pid(activated.pid) {
-            if !is_packaged || requested_job_name.is_some() {
+            if requested_job_name.is_some() && !allow_packaged_job_failure {
                 return Err(startup_cleanup.fail(err.into()));
             }
         }
@@ -823,6 +880,7 @@ pub(crate) fn start_session_with_options(
         profile_payload,
         broker,
         tracker,
+        hosted_identity: None,
         #[cfg(windows)]
         process: root_process,
         #[cfg(windows)]

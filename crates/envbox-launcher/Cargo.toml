@@ -10,6 +10,8 @@ envbox-core = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 sha2 = "0.10"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp", "Win32_Security_Authorization"] }

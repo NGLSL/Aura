@@ -125,5 +125,8 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked -- --test-threads=1
 
+      - name: Test detached session child startup
+        run: ./tools/test-detached-session.ps1 -Cli ./target/debug/envbox.exe -RuntimeDirectory ./target/debug -Scenario All
+
       - name: Test CPU renderer SVG DPI regressions
         run: cargo test -p iced_tiny_skia --lib --locked

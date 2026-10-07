@@ -44,6 +44,22 @@ fn g_stop() -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if args.first().is_some_and(|arg| arg == "--session-host") {
+        let result = match (args.get(1), args.get(2).and_then(|pid| pid.parse().ok())) {
+            (Some(pipe), Some(parent)) if args.len() == 3 => {
+                envbox_launcher::session_host::run(pipe, parent)
+            }
+            _ => Err(envbox_launcher::SessionError::Unsupported(
+                "invalid internal session host arguments".into(),
+            )),
+        };
+        if let Err(error) = result {
+            eprintln!("envbox-broker: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let name = pipe_name(&args);
     let registry = new_registry();
     let mut broker = match serve(registry.clone(), name.clone()) {

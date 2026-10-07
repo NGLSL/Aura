@@ -11,7 +11,7 @@ pub const RUNTIME_IDENTITY_PROTOCOL: u32 = 1;
 
 /// Facts observed after the Runtime's hook transaction committed. Counts
 /// describe attached APIs, never complete Windows/process-tree coverage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeIdentity {
     pub pid: u32,
     pub creation_time: u64,

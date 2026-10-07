@@ -10,7 +10,7 @@ use envbox_core::{PackageIdentity, SessionState};
 use std::collections::HashSet;
 
 /// How a tracked process set is supervised.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrackMode {
     /// Classic Win32 Process Tree Instance via Job Object.
     Job,
@@ -19,7 +19,7 @@ pub enum TrackMode {
 }
 
 /// One EnvironmentSession's process set + supervision mode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProcessTracker {
     pub mode: TrackMode,
     pub roots: HashSet<u32>,

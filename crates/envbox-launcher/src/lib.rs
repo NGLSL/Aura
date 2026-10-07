@@ -20,6 +20,8 @@ mod service_bundle;
 #[cfg(windows)]
 pub mod service_start;
 pub mod session;
+#[cfg(windows)]
+pub mod session_host;
 
 pub use activation::{
     backend_for, ActivateError, ActivatedTarget, ActivationBackend, ActivationRequest,

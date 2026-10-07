@@ -413,7 +413,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         audit,
     };
 
-    match envbox_launcher::start_session(request) {
+    match envbox_launcher::session_host::start(request, None, None, false) {
         Ok(mut handle) => {
             eprintln!(
                 "envbox: started pid={} instance={} profile={} (Runtime + core hooks active)",
@@ -597,7 +597,7 @@ fn cmd_terminal_run(store: &ConfigStore, args: &[String]) -> ExitCode {
         inherit_children: app.inherit_children,
         audit: app.audit,
     };
-    match envbox_launcher::start_session_in_named_job(request, instance_id, &job_name) {
+    match envbox_launcher::session_host::start_in_owned_job(request, instance_id, &job_name) {
         Ok(mut handle) => {
             let root_pid = handle.instance.root_pid;
             if terminal_handoff_cancelled(&cancel_marker) {

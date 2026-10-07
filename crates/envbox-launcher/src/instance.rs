@@ -5,9 +5,7 @@
 use crate::job::{InstanceJob, JobError, JobStats};
 use crate::launcher::LaunchError;
 use crate::package_discovery::normalize_launch_target;
-use crate::session::{
-    start_session, start_session_in_new_console, SessionError, SessionHandle, SessionStartRequest,
-};
+use crate::session::{SessionError, SessionHandle, SessionStartRequest};
 use envbox_core::{Application, ConsoleHost, EnvironmentProfile, InstanceStatus, RuntimeInstance};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -84,11 +82,8 @@ impl InstanceManager {
             return self.run_windows_terminal(app, target);
         }
         let request = build_session_request(app, target)?;
-        let session = if matches!(app.console_host, ConsoleHost::Cmd | ConsoleHost::PowerShell) {
-            start_session_in_new_console(request)?
-        } else {
-            start_session(request)?
-        };
+        let new_console = matches!(app.console_host, ConsoleHost::Cmd | ConsoleHost::PowerShell);
+        let session = crate::session_host::start(request, None, None, new_console)?;
         let id = session.instance.id;
         let meta = session.instance.clone();
         self.instances.insert(

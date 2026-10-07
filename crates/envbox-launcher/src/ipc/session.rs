@@ -6,7 +6,7 @@ use super::wire::{
 use envbox_core::EnvironmentProfile;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObservedRuntimeIdentity {
     pub identity: RuntimeIdentity,
     pub module_sha256: String,
@@ -147,6 +147,19 @@ impl SessionTable {
                 v
             })
             .unwrap_or_default()
+    }
+
+    /// Original process generations, for independent host lifetime tracking.
+    /// Consumers must also test the retained process handle for exit.
+    pub(crate) fn live_members(&self, profile_id: &str) -> Vec<(u32, u64)> {
+        self.live_pids(profile_id)
+            .into_iter()
+            .filter_map(|pid| {
+                self.generations
+                    .get(&pid)
+                    .map(|generation| (pid, *generation))
+            })
+            .collect()
     }
 
     pub fn profile_of(&self, pid: u32) -> Option<&str> {
