@@ -138,6 +138,7 @@ pub struct EnvBoxApp {
     pub app_capabilities: HashMap<Uuid, crate::package::Capability>,
     resume_new_app: bool,
     pub audit_events: Vec<AuditEvent>,
+    pub audit_total: usize,
     /// Empty = show all software.
     pub audit_filter: String,
     /// Open searchable-select field in the Profile editor.
@@ -267,6 +268,7 @@ impl EnvBoxApp {
             app_capabilities,
             resume_new_app: false,
             audit_events: Vec::new(),
+            audit_total: 0,
             audit_filter: String::new(),
             open_combo: None,
             combo_query: String::new(),

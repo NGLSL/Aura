@@ -1,11 +1,16 @@
 //! Curated Profile editor option lists (common values only).
-//! Display: only 中国 / 美国 / timezone Chinese names. Stored values stay host tokens.
+//! Display: region codes / locale tokens / timezone Chinese names.
 
-/// Region list is intentionally tiny (search still finds the current value).
-pub const COMMON_REGIONS: &[&str] = &["CN", "US"];
+/// Common regions supported by the Profile editor.
+pub const COMMON_REGIONS: &[&str] = &[
+    "CN", "US", "TW", "SG", "JP", "PH", "GB", "DE", "KR", "BO", "TR",
+];
 
-/// Locale / UI language: keep the two common ones.
-pub const COMMON_LOCALES: &[&str] = &["zh-CN", "en-US"];
+/// Locale and UI language share the same Windows locale tokens.
+pub const COMMON_LOCALES: &[&str] = &[
+    "zh-CN", "en-US", "zh-TW", "en-SG", "zh-SG", "ja-JP", "en-PH", "fil-PH", "en-GB", "de-DE",
+    "ko-KR", "es-BO", "tr-TR",
+];
 
 /// Region display: 中国 / 美国 only. Other codes stay as codes (no long names).
 pub fn region_label(code: &str) -> String {
@@ -44,6 +49,7 @@ fn iana_label(t: &str) -> String {
         "Asia/Tokyo" => Some("东京"),
         "Asia/Seoul" => Some("首尔"),
         "Asia/Singapore" => Some("新加坡"),
+        "Asia/Manila" => Some("马尼拉（菲律宾）"),
         "Asia/Jerusalem" => Some("耶路撒冷"),
         "Asia/Dubai" => Some("迪拜"),
         "Asia/Kolkata" | "Asia/Calcutta" => Some("加尔各答"),
@@ -56,6 +62,7 @@ fn iana_label(t: &str) -> String {
         "America/Anchorage" => Some("安克雷奇"),
         "America/Halifax" => Some("哈利法克斯"),
         "America/Bogota" => Some("波哥大"),
+        "America/La_Paz" => Some("拉巴斯（玻利维亚）"),
         "America/Sao_Paulo" => Some("圣保罗"),
         "America/Santiago" => Some("圣地亚哥"),
         "America/Mexico_City" => Some("墨西哥城"),
@@ -89,9 +96,9 @@ fn windows_tz_label(t: &str) -> String {
         "china standard time" => "中国标准时间",
         "taipei standard time" => "台北时间",
         "hong kong standard time" => "香港时间",
-        "tokyo standard time" => "东京时间",
-        "korea standard time" => "首尔时间",
-        "singapore standard time" => "新加坡时间",
+        "tokyo standard time" => "日本（东京）时间",
+        "korea standard time" => "韩国（首尔）时间",
+        "singapore standard time" => "新加坡／菲律宾时间",
         "pacific standard time" => "太平洋时间",
         "us pacific standard time" => "太平洋时间",
         "mountain standard time" => "山地时间",
@@ -104,6 +111,7 @@ fn windows_tz_label(t: &str) -> String {
         "hawaiian standard time" => "夏威夷时间",
         "atlantic standard time" => "大西洋时间",
         "sa pacific standard time" => "南美太平洋时间",
+        "sa western standard time" => "玻利维亚（拉巴斯）时间",
         "e. south america standard time" => "南美东部时间",
         "e. south america daylight time" => "南美东部时间",
         "pacific sa standard time" => "南美西部时间",
@@ -111,7 +119,7 @@ fn windows_tz_label(t: &str) -> String {
         "central america standard time" => "中美洲时间",
         "gmt standard time" => "英国时间",
         "greenwich standard time" => "格林尼治时间",
-        "w. europe standard time" => "西欧时间",
+        "w. europe standard time" => "西欧（德国）时间",
         "romance standard time" => "中欧西岸时间",
         "central europe standard time" => "中欧时间",
         "central european standard time" => "中欧标准时间",

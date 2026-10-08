@@ -190,6 +190,16 @@ pub fn present<T: AsRef<str>>(
 
     let damage =
         damage::group(damage, Rectangle::with_size(viewport.logical_size()));
+    // Each region traverses every layer and rebuilds a window-sized clip mask.
+    // Scrolling text can produce hundreds of small regions: repainting their
+    // bounding rectangle once is cheaper than repeating that work per region.
+    let damage = if damage.len() > 16 {
+        vec![damage[1..]
+            .iter()
+            .fold(damage[0], |bounds, region| bounds.union(region))]
+    } else {
+        damage
+    };
 
     let mut pixels = tiny_skia::PixmapMut::from_bytes(
         bytemuck::cast_slice_mut(&mut buffer),

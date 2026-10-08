@@ -26,7 +26,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let rows_all = app.filtered_audit_events();
     let shown = rows_all.len();
-    let total = app.audit_events.len();
+    let total = app.audit_total;
     let mut soft_opts = vec!["全部软件".to_string()];
     soft_opts.extend(app.audit_software_options());
     let filter_sel = if app.audit_filter.trim().is_empty() {
@@ -39,7 +39,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
         column![
             text("安全审计").size(24).color(INK).font(font::name_font()),
             text(format!(
-                "实时观测台 · 显示最近 {} / 共捕获 {} 条 · 只读记录，不改变虚拟化语义",
+                "审计记录 · 显示 {} / 共捕获 {} 条 · 点击刷新更新记录",
                 shown, total
             ))
             .size(12)

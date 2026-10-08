@@ -235,6 +235,7 @@ pub const COMMON_TIMEZONE_PAIRS: &[(&str, &str)] = &[
     ("Hawaiian Standard Time", "Pacific/Honolulu"),
     ("Atlantic Standard Time", "America/Halifax"),
     ("SA Pacific Standard Time", "America/Bogota"),
+    ("SA Western Standard Time", "America/La_Paz"),
     ("E. South America Standard Time", "America/Sao_Paulo"),
     ("Pacific SA Standard Time", "America/Santiago"),
     ("Mexico Standard Time", "America/Mexico_City"),
@@ -253,6 +254,7 @@ pub const COMMON_TIMEZONE_PAIRS: &[(&str, &str)] = &[
     ("SE Asia Standard Time", "Asia/Bangkok"),
     ("China Standard Time", "Asia/Shanghai"),
     ("Singapore Standard Time", "Asia/Singapore"),
+    ("Singapore Standard Time", "Asia/Manila"),
     ("Taipei Standard Time", "Asia/Taipei"),
     ("Tokyo Standard Time", "Asia/Tokyo"),
     ("Korea Standard Time", "Asia/Seoul"),
@@ -283,8 +285,10 @@ pub fn iana_to_windows(iana_id: &str) -> Option<&'static str> {
 
 /// Common Windows timezone IDs for the Profile editor default list.
 pub fn common_windows_timezone_ids() -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     COMMON_TIMEZONE_PAIRS
         .iter()
+        .filter(|(w, _)| seen.insert(*w))
         .map(|(w, _)| (*w).to_string())
         .collect()
 }
