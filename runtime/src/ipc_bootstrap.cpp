@@ -4,6 +4,7 @@
 // enforced by the caller (EnvBoxLoadProfile), not by this module.
 
 #include "ipc_bootstrap.h"
+#include "audit.h"
 #include "service_bootstrap.h"
 
 #include <stdio.h>
@@ -67,6 +68,7 @@ int WriteAll(HANDLE h, const char* data, DWORD len, ULONGLONG deadline) {
   while (sent < len) {
     DWORD timeout = RemainingMs(deadline);
     if (timeout == 0) {
+      SetLastError(ERROR_TIMEOUT);
       return 0;
     }
     OVERLAPPED ov = {};
@@ -80,21 +82,29 @@ int WriteAll(HANDLE h, const char* data, DWORD len, ULONGLONG deadline) {
       DWORD err = GetLastError();
       if (err != ERROR_IO_PENDING) {
         CloseHandle(ov.hEvent);
+        SetLastError(err);
         return 0;
       }
       DWORD w = WaitForSingleObject(ov.hEvent, timeout);
       if (w != WAIT_OBJECT_0) {
+        DWORD wait_error = w == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
         CancelAndDrain(h, &ov);
         CloseHandle(ov.hEvent);
+        SetLastError(wait_error);
         return 0;
       }
       if (!GetOverlappedResult(h, &ov, &n, FALSE)) {
+        DWORD completion_error = GetLastError();
         CloseHandle(ov.hEvent);
+        SetLastError(completion_error);
         return 0;
       }
     }
     CloseHandle(ov.hEvent);
-    if (n == 0) return 0;
+    if (n == 0) {
+      SetLastError(ERROR_BROKEN_PIPE);
+      return 0;
+    }
     sent += n;
   }
   return 1;
@@ -118,10 +128,12 @@ int ReadMore(PipeReader* r, ULONGLONG deadline) {
     r->pos = 0;
   }
   if (r->end >= sizeof(r->buf)) {
+    SetLastError(ERROR_BUFFER_OVERFLOW);
     return 0;  // line overflow
   }
   DWORD timeout = RemainingMs(deadline);
   if (timeout == 0) {
+    SetLastError(ERROR_TIMEOUT);
     return 0;
   }
   OVERLAPPED ov = {};
@@ -137,21 +149,27 @@ int ReadMore(PipeReader* r, ULONGLONG deadline) {
     if (err != ERROR_IO_PENDING) {
       // Broken pipe / EOF counts as failure to read more.
       CloseHandle(ov.hEvent);
+      SetLastError(err);
       return 0;
     }
     DWORD w = WaitForSingleObject(ov.hEvent, timeout);
     if (w != WAIT_OBJECT_0) {
+      DWORD wait_error = w == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
       CancelAndDrain(r->h, &ov);
       CloseHandle(ov.hEvent);
+      SetLastError(wait_error);
       return 0;
     }
     if (!GetOverlappedResult(r->h, &ov, &n, FALSE)) {
+      DWORD completion_error = GetLastError();
       CloseHandle(ov.hEvent);
+      SetLastError(completion_error);
       return 0;
     }
   }
   CloseHandle(ov.hEvent);
   if (n == 0) {
+    SetLastError(ERROR_BROKEN_PIPE);
     return 0;  // EOF
   }
   r->end += n;
@@ -173,6 +191,7 @@ int ReadLine(PipeReader* r, char* out, size_t cap, ULONGLONG deadline) {
         return 1;
       }
       if (o + 1 >= cap) {
+        SetLastError(ERROR_BUFFER_OVERFLOW);
         return 0;  // line too long
       }
       out[o++] = c;
@@ -929,16 +948,34 @@ void EnvBoxIpcNotifyProcessCreated(unsigned long child_pid,
 }
 
 int EnvBoxIpcRegisterChild(HANDLE child, unsigned long child_pid) {
+  const ULONGLONG started = GetTickCount64();
+  // Keep failure stages and the Broker's bounded reason in Audit Mode. Never
+  // copy an arbitrary response, command line or environment into the log.
+  auto fail = [&](const char* stage, DWORD code, const char* reason = nullptr) {
+    char summary[192] = {};
+    _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+        "child-binding-failed stage=%s code=%lu child-pid=%lu elapsed-ms=%llu%s%s",
+        stage, code, child_pid, GetTickCount64() - started,
+        reason ? " reason=" : "", reason ? reason : "");
+    EnvBoxAuditEvent("REGISTER_CHILD", 0, summary);
+    SetLastError(code);
+    return 0;
+  };
   const RuntimeProfile* profile = EnvBoxProfile();
   FILETIME parent_created = {}, child_created = {}, exited = {}, kernel = {}, user = {};
-  if (!profile || GetProcessId(child) != child_pid ||
-      !GetProcessTimes(GetCurrentProcess(), &parent_created, &exited, &kernel, &user) ||
-      !GetProcessTimes(child, &child_created, &exited, &kernel, &user)) return 0;
+  if (!profile || GetProcessId(child) != child_pid)
+    return fail("identity", ERROR_INVALID_PARAMETER);
+  if (!GetProcessTimes(GetCurrentProcess(), &parent_created, &exited, &kernel, &user) ||
+      !GetProcessTimes(child, &child_created, &exited, &kernel, &user))
+    return fail("identity", GetLastError());
   ULONGLONG parent_generation = (static_cast<ULONGLONG>(parent_created.dwHighDateTime) << 32) | parent_created.dwLowDateTime;
   ULONGLONG child_generation = (static_cast<ULONGLONG>(child_created.dwHighDateTime) << 32) | child_created.dwLowDateTime;
-  ULONGLONG deadline = GetTickCount64() + 3000;
+  ULONGLONG deadline = started + 3000;
   HANDLE pipe = ConnectPipe(RemainingMs(deadline));
-  if (pipe == INVALID_HANDLE_VALUE) { SetLastError(ERROR_TIMEOUT); return 0; }
+  if (pipe == INVALID_HANDLE_VALUE) {
+    DWORD code = GetLastError();
+    return fail("connect", code == ERROR_SUCCESS ? ERROR_TIMEOUT : code);
+  }
   std::string request = "REGISTER_CHILD";
   AppendKvU32(&request, "pid", GetCurrentProcessId());
   AppendKvU32(&request, "child_pid", child_pid);
@@ -952,10 +989,39 @@ int EnvBoxIpcRegisterChild(HANDLE child, unsigned long child_pid) {
   char expected[128], response[256];
   _snprintf_s(expected, sizeof(expected), _TRUNCATE, "CHILD_BOUND pid=%lu creation_time=%llu", child_pid, child_generation);
   PipeReader reader = {}; reader.h = pipe;
-  int ok = SendLine(pipe, request, deadline) && ReadLine(&reader, response, sizeof(response), deadline) && strcmp(expected, response) == 0;
+  int sent = SendLine(pipe, request, deadline);
+  DWORD io_error = sent ? ERROR_SUCCESS : GetLastError();
+  int received = sent && ReadLine(&reader, response, sizeof(response), deadline);
+  if (sent && !received) io_error = GetLastError();
+  int ok = received && strcmp(expected, response) == 0;
+  const bool timed_out = RemainingMs(deadline) == 0;
   ClosePipe(pipe);
-  if (!ok) SetLastError(ERROR_ACCESS_DENIED);
-  return ok;
+  if (ok) return 1;
+  if (!received) {
+    DWORD code = timed_out ? ERROR_TIMEOUT : io_error;
+    if (code == ERROR_SUCCESS || code == ERROR_IO_PENDING) code = ERROR_BROKEN_PIPE;
+    return fail(sent ? "read" : "send", code);
+  }
+  // ERROR currently has one canonical field: code=<lowercase_reason>.
+  // Whitelist its alphabet and length instead of logging untrusted wire data.
+  constexpr char prefix[] = "ERROR code=";
+  if (strncmp(response, prefix, sizeof(prefix) - 1) == 0) {
+    const char* value = response + sizeof(prefix) - 1;
+    const bool quoted = *value == '"';
+    if (quoted) ++value;
+    char reason[64] = {};
+    size_t length = 0;
+    while (length + 1 < sizeof(reason) &&
+           ((value[length] >= 'a' && value[length] <= 'z') ||
+            (value[length] >= '0' && value[length] <= '9') || value[length] == '_')) {
+      reason[length] = value[length];
+      ++length;
+    }
+    if (length > 0 && ((quoted && value[length] == '"' && value[length + 1] == '\0') ||
+                       (!quoted && value[length] == '\0')))
+      return fail("denied", ERROR_ACCESS_DENIED, reason);
+  }
+  return fail("response", ERROR_INVALID_DATA);
 }
 
 void EnvBoxIpcNotifyProcessExited(unsigned long exit_code) {

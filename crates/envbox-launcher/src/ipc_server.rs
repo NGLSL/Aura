@@ -528,111 +528,160 @@ fn serve_loop(
     };
 
     struct OwnedHandle(HANDLE);
+    // Each connected pipe is moved to exactly one worker, which owns its
+    // disconnect and close. No other thread accesses that handle.
+    unsafe impl Send for OwnedHandle {}
+    impl OwnedHandle {
+        fn serve(
+            self,
+            table: &SharedTable,
+            stop: &AtomicBool,
+            expected: Option<&crate::service_start::TokenOwner>,
+        ) {
+            let _ = serve_connection(self.0, table, stop, expected);
+        }
+    }
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
                 unsafe {
+                    let _ = DisconnectNamedPipe(self.0);
                     let _ = CloseHandle(self.0);
                 }
             }
         }
     }
 
-    #[cfg(test)]
-    let mut iteration = 0;
-    while !stop.load(Ordering::SeqCst) {
+    // Keep one accept loop so stop needs only one wakeup. Connected clients
+    // run independently: an idle or slow client must not block new bootstrap
+    // connections. The pipe instance limit also bounds live worker threads;
+    // there is no unbounded queue of accepted clients.
+    std::thread::scope(|scope| {
+        let mut workers: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
         #[cfg(test)]
-        {
-            iteration += 1;
-            if iteration == 2 {
-                if let Some(pause) = &pause {
-                    let _ = pause.entered.send(());
-                    if pause
-                        .release
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(5))
-                        .is_err()
-                    {
-                        return;
+        let mut iteration = 0;
+        while !stop.load(Ordering::SeqCst) {
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let _ = workers.swap_remove(index).join();
+                } else {
+                    index += 1;
+                }
+            }
+            if workers.len() == 8 {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            #[cfg(test)]
+            {
+                iteration += 1;
+                if iteration == 2 {
+                    if let Some(pause) = &pause {
+                        let _ = pause.entered.send(());
+                        if pause
+                            .release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
             }
-        }
-        let name: Vec<u16> = std::ffi::OsStr::new(&pipe_name)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let first_instance = ready.is_some();
-        let open_mode = if first_instance {
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
-        } else {
-            PIPE_ACCESS_DUPLEX
-        };
-        let raw = unsafe {
-            CreateNamedPipeW(
-                PCWSTR(name.as_ptr()),
-                open_mode,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                8,
-                8192,
-                8192,
-                0,
-                security.as_ref().map(|sd| &sd.attributes as *const _),
-            )
-        };
-        if raw.is_invalid() {
-            let error = unsafe { GetLastError() };
-            if first_instance && error == ERROR_ACCESS_DENIED {
-                if let Some(tx) = ready.take() {
-                    let _ = tx.send(Err(std::io::Error::from_raw_os_error(error.0 as i32)));
+            let name: Vec<u16> = std::ffi::OsStr::new(&pipe_name)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let first_instance = ready.is_some();
+            let open_mode = if first_instance {
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+            } else {
+                PIPE_ACCESS_DUPLEX
+            };
+            let raw = unsafe {
+                CreateNamedPipeW(
+                    PCWSTR(name.as_ptr()),
+                    open_mode,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    8,
+                    8192,
+                    8192,
+                    0,
+                    security.as_ref().map(|sd| &sd.attributes as *const _),
+                )
+            };
+            if raw.is_invalid() {
+                let error = unsafe { GetLastError() };
+                if first_instance && error == ERROR_ACCESS_DENIED {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Err(std::io::Error::from_raw_os_error(error.0 as i32)));
+                    }
+                    return;
                 }
-                return;
+                // Preserve the existing retry behavior for a transient bind
+                // failure. start_on will stop the loop if the first instance does
+                // not become available within its bounded readiness window.
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
             }
-            // Preserve the existing retry behavior for a transient bind
-            // failure. start_on will stop the loop if the first instance does
-            // not become available within its bounded readiness window.
+            let pipe = OwnedHandle(raw);
+            #[cfg(test)]
+            if iteration == 2 {
+                if let Some(pause) = &pause {
+                    let _ = pause.published.send(());
+                }
+            }
+            if let Some(tx) = ready.take() {
+                let _ = tx.send(Ok(()));
+            }
+
+            // stop's nudge may run after the loop condition but before this
+            // instance exists. Once published, a later nudge can connect; an
+            // earlier one is covered by this check before the blocking accept.
             if stop.load(Ordering::SeqCst) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            continue;
-        }
-        let pipe = OwnedHandle(raw);
-        #[cfg(test)]
-        if iteration == 2 {
-            if let Some(pause) = &pause {
-                let _ = pause.published.send(());
+
+            match unsafe { ConnectNamedPipe(pipe.0, None) } {
+                Ok(()) => {}
+                Err(_) => {
+                    let code = unsafe { GetLastError() };
+                    if code != ERROR_PIPE_CONNECTED {
+                        drop(pipe);
+                        continue;
+                    }
+                }
             }
-        }
-        if let Some(tx) = ready.take() {
-            let _ = tx.send(Ok(()));
-        }
 
-        // stop's nudge may run after the loop condition but before this
-        // instance exists. Once published, a later nudge can connect; an
-        // earlier one is covered by this check before the blocking accept.
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-
-        match unsafe { ConnectNamedPipe(pipe.0, None) } {
-            Ok(()) => {}
-            Err(_) => {
-                let code = unsafe { GetLastError() };
-                if code != ERROR_PIPE_CONNECTED {
-                    drop(pipe);
-                    continue;
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let table = &table;
+            let stop = &stop;
+            let expected = expected.as_ref();
+            match std::thread::Builder::new()
+                .name("envbox-ipc-client".into())
+                .spawn_scoped(scope, move || pipe.serve(table, stop, expected))
+            {
+                Ok(worker) => workers.push(worker),
+                Err(_) => {
+                    stop.store(true, Ordering::SeqCst);
+                    return;
                 }
             }
         }
-
-        let _ = serve_connection(pipe.0, &table, &stop, expected.as_ref());
-        unsafe {
-            let _ = DisconnectNamedPipe(pipe.0);
+        // Joining explicitly also consumes any worker panic without making
+        // shutdown panic. Early returns are joined by the scope itself.
+        for worker in workers {
+            let _ = worker.join();
         }
-        drop(pipe);
-    }
+    });
 }
 
 #[cfg(windows)]
@@ -647,6 +696,41 @@ fn serve_connection(
     use windows::Win32::System::Pipes::{
         GetNamedPipeClientProcessId, SetNamedPipeHandleState, PIPE_NOWAIT,
     };
+
+    fn write_reply(
+        pipe: windows::Win32::Foundation::HANDLE,
+        stop: &AtomicBool,
+        reply: IpcMessage,
+    ) -> std::io::Result<()> {
+        let mut out = reply.encode_line().into_bytes();
+        out.push(b'\n');
+        // Message handling can wait for the registry lock or validate files.
+        // Give its response a fresh I/O budget instead of silently discarding
+        // it when the preceding read deadline expired during processing.
+        let deadline = std::time::Instant::now() + Duration::from_millis(750);
+        let mut offset = 0;
+        while offset < out.len() {
+            if stop.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "IPC broker stopping",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "IPC response write timed out",
+                ));
+            }
+            let mut written = 0u32;
+            unsafe { WriteFile(pipe, Some(&out[offset..]), Some(&mut written), None) }?;
+            offset += written as usize;
+            if written == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        Ok(())
+    }
 
     let mut client_pid = 0;
     unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) }?;
@@ -697,40 +781,27 @@ fn serve_connection(
                 continue;
             }
             let Ok(msg) = IpcMessage::decode_line(&line) else {
-                let mut out = protocol_denied("malformed_message")
-                    .encode_line()
-                    .into_bytes();
-                out.push(b'\n');
-                let mut written = 0;
-                let _ = unsafe { WriteFile(pipe, Some(&out), Some(&mut written), None) };
+                write_reply(pipe, stop, protocol_denied("malformed_message"))?;
+                deadline = std::time::Instant::now() + Duration::from_millis(750);
                 continue;
             };
             // Re-check the process generation on every message. A cached PID
             // alone must not authorize a newly created process after reuse.
-            let reply = if process_creation_time(client_pid) == Some(client.creation_time) {
-                table.lock().unwrap().handle_client(&client, &msg)
-            } else {
-                Some(protocol_denied("client_generation_changed"))
+            let reply = {
+                let mut registry = table.lock().unwrap();
+                // A worker may have waited behind an expensive identity check.
+                // Do not start queued work after shutdown has been requested.
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if process_creation_time(client_pid) == Some(client.creation_time) {
+                    registry.handle_client(&client, &msg)
+                } else {
+                    Some(protocol_denied("client_generation_changed"))
+                }
             };
             if let Some(rep) = reply {
-                let mut out = rep.encode_line().into_bytes();
-                out.push(b'\n');
-                let mut offset = 0;
-                while offset < out.len()
-                    && std::time::Instant::now() < deadline
-                    && !stop.load(Ordering::SeqCst)
-                {
-                    let mut written = 0u32;
-                    let result =
-                        unsafe { WriteFile(pipe, Some(&out[offset..]), Some(&mut written), None) };
-                    if result.is_err() {
-                        return Ok(());
-                    }
-                    offset += written as usize;
-                    if written == 0 {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                }
+                write_reply(pipe, stop, rep)?;
             }
             deadline = std::time::Instant::now() + Duration::from_millis(750);
         }

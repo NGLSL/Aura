@@ -204,6 +204,9 @@ impl SessionTable {
             ("envbox-runtime64.dll", "x64", crate::injection::PeArch::X64),
             ("envbox-runtime32.dll", "x86", crate::injection::PeArch::X86),
         ] {
+            if bundle.contains_key(architecture) {
+                continue;
+            }
             let sibling = path.parent().unwrap().join(name);
             if sibling.is_file() && crate::injection::pe_arch(&sibling).ok() == Some(expected_arch)
             {
@@ -417,16 +420,16 @@ impl SessionTable {
                 {
                     return denied("parent_identity_unverified");
                 }
-                let bound = &self.bindings[&client.pid];
+                let bound = self.bindings[&client.pid].clone();
                 let Some(IpcMessage::Profile {
                     instance_id: expected_instance,
                     inherit_children: true,
                     ..
-                }) = self.profiles.get(bound)
+                }) = self.profiles.get(&bound)
                 else {
                     return denied("child_inheritance_disabled");
                 };
-                if profile_id != bound
+                if profile_id != &bound
                     || instance_id != expected_instance
                     || process_parent(*child_pid) != Some(client.pid)
                     || process_creation_time(*child_pid) != Some(*child_creation_time)
@@ -434,11 +437,22 @@ impl SessionTable {
                 {
                     return denied("child_or_parent_snapshot_mismatch");
                 }
-                if self.bindings.get(child_pid).is_some_and(|old| old != bound)
-                    || self
-                        .generations
-                        .get(child_pid)
-                        .is_some_and(|old| old != child_creation_time)
+                match self.generations.get(child_pid) {
+                    Some(old) if old != child_creation_time => {
+                        // The OS snapshot above proves this PID now belongs to
+                        // a different process. Short-lived children need not
+                        // have sent ProcessExited before Windows reuses a PID.
+                        self.retire_pid(*child_pid);
+                    }
+                    None if self.bindings.contains_key(child_pid) => {
+                        return denied("child_binding_generation_missing");
+                    }
+                    _ => {}
+                }
+                if self
+                    .bindings
+                    .get(child_pid)
+                    .is_some_and(|old| old != &bound)
                     || self
                         .parents
                         .get(child_pid)
@@ -463,8 +477,12 @@ impl SessionTable {
                 {
                     return denied("child_runtime_identity_conflict");
                 }
-                let profile_id = bound.clone();
-                self.bind_pid(*child_pid, &profile_id);
+                self.bind_pid(*child_pid, &bound);
+                if self.generations.get(child_pid) != Some(child_creation_time)
+                    || self.bindings.get(child_pid) != Some(&bound)
+                {
+                    return denied("child_binding_not_established");
+                }
                 self.parents.insert(*child_pid, client.pid);
                 self.expected_runtimes.insert(*child_pid, expected);
                 self.runtime_bundles.insert(*child_pid, bundle);
@@ -651,6 +669,28 @@ impl SessionTable {
         }
     }
 
+    fn retire_pid(&mut self, pid: u32) {
+        if let Some(key) = self.bindings.get(&pid) {
+            if let Some(set) = self.live.get_mut(key) {
+                set.remove(&pid);
+            }
+        }
+        self.bindings.remove(&pid);
+        if !self.parents.contains_key(&pid) {
+            if let Some(identity) = self.identities.get(&pid) {
+                self.exited_root_identities
+                    .insert((pid, identity.identity.creation_time), identity.clone());
+            }
+        }
+        self.generations.remove(&pid);
+        self.identities.remove(&pid);
+        self.reconnect_challenges.remove(&pid);
+        self.reconfirmed.remove(&pid);
+        self.expected_runtimes.remove(&pid);
+        self.runtime_bundles.remove(&pid);
+        self.parents.remove(&pid);
+    }
+
     pub fn handle(&mut self, msg: &IpcMessage) -> Option<IpcMessage> {
         match msg {
             IpcMessage::Hello { .. } => {
@@ -732,25 +772,7 @@ impl SessionTable {
                 None
             }
             IpcMessage::ProcessExited { pid, .. } => {
-                if let Some(key) = self.bindings.get(pid).cloned() {
-                    if let Some(set) = self.live.get_mut(&key) {
-                        set.remove(pid);
-                    }
-                }
-                self.bindings.remove(pid);
-                if !self.parents.contains_key(pid) {
-                    if let Some(identity) = self.identities.get(pid) {
-                        self.exited_root_identities
-                            .insert((*pid, identity.identity.creation_time), identity.clone());
-                    }
-                }
-                self.generations.remove(pid);
-                self.identities.remove(pid);
-                self.reconnect_challenges.remove(pid);
-                self.reconfirmed.remove(pid);
-                self.expected_runtimes.remove(pid);
-                self.runtime_bundles.remove(pid);
-                self.parents.remove(pid);
+                self.retire_pid(*pid);
                 self.events.push(msg.clone());
                 None
             }
