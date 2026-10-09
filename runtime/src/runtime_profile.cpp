@@ -67,7 +67,16 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
   // Hot path: GetTimeZoneInformation hooks call this every time. EnumDynamic-
   // TimeZoneInformation walks the whole host table (100+ rows), which made
   // Chrome-style workloads ~300x slower. Profile tz is process-immutable, so
-  // cache the first successful lookup (and the miss for the same id).
+  // cache successful lookups and definitive misses, but retry transient errors.
+  // Serialize initialization and reads so callers never observe a partial entry.
+  static SRWLOCK s_lock = SRWLOCK_INIT;
+  struct CacheLock {
+    explicit CacheLock(SRWLOCK* lock) : lock(lock) {
+      AcquireSRWLockExclusive(lock);
+    }
+    ~CacheLock() { ReleaseSRWLockExclusive(lock); }
+    SRWLOCK* lock;
+  } guard(&s_lock);
   static DYNAMIC_TIME_ZONE_INFORMATION s_cache = {};
   static int s_cached = 0;
   static int s_found = 0;
@@ -80,16 +89,19 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
   }
   DWORD index = 0;
   int found = 0;
+  bool cacheable = false;
   DYNAMIC_TIME_ZONE_INFORMATION hit = {};
   for (;;) {
     DYNAMIC_TIME_ZONE_INFORMATION info = {};
     DWORD status = EnumDynamicTimeZoneInformation(index, &info);
     if (status != ERROR_SUCCESS) {
+      cacheable = status == ERROR_NO_MORE_ITEMS;
       break;
     }
     if (_wcsicmp(info.TimeZoneKeyName, windows_id) == 0) {
       hit = info;
       found = 1;
+      cacheable = true;
       break;
     }
     index++;
@@ -97,10 +109,12 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
       break;
     }
   }
-  wcsncpy_s(s_id, windows_id, _TRUNCATE);
-  s_cache = hit;
-  s_found = found;
-  s_cached = 1;
+  if (cacheable) {
+    wcsncpy_s(s_id, windows_id, _TRUNCATE);
+    s_cache = hit;
+    s_found = found;
+    s_cached = 1;
+  }
   if (found) {
     *out = hit;
   }

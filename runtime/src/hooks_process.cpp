@@ -574,12 +574,14 @@ static BOOL SpawnInjected(
       ZeroMemory(lpProcessInformation, sizeof(*lpProcessInformation));
     }
     // Ticket 30: surface elevation/integrity vs generic inject failure (audit only).
+    const char* failure = "inject-failed";
     if (err == ERROR_ELEVATION_REQUIRED || err == ERROR_ACCESS_DENIED ||
         err == ERROR_PRIVILEGE_NOT_HELD) {
-      EnvBoxAuditEvent(audit_api, 0, "inject-failed-elevation");
-    } else {
-      EnvBoxAuditEvent(audit_api, 0, "inject-failed");
+      failure = "inject-failed-elevation";
     }
+    char detail[96] = {};
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "%s error=%lu", failure, err);
+    EnvBoxAuditEvent(audit_api, 0, detail);
     SetLastError(err);
     return FALSE;
   }
@@ -689,15 +691,43 @@ static BOOL WINAPI HookCreateProcessAsUserW(
   // repeatedly attempting this path causes renderer restart churn. Keep the
   // browser's own sandbox creation intact and report this partial coverage.
   BrowserEngineKind engine = ClassifyBrowserEngine(app);
+  if (app == nullptr) {
+    const std::wstring image = EnvBoxCommandImage(cmd);
+    engine = ClassifyBrowserEngine(image.c_str());
+  }
   if ((engine == kEngineChromium || engine == kEngineEdge) &&
       HasCommandSwitch(cmd, L"--type=renderer")) {
     if (ControlledStartup()) { EnvBoxAuditEvent("CreateProcessAsUserW", 0, "controlled-chromium-renderer-unsupported"); SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+    // Keep the restricted token and sandbox startup contract, but do not let
+    // an explicit Chromium environment bypass the immutable parent's Profile.
+    // This is native browser configuration only; no Runtime DLL is injected.
+    std::vector<wchar_t> env = EnvToWide(environment, flags);
+    if (env.empty()) env = CurrentProcessEnvBlock();
+    if (!UpsertProfileKeys(&env)) {
+      EnvBoxAuditEvent("CreateProcessAsUserW", 0, "child-dns-snapshot-invalid");
+      SetLastError(ERROR_INVALID_DATA);
+      return FALSE;
+    }
+    std::wstring command(cmd);
+    std::vector<std::pair<std::wstring, std::wstring>> dummy;
+    ApplyBrowserChildPolicy(app, &command, &dummy);
     BOOL created = TrueCreateProcessAsUserW(
-        token, app, cmd, process_attributes, thread_attributes, inherit_handles,
-        flags, environment, current_directory, startup, process_info);
+        token, app, command.data(), process_attributes, thread_attributes,
+        inherit_handles, flags | CREATE_UNICODE_ENVIRONMENT, env.data(),
+        current_directory, startup, process_info);
     DWORD error = GetLastError();
     EnvBoxAuditEvent("CreateProcessAsUserW", 0,
                      "chromium-sandboxed-renderer-unsupported");
+    char summary[128] = {};
+    if (created) {
+      _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+                  "chromium-renderer-profile-overlay-created child-pid=%lu",
+                  process_info->dwProcessId);
+    } else {
+      _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+                  "chromium-renderer-profile-overlay-failed error=%lu", error);
+    }
+    EnvBoxAuditEvent("CreateProcessAsUserW", 0, summary);
     SetLastError(error);
     return created;
   }
@@ -747,44 +777,65 @@ static BOOL WINAPI HookCreateProcessA(
     LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles,
     DWORD dwCreationFlags, LPVOID lpEnvironment, LPCSTR lpCurrentDirectory,
     LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-  wchar_t app[32768] = {};
-  wchar_t cmd[32768] = {};
-  wchar_t cwd[32768] = {};
-  if (lpApplicationName) {
-    MultiByteToWideChar(CP_ACP, 0, lpApplicationName, -1, app, 32768);
-  }
-  if (lpCommandLine) {
-    MultiByteToWideChar(CP_ACP, 0, lpCommandLine, -1, cmd, 32768);
-  }
-  if (lpCurrentDirectory) {
-    MultiByteToWideChar(CP_ACP, 0, lpCurrentDirectory, -1, cwd, 32768);
+  const bool extended = (dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT) != 0;
+  const size_t required_size = extended ? sizeof(STARTUPINFOEXA)
+                                        : sizeof(STARTUPINFOA);
+  if (lpStartupInfo == nullptr || lpStartupInfo->cb < required_size) {
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
   }
 
-  STARTUPINFOW siw = {};
-  if (lpStartupInfo) {
-    siw.cb = sizeof(siw);
-    siw.lpDesktop = nullptr;
-    siw.lpTitle = nullptr;
-    siw.dwFlags = lpStartupInfo->dwFlags;
-    siw.wShowWindow = lpStartupInfo->wShowWindow;
-    siw.dwX = lpStartupInfo->dwX;
-    siw.dwY = lpStartupInfo->dwY;
-    siw.dwXSize = lpStartupInfo->dwXSize;
-    siw.dwYSize = lpStartupInfo->dwYSize;
-    siw.dwXCountChars = lpStartupInfo->dwXCountChars;
-    siw.dwYCountChars = lpStartupInfo->dwYCountChars;
-    siw.dwFillAttribute = lpStartupInfo->dwFillAttribute;
-    siw.hStdInput = lpStartupInfo->hStdInput;
-    siw.hStdOutput = lpStartupInfo->hStdOutput;
-    siw.hStdError = lpStartupInfo->hStdError;
-  } else {
-    siw.cb = sizeof(siw);
+  // Keep optional strings distinct from null pointers and propagate conversion
+  // failures instead of silently substituting another application/directory.
+  auto widen = [](LPCSTR source, std::wstring* destination) {
+    if (source == nullptr) return true;
+    const int length = MultiByteToWideChar(CP_ACP, 0, source, -1, nullptr, 0);
+    if (length == 0) return false;
+    destination->resize(length);
+    if (MultiByteToWideChar(CP_ACP, 0, source, -1, destination->data(), length) == 0)
+      return false;
+    destination->pop_back();
+    return true;
+  };
+  std::wstring app, cmd, cwd, desktop, title;
+  if (!widen(lpApplicationName, &app) || !widen(lpCommandLine, &cmd) ||
+      !widen(lpCurrentDirectory, &cwd) ||
+      !widen(lpStartupInfo->lpDesktop, &desktop) ||
+      !widen(lpStartupInfo->lpTitle, &title)) {
+    return FALSE;
+  }
+
+  STARTUPINFOEXW siw = {};
+  STARTUPINFOW& startup = siw.StartupInfo;
+  startup.cb = extended ? sizeof(siw) : sizeof(startup);
+  startup.lpDesktop = lpStartupInfo->lpDesktop ? desktop.data() : nullptr;
+  startup.lpTitle = lpStartupInfo->lpTitle ? title.data() : nullptr;
+  startup.dwFlags = lpStartupInfo->dwFlags;
+  startup.wShowWindow = lpStartupInfo->wShowWindow;
+  startup.dwX = lpStartupInfo->dwX;
+  startup.dwY = lpStartupInfo->dwY;
+  startup.dwXSize = lpStartupInfo->dwXSize;
+  startup.dwYSize = lpStartupInfo->dwYSize;
+  startup.dwXCountChars = lpStartupInfo->dwXCountChars;
+  startup.dwYCountChars = lpStartupInfo->dwYCountChars;
+  startup.dwFillAttribute = lpStartupInfo->dwFillAttribute;
+  startup.cbReserved2 = lpStartupInfo->cbReserved2;
+  startup.lpReserved2 = lpStartupInfo->lpReserved2;
+  startup.hStdInput = lpStartupInfo->hStdInput;
+  startup.hStdOutput = lpStartupInfo->hStdOutput;
+  startup.hStdError = lpStartupInfo->hStdError;
+  if (extended) {
+    // The attribute list is encoding-neutral and remains caller-owned for the
+    // synchronous CreateProcess call (sandbox/parent/handle-list attributes).
+    siw.lpAttributeList =
+        reinterpret_cast<LPSTARTUPINFOEXA>(lpStartupInfo)->lpAttributeList;
   }
 
   return HookCreateProcessW(
-      app[0] ? app : nullptr, cmd[0] ? cmd : nullptr, lpProcessAttributes,
+      lpApplicationName ? app.c_str() : nullptr,
+      lpCommandLine ? cmd.data() : nullptr, lpProcessAttributes,
       lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
-      cwd[0] ? cwd : nullptr, &siw, lpProcessInformation);
+      lpCurrentDirectory ? cwd.c_str() : nullptr, &startup, lpProcessInformation);
 }
 
 int EnvBoxInstallProcessHooks() {
