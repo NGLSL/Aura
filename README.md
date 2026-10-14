@@ -1,120 +1,49 @@
-# EnvBox
+# Aura
 
-Run Windows applications with consistent Profile environment information — without a VM.
+在 Windows 上，为应用配置独立的语言、地区、时区和其他环境信息。
 
-Windows process-level environment virtualization launcher. Target apps run on the host (full access to filesystem, GPU, network, user profile, Git/SSH/IDE) but see **Environment Profile** values for locale, region, UI language, timezone, DNS view, environment variables, and whitelisted internationalization registry reads.
+Aura 让应用直接运行在宿主系统上，同时通过环境配置控制它们读取到的部分系统信息。修改只作用于对应的进程树，不改变 Windows 全局设置。
 
-## Security posture
+## 安装与使用
 
-**EnvBox does not provide a security boundary; launched apps keep the current user’s filesystem and permissions.**
+1. 从[最新版本](https://github.com/NGLSL/Aura/releases/latest)下载并运行 `aura-setup.exe`。
+2. 在“环境配置”中设置语言、地区、时区等信息。
+3. 在“应用”中添加程序，选择环境配置并启动。
 
-EnvBox is not a sandbox. It does not isolate files, registry writes, network, or privileges. Do not use it as a security control.
+需要 PowerShell 7 时，在应用的终端宿主中选择 PowerShell 7，并先安装 `pwsh.exe`。
 
-### Elevation / integrity
+可在“设置”中检查更新。升级后重新启动目标应用，才能加载新的运行时；已有应用和环境配置无需重建。
 
-Runtime injection is process-scoped and runs at EnvBox’s integrity level. A target that requires a **higher** integrity level (for example `requireAdministrator`) cannot be injected. Startup Fail Policy: EnvBox **refuses to start** the target rather than silently running it without virtualization. The error names `integrity/elevation` and states that the target must run at the **same integrity level as EnvBox or lower** — start EnvBox elevated when the target requires elevation. This is a compatibility limit, not a security control.
+## 主要功能
 
-## Principles
+- 配置语言、地区、时区、环境变量及部分注册表读取视图。
+- 为受支持的 Windows DNS 解析入口设置 UDP、TCP、DoT 或 DoH 上游；严格模式失败时不回退宿主 DNS。
+- 可选的主机名、用户名、MAC 和 MachineGuid 读取视图。MAC 支持 `Get-NetAdapter`、`Get-CimInstance` 的本机网卡查询。
+- 支持直接启动、命令提示符、Windows PowerShell、PowerShell 7 和 Windows Terminal。
+- 查看运行实例与审计记录。每次启动使用固定配置，编辑只影响后续启动；关闭 Aura 后，已启动的应用继续运行。
 
-1. **Process-scoped** — changes apply only to one RuntimeInstance’s process tree
-2. **Host-transparent** — never modify Windows global configuration
-3. **Environment-consistent** — one Profile keeps Locale / Region / Language / Timezone / DNS / Environment aligned
+## 使用范围
 
-## Components
+Aura 不提供安全隔离。应用保留宿主文件、网络和当前用户权限，不能把它当作沙箱。
 
-| Path | Role |
-|------|------|
-| `crates/envbox-app` | Iced GUI |
-| `crates/envbox-core` | Domain model |
-| `crates/envbox-storage` | TOML persistence + validation |
-| `crates/envbox-launcher` | Resolve, env block, Job, injection |
-| `crates/envbox-cli` | `envbox run` / `profile` / `app` |
-| `runtime/` | Detours Runtime DLL |
-| `tools/envbox-probe` | Acceptance probe |
+覆盖范围取决于程序使用的读取入口；程序自行实现的解析、身份缓存和浏览器沙箱进程可能只有部分覆盖。目标程序需要管理员权限时，Aura 也需要相应权限；注入完全失败时拒绝启动。
 
-## Quick start
+配置保存在 `%LOCALAPPDATA%\com.aura.envbox\`。更多说明见[领域文档](docs/CONTEXT.md)和[版本记录](docs/releases/)。
 
-Install [rustup](https://rustup.rs/) with the Windows MSVC toolchain. This repository pins Rust 1.99.0 in `rust-toolchain.toml`; Cargo selects it automatically. CI and installer workflows use the same version.
+## 开发
+
+项目使用 Rust 1.99.0 和 Windows MSVC 工具链，版本由 `rust-toolchain.toml` 固定。完整安装包还需要 Visual Studio C++ 构建工具、CMake、Microsoft Detours 和 NSIS。
 
 ```powershell
-# Rust development build
-cargo build
+# 构建 Rust 工作区
+cargo build --workspace --locked
 
-# Complete installer build (Rust workspace + x64/x86 Runtime + NSIS)
+# 构建运行时和 Windows 安装包
 .\scripts\build-installer.ps1
-
-# add a US profile and run Probe under it
-envbox profile add --name US --locale en-US --ui-language en-US --region US `
-  --tz-windows "Pacific Standard Time" --tz-iana America/Los_Angeles
-envbox run --profile <id> .\target\debug\envbox-probe.exe
 ```
 
-Config lives under `%LOCALAPPDATA%\com.aura.envbox\` (or `ENVBOX_CONFIG_ROOT`).
+## 社区与许可
 
-DoH 的 `bootstrap_ips` 可留空：Aura 使用同一 Profile 中可直接连接的上游解析服务域名；手填 IP 则覆盖自动解析。全部上游都缺少解析起点时查询失败，不调用宿主 DNS，也不添加默认公共 DNS。当前自动解析连接按 IPv4 范围支持。
+感谢 [LINUX DO](https://linux.do/) 社区对开源项目的支持。
 
-GUI 统一使用“环境配置”：此页只创建、查看和编辑环境设置；在“应用”页选择应用及其默认环境配置并启动，在“运行实例”页管理实例，无需另建容器。每次运行仍使用不可变快照。旧容器数据与 CLI 兼容入口保留，GUI 自动管理内部运行作用域；历史记录按运行时的 Profile 身份归属。
-
-## Windows installer
-
-`scripts/build-installer.ps1` builds the Rust workspace, both C++ Runtime DLLs, and the NSIS installer. The version shown in Aura and the version registered by the installer both come from `workspace.package.version` in `Cargo.toml`. When bumping it, update and commit `Cargo.lock` too; an explicit `-Version` value is accepted only when it matches the Cargo version.
-
-For a test build, run **Actions → Build Windows installer → Run workflow**. Download the `aura-windows-installer` artifact from the completed run; it contains `aura-setup.exe` and its SHA-256 checksum.
-
-For a release, update `Cargo.toml` and `Cargo.lock`, add `docs/releases/v<version>.md`, then push `main` and wait for `ci.yml` to pass on that exact commit. Create and push an annotated `v<version>` tag on the same commit. `release.yml` checks the tag, version, `main` commit and CI result, builds the complete Windows installer, and publishes a GitHub Release with the installer and checksum. Both workflows build pinned Microsoft Detours for x64 and x86 on a Windows 2022 runner.
-
-### Updates
-
-Open **Settings → About Aura and updates** to check the latest stable release, open its release page, or visit the [GitHub repository](https://github.com/NGLSL/Aura). Update checks are manual and contact the GitHub API.
-
-When a newer version is available, choose **Download and install**. Aura downloads the official release installer and its SHA-256 checksum, verifies the download, and opens the Windows installer. Windows may ask for administrator approval. Aura exits only after the installer starts successfully; finish the installation wizard and reopen Aura afterwards. Applications already launched through Aura keep running, and your local configuration is retained. If checking, downloading, verification, or installer startup fails, the error stays visible and you can retry or use the release page to install manually.
-
-## Instance lifecycle
-
-An **environment container** is a persistent workspace that selects a Profile and manages runs using immutable configuration snapshots. It changes the supported environment information that applications read; applications retain host resources and permissions. Container runs use the user-level Supervisor for background ownership, reconnect and Stop. No driver or LocalSystem service is required for this environment-information workflow.
-
-Closing Aura leaves launched applications running. Container runs can be managed after reconnecting to their Supervisor; recovery must reconfirm process generations and Runtime identity, and reports TrackingLost when ownership cannot be established. Legacy direct runs retain their detached-instance behavior: reopening Aura does not automatically take ownership of their process trees.
-
-The container view and CLI show observed Profile matching, configuration completeness and installed Hook groups. Hook installation is evidence of attachment, not proof that every API or application behaves as configured. Unobserved legacy records remain unknown. Historical storage policy metadata is retained for configuration compatibility, but is not enforced or exposed as an editable container feature.
-
-```powershell
-envbox container create --name US --profile <profile-uuid>
-envbox container list
-```
-
-## Performance
-
-Extra launch latency target: ideal &lt; 100 ms, acceptable &lt; 300 ms. Runtime has no polling or timers (event-driven hooks only).
-
-## Scope notes
-
-- Virtual timezone, real timeline (never hook `GetSystemTime` / QPC / TickCount)
-- DNS configuration view and process-scoped Windows resolver routing — no packet redirection
-- Registry Virtual View is whitelist-only — not a registry sandbox
-- No anti-stealth / anti-detection goals
-
-### DNS routing
-
-With `VirtualView` and working DNS hooks, supported `DnsQuery_A/W/UTF8` and version-1 `DnsQueryEx` queries send every resource-record type to the Profile DNS servers, including HTTPS (65), SVCB (64), TXT, PTR, SRV and unknown types. Responses are decoded by Windows' DNS message parser; record formats depend on the installed Windows version. Profile timeouts, DNS errors and unsupported query inputs return an error instead of retrying through host DNS. Query names currently require ASCII (including pre-encoded IDN punycode); Unicode names return an error. `Host` mode keeps Windows resolution unchanged.
-
-Profile DNS uses an explicit ordered list of UDP, TCP, DoT or DoH upstreams and requires `strict = true`. UDP truncation retries over TCP to the same endpoint. DoT uses a configured IP and TLS server identity; DoH uses configured bootstrap IPs and the HTTPS server identity. TLS trust, protocol or upstream failures return a resolution error or try the next explicitly configured upstream. A plaintext fallback occurs only when you configure a later UDP/TCP upstream. IPv4 upstream connections are the current delivery scope; IPv6 transport qualification is deferred, while AAAA records remain supported. See [.scratch/dns-transports/spec.md](.scratch/dns-transports/spec.md).
-
-Supported Profile lookups through address-resolution hooks (`getaddrinfo` / `GetAddrInfo*`) return a resolution error when Profile DNS fails. Unsupported asynchronous resolver inputs are rejected without calling Windows resolution; `DnsQueryRaw`, when present and hooked, is explicitly rejected in strict Profile mode. Required DNS hook failures reject Runtime initialization. Local-machine passthrough, uninjected processes and application-owned UDP/TCP DNS, DoH, DoT or DoQ remain outside this resolver guarantee. Aura does not provide a network security boundary or change the host DNS configuration.
-
-### Profile identity read views
-
-Profiles optionally configure `identity.computer_name`, `user_name`, `mac_address`, and `machine_guid`. Empty fields retain the Host view. The GUI exposes these in Profile advanced settings; the CLI provides `profile identity show UUID`, `set UUID --computer-name NAME --user-name NAME --mac-address MAC --machine-guid UUID`, `set UUID --clear FIELD`, and `reset UUID`.
-
-The current read APIs are `GetComputerNameA/W`, `GetComputerNameExA/W`, Winsock `gethostname` / `GetHostNameW`, `GetUserNameA/W`, `GetAdaptersAddresses`, `GetAdaptersInfo`, `GetIfEntry`, `GetIfTable`, `GetIfEntry2`, `GetIfTable2`, and `RegQueryValueExA/W` / `RegGetValueA/W` for `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`. Computer DNS domain views are empty, and the FQDN view is the configured single label. MAC applies to six-byte physical addresses returned by the listed APIs, including permanent addresses in MIB rows. With an explicit computer name, that virtual label cannot bypass strict Profile DNS as a local-machine lookup.
-
-These views do not rename the host, change accounts, tokens, SIDs, permissions, adapter settings, registry data, or public IP. `GetUserNameEx`, WMI, Native Registry APIs, device IOCTLs and application-owned identity caches remain outside this API coverage. CPU/GPU/disk identity support is deferred. New immutable snapshots use Profile schema 3; legacy schema 1/2 snapshots retain their original digests. An identity Profile requires a Runtime that explicitly advertises and installs the necessary hooks.
-
-## Community
-
-Thanks to the [LINUX DO](https://linux.do/) community for supporting open-source projects.
-
-## License
-
-Aura / EnvBox is licensed under the [Apache License 2.0](LICENSE).
-
-Microsoft Detours retains its MIT license; see [third-party notices](THIRD_PARTY_NOTICES.txt). Other dependencies retain their respective licenses.
+项目采用 [Apache 2.0 许可证](LICENSE)，依赖许可见[第三方声明](THIRD_PARTY_NOTICES.txt)。
