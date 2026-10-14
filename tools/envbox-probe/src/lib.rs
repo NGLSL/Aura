@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 pub mod host;
 pub mod identity;
+mod cim_identity;
 
 /// Stable section headers used as independent expected values in tests.
 pub const SECTION_GEO: &str = "GEO";

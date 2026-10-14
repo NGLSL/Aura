@@ -42,6 +42,12 @@ static int InstallAllHooks() {
       (identity->identity_machine_guid[0] && g_hook_counts[7] != 7)) {
     DetourTransactionAbort(); return 0;
   }
+  // Preserve the Win32 identity IPC count. CIM is a separately qualified,
+  // mandatory bootstrap seam; failure must abort before application entry.
+  if (identity->identity_mac_address[0] && EnvBoxInstallCimIdentityHooks() != 1) {
+    DetourTransactionAbort();
+    return 0;
+  }
   ok += g_hook_counts[8] = EnvBoxInstallProcessHooks();
   if (g_hook_counts[8] < 0 ||
       (EnvBoxControlledStartup() && g_hook_counts[8] != 4)) {

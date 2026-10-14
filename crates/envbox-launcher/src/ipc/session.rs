@@ -620,6 +620,15 @@ impl SessionTable {
                 {
                     return denied("actual_runtime_module_mismatch");
                 }
+                // Qualify each actual module, including opposite-bitness
+                // children and recovered processes, rather than only the root.
+                if let IpcMessage::Profile { identity, .. } = &actual {
+                    if identity.mac_address.is_some()
+                        && crate::recovery::validate_runtime_identity(path, identity).is_err()
+                    {
+                        return denied("runtime_identity_capability_missing");
+                    }
+                }
                 if self
                     .identities
                     .get(&client.pid)

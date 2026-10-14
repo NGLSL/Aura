@@ -4,7 +4,9 @@
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include <cstring>
+#include <cstdio>
 #include "hooks.h"
+#include "audit.h"
 
 static auto TrueGetComputerNameW = &GetComputerNameW;
 static auto TrueGetComputerNameA = &GetComputerNameA;
@@ -109,42 +111,76 @@ static int WSAAPI HookGetHostNameW(PWSTR buffer,int capacity) {
 static int WSAAPI HookGetHostNameA(char* buffer,int capacity) {
   return EnvBoxProfile()->identity_computer_name[0] ? HostName(buffer,capacity) : TrueGetHostNameA(buffer,capacity);
 }
-static void Mac(BYTE *data, ULONG length) {
+static bool Mac(BYTE *data, ULONG length) {
   const auto *p = EnvBoxProfile();
-  if (p->identity_mac_address[0] && length == 6)
+  if (p->identity_mac_address[0] && length == 6) {
     memcpy(data, p->identity_mac_bytes, 6);
+    return true;
+  }
+  return false;
+}
+static void AuditMac(const char *api, DWORD status, bool covered,
+                     DWORD last_error) {
+  char summary[96];
+  const char *view = status != NO_ERROR
+      ? ((status == ERROR_BUFFER_OVERFLOW || status == ERROR_INSUFFICIENT_BUFFER)
+             ? "mac-buffer-size-query" : "mac-api-error")
+      : (covered ? "mac-virtual-view"
+                 : (EnvBoxProfile()->identity_mac_address[0]
+                        ? "mac-no-six-byte-address" : "mac-host"));
+  snprintf(summary, sizeof(summary), "%s status=%lu", view,
+           static_cast<unsigned long>(status));
+  EnvBoxAuditEvent(api, covered ? 1 : 0, summary);
+  // IP Helper returns a status code; preserve the thread error state as well.
+  SetLastError(last_error);
 }
 static ULONG WINAPI HookGetAdaptersInfo(PIP_ADAPTER_INFO p, PULONG n) {
   ULONG s = TrueGetAdaptersInfo(p, n);
+  const DWORD last_error = GetLastError();
+  bool covered = false;
   if (s == NO_ERROR)
-    for (auto *a = p; a; a = a->Next) Mac(a->Address, a->AddressLength);
+    for (auto *a = p; a; a = a->Next)
+      covered = Mac(a->Address, a->AddressLength) || covered;
+  AuditMac("GetAdaptersInfo", s, covered, last_error);
   return s;
 }
 static DWORD WINAPI HookGetIfEntry(PMIB_IFROW p) {
   DWORD s = TrueGetIfEntry(p);
-  if (s == NO_ERROR) Mac(p->bPhysAddr, p->dwPhysAddrLen);
+  const DWORD last_error = GetLastError();
+  const bool covered = s == NO_ERROR && Mac(p->bPhysAddr, p->dwPhysAddrLen);
+  AuditMac("GetIfEntry", s, covered, last_error);
   return s;
 }
 static DWORD WINAPI HookGetIfTable(PMIB_IFTABLE p, PULONG n, BOOL order) {
   DWORD s = TrueGetIfTable(p, n, order);
+  const DWORD last_error = GetLastError();
+  bool covered = false;
   if (s == NO_ERROR && p)
     for (DWORD i = 0; i < p->dwNumEntries; ++i)
-      Mac(p->table[i].bPhysAddr, p->table[i].dwPhysAddrLen);
+      covered = Mac(p->table[i].bPhysAddr, p->table[i].dwPhysAddrLen) || covered;
+  AuditMac("GetIfTable", s, covered, last_error);
   return s;
 }
-static void Row2(PMIB_IF_ROW2 p) {
-  Mac(p->PhysicalAddress, p->PhysicalAddressLength);
+static bool Row2(PMIB_IF_ROW2 p) {
+  const bool covered = Mac(p->PhysicalAddress, p->PhysicalAddressLength);
   Mac(p->PermanentPhysicalAddress, p->PhysicalAddressLength);
+  return covered;
 }
 static DWORD WINAPI HookGetIfEntry2(PMIB_IF_ROW2 p) {
   DWORD s = TrueGetIfEntry2(p);
-  if (s == NO_ERROR) Row2(p);
+  const DWORD last_error = GetLastError();
+  const bool covered = s == NO_ERROR && Row2(p);
+  AuditMac("GetIfEntry2", s, covered, last_error);
   return s;
 }
 static DWORD WINAPI HookGetIfTable2(PMIB_IF_TABLE2 *p) {
   DWORD s = TrueGetIfTable2(p);
+  const DWORD last_error = GetLastError();
+  bool covered = false;
   if (s == NO_ERROR && p && *p)
-    for (ULONG i = 0; i < (*p)->NumEntries; ++i) Row2(&(*p)->Table[i]);
+    for (ULONG i = 0; i < (*p)->NumEntries; ++i)
+      covered = Row2(&(*p)->Table[i]) || covered;
+  AuditMac("GetIfTable2", s, covered, last_error);
   return s;
 }
 int EnvBoxIdentityHooksRequired() {

@@ -15,10 +15,12 @@ Parent: [环境信息容器](spec.md)
 | --- | --- | --- |
 | computer_name | ASCII DNS 单标签，1–15 字符，字母数字或中横线，首尾字母数字 | GetComputerNameA/W、GetComputerNameExA/W、gethostname、GetHostNameW；COMPUTERNAME |
 | user_name | ASCII 1–64 字符，字母数字、点、下划线、中横线 | GetUserNameA/W；USERNAME |
-| mac_address | 大写六字节冒号分隔，单播、非全零 | GetAdaptersAddresses、GetAdaptersInfo、GetIfEntry、GetIfTable、GetIfEntry2、GetIfTable2；仅覆盖六字节物理地址，保留适配器数量、索引和实际网络状态 |
+| mac_address | 大写六字节冒号分隔，单播、非全零 | GetAdaptersAddresses、GetAdaptersInfo、GetIfEntry、GetIfTable、GetIfEntry2、GetIfTable2；本机 CIM 的 Win32_NetworkAdapter、Win32_NetworkAdapterConfiguration、MSFT_NetAdapter 的 MACAddress、NetworkAddresses、PermanentAddress；仅覆盖六字节物理地址，保留适配器数量、索引和实际网络状态 |
 | machine_guid | 小写规范 UUID，非 nil | HKLM\\SOFTWARE\\Microsoft\\Cryptography 的 MachineGuid：RegQueryValueExA/W、RegGetValueA/W |
 
-主机名 Ex 的 DNS domain 和 physical DNS domain 返回空字符串，FQDN 返回配置单标签，避免拼接宿主 DNS suffix。MAC 配置用于返回的每个六字节物理地址；不改变真实数据包。用户名读视图不改变 token、SID、账户目录或 impersonation 权限。GetUserNameEx、WMI、Native Registry API、设备 IOCTL、应用自行读取或缓存身份暂不属于支持入口，必须显示限制。
+主机名 Ex 的 DNS domain 和 physical DNS domain 返回空字符串，FQDN 返回配置单标签，避免拼接宿主 DNS suffix。MAC 配置用于返回的每个六字节物理地址；不改变真实数据包。用户名读视图不改变 token、SID、账户目录或 impersonation 权限。除上述 MAC 的本机 CIM 查询外，其他身份字段的 WMI/CIM、经典 WMI COM、GetUserNameEx、Native Registry API、设备 IOCTL、应用自行读取或缓存身份暂不属于支持入口，必须显示限制。
+
+2026-10-14 用户明确扩展 MAC 读取范围：Get-NetAdapter 和 Get-CimInstance 的本机网卡查询必须返回 Profile MAC。通过公开 MI 客户端处理查询结果，支持按名称/索引读取、枚举/WQL、Clone 与序列化的一致视图；不修改 WMI 服务或真实网卡。远端查询保持远端数据，不能仅凭实例中的短主机名猜测查询来源。启用 MAC 的新启动必须验证独立 CIM MAC Runtime 能力，旧 DLL 不得静默降级。
 
 配置与 Environment 中同名值冲突时拒绝；保留 `ENVBOX_IDENTITY_*` 名称空间，不允许用户通过自由环境变量注入。Launcher 与 Runtime 子进程合并均清理整个继承身份名称空间，再从不可变 Profile 重写。启用字段不能靠父进程残留变量决定。
 

@@ -79,3 +79,17 @@ Rust 1.99.0 locked workspace build/test 全部 exit 0：467 passed / 0 failed / 
 最终 App 单元与持久化/请求合约测试 58 passed / 0 failed / 5 ignored；App 和 opt-in example 构建、定向 rustfmt、git diff --check 通过。实际 1400/980 宽度窗口已目视检查，配置名称与状态标签分行，不再被挤成竖排，右侧滚动条留出间距。截图 target/gui-workspace-0531a98e7131419f9d13042464367ec3/startup.png 和 target/gui-workspace-6c9692376a904653b94ab2ebee7c93c0/startup.png，独立配置根自动保存作用域，无手工容器操作。
 
 本增量的实际窗口验证覆盖渲染与绑定保存；跨配置 Stop 调度以真实 Request/Response 合约测试验证，未通过 GUI 对用户现有进程执行停止，也未将前述旧原生恢复证据计为本轮 GUI 运行验收。未更新已安装版本。
+
+## 2026-10-14 本机 CIM MAC 读取
+
+按用户要求扩展 MAC 读入口：本机 `Win32_NetworkAdapter`、`Win32_NetworkAdapterConfiguration`、`MSFT_NetAdapter` 的 MACAddress、NetworkAddresses 与 PermanentAddress。MI 初始化后安装读取、Clone 与 Session/Operation 来源接缝，避免在 loader lock 下初始化 MI。仅处理可信本机查询结果，按 destination 保留来源，不用返回实例中的短主机名猜测本机。原生 borrowed 结果保持至下一次同步获取/Close 或异步 acknowledgement；owned Clone 用公开 SetElement 复制 MAC，后续序列化一致。不更新 provider 或真实网卡。
+
+最终开发构建 `target/cim-mac-current/`：x64 Runtime SHA256 `B049357240845E9B00F474023264FBF8CA1B07681F0B71F974FA0B7364076DEA`，x86 `95CACE7CE7679EF8C98709000FB91D3E61CAE16E789F7090FF0D3F4D78D24E1D`。
+
+未注入 controller 23652，RuntimeModules=0，`target/cim-final-result.json`：PowerShell 7.6.6、Windows PowerShell 5.1 x64/x86，分别运行两个不同 MAC Profile，六次退出均为 0。Get-NetAdapter 返回横线格式配置值；Get-CimInstance 两类 Win32 网卡及 MSFT_NetAdapter 查询返回对应配置值。两个 x64 shell 的 Clone、原生 MI 序列化/反序列化、WQL、默认 Session、显式 localhost DCOM Session、InputObject 刷新均通过。
+
+同步原生 Probe x64/x86 每架构 96 个非空 CIM MAC 观察全部匹配 Profile，按名称、索引、Clone 与枚举/WQL 状态成功。实际 x64 父进程到 x86 子进程同配置，退出 0。未设置 MAC 的 Profile 四类查询结果与宿主相同，宿主前后相同。`target/cim-mac-summary.json` 保存汇总及产物 hash。相同 CIM 接缝的 controller 24100 另完成 1100 次查询与 300 次 Session 创建/关闭，退出 0；此记录是有界资源回收检查，不是长期运行证据。
+
+独立 EnvBoxCimMacCapability DATA export 在 MAC opt-in 时必需。根进程 preflight 与每个实际 Runtime 模块身份认证均检查能力，覆盖跨位数子进程和重连。CIM bootstrap 在 DllMain 的同一事务中独立强制成功，保留既有 Win32 identity IPC 计数。实测旧 root DLL 启动前拒绝、输出为空；新 x64/旧 x86 混合 bundle 的 child 被拒绝，仅出现父快照，均退出 1。相关既有 IPC 与离线身份能力检查各一项通过，未新增或修改测试用例。
+
+Rust 相关程序、x64/x86 Runtime 和 x86 Probe 构建成功，定向 rustfmt 与 git diff --check 通过。真实远端机器、安装升级、GUI 鼠标操作与长跑未验证；未替换已安装版本或发布。

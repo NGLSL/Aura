@@ -396,19 +396,37 @@ static ULONG WINAPI HookGetAdaptersAddresses(
     PIP_ADAPTER_ADDRESSES AdapterAddresses, PULONG SizePointer) {
   ULONG status = TrueGetAdaptersAddresses(Family, Flags, Reserved,
                                           AdapterAddresses, SizePointer);
+  const DWORD last_error = GetLastError();
+  const RuntimeProfile* identity = EnvBoxProfile();
   if (status != ERROR_SUCCESS || AdapterAddresses == nullptr) {
+    char summary[96];
+    const char* view = status == ERROR_BUFFER_OVERFLOW
+        ? "mac-buffer-size-query"
+        : (status == ERROR_SUCCESS ? "mac-no-six-byte-address" : "mac-api-error");
+    snprintf(summary, sizeof(summary), "%s status=%lu", view,
+             static_cast<unsigned long>(status));
+    EnvBoxAuditEvent("GetAdaptersAddresses.MAC", 0, summary);
     EnvBoxAuditEvent("GetAdaptersAddresses", 0, "fail-open");
+    SetLastError(last_error);
     return status;
   }
-  const RuntimeProfile* identity = EnvBoxProfile();
+  bool mac_covered = false;
   if (identity->identity_mac_address[0]) {
     for (auto* a = AdapterAddresses; a != nullptr; a = a->Next) {
-      if (a->Length >= offsetof(IP_ADAPTER_ADDRESSES, PhysicalAddressLength) + sizeof(a->PhysicalAddressLength) && a->PhysicalAddressLength == 6)
+      if (a->Length >= offsetof(IP_ADAPTER_ADDRESSES, PhysicalAddressLength) + sizeof(a->PhysicalAddressLength) && a->PhysicalAddressLength == 6) {
         memcpy(a->PhysicalAddress, identity->identity_mac_bytes, 6);
+        mac_covered = true;
+      }
     }
   }
+  EnvBoxAuditEvent("GetAdaptersAddresses.MAC", mac_covered ? 1 : 0,
+                  mac_covered ? "mac-virtual-view status=0"
+                              : (identity->identity_mac_address[0]
+                                     ? "mac-no-six-byte-address status=0"
+                                     : "mac-host status=0"));
   if (!g_view_active) {
     EnvBoxAuditEvent("GetAdaptersAddresses", 0, "dns-host");
+    SetLastError(last_error);
     return status;
   }
   EnvBoxAuditEvent("GetAdaptersAddresses", 1, "dns-virtual-view");
@@ -418,6 +436,7 @@ static ULONG WINAPI HookGetAdaptersAddresses(
     // Empty Profile list for this family still replaces Host (consistent).
     a->FirstDnsServerAddress = chain;
   }
+  SetLastError(last_error);
   return status;
 }
 

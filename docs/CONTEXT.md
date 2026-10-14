@@ -16,7 +16,7 @@
 | **Process Tree Instance** | 隔离单位：Root Process 及其子进程树；不是可执行文件名 |
 | **Root Process** | EnvBox 直接创建或激活的进程；后续子进程经注入继承 Profile |
 | **LaunchTarget** | 启动方式：Executable / Command / Packaged（AUMID，禁止直接跑 WindowsApps exe） |
-| **ConsoleHost** | Application 的命令宿主偏好：Direct / cmd.exe / PowerShell / Windows Terminal；旧配置默认为 Direct，非 Direct 宿主仅适用于 Command |
+| **ConsoleHost** | Application 的命令宿主偏好：Direct / cmd.exe / Windows PowerShell / PowerShell 7 / Windows Terminal；旧配置默认为 Direct，非 Direct 宿主仅适用于 Command |
 | **ActivationBackend** | 激活后端：Win32（CreateProcess SUSPENDED）/ Packaged（ActivateApplication） |
 | **AttachStrategy** | 注入时机：PreExecution（挂起注入）/ PostActivation（激活后注入）/ PackageDebug（预留） |
 | **RuntimeAttacher / RuntimeInjector** | 共享注入缝：向 PID 装载 envbox-runtime；与激活方式解耦 |
@@ -56,7 +56,7 @@
 | **Environment Block** | CreateProcess 传入的独立 Unicode 环境块；优先于 Hook 注入环境变量 |
 | **ENVBOX_INHERIT_CHILDREN** | Environment Block 内部标志（`1`/`0`）：子进程是否继承 Profile；对应 Application.inherit_children |
 | **Environment View** | 目标进程树读到的 Profile 环境（Locale/Region/Timezone/DNS/Env 等） |
-| **IdentityProfile** | 显式可选的主机名、用户名、MAC 与 MachineGuid 读视图；空字段跟随宿主，只覆盖声明的 Win32 查询，不改变账户/SID、权限、网卡、注册表或真实网络出口 |
+| **IdentityProfile** | 显式可选的主机名、用户名、MAC 与 MachineGuid 读视图；空字段跟随宿主，覆盖声明的 Win32 查询及 MAC 的本机网卡 CIM 查询，不改变账户/SID、权限、网卡、注册表或真实网络出口 |
 | **Virtual timezone, real timeline** | 只虚拟化时区与本地时间换算；UTC/FILETIME/Unix timestamp/Performance Counter/Tick Count 保持真实 |
 | **DNS View** | 虚拟化程序读取到的 DNS 配置（GetNetworkParams / GetAdaptersAddresses）；非透明 DNS 劫持。DnsMode：`Host` / `VirtualView` |
 | **Registry Virtual View** | 仅白名单路径的注册表读值虚拟化；非完整 Registry Sandbox。白名单路径字段记为 `whitelist_paths` |

@@ -401,6 +401,13 @@ pub fn validate_runtime_identity(
             return Err(refused("Runtime lacks requested identity view"));
         }
     }
+    if identity.mac_address.is_some() {
+        let (_, _, _, offset) = export_rva_length(&bytes, b"EnvBoxCimMacCapability\0", false, 4)
+            .map_err(|_| refused("Runtime lacks local WMI/CIM MAC read support"))?;
+        if bytes[offset..offset + 4] != 1u32.to_le_bytes() {
+            return Err(refused("Runtime lacks local WMI/CIM MAC read support"));
+        }
+    }
     Ok(())
 }
 

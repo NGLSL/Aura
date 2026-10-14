@@ -191,6 +191,10 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
                         .size(10)
                         .color(FAINT)
                         .font(font::ui_font()),
+                    text("MAC 支持 Win32 和本机网卡 CIM 查询（Get-NetAdapter、Get-CimInstance）；远端查询保持远端值。")
+                        .size(10)
+                        .color(FAINT)
+                        .font(font::ui_font()),
                 ]
                 .spacing(7)
                 .padding(10),
@@ -325,7 +329,7 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
                     tooltip(icon(Icon::Info, MUTED, 12.0),
                         container(column![
                             text("提供 Win32 主机名 / 用户名、网卡信息和 MachineGuid 注册表读取视图。真实账户、网卡和系统安装标识保持原值；CPU、GPU、磁盘身份暂不覆盖。").size(12).font(font::ui_font()),
-                            text("GetUserNameEx、WMI、Native Registry API 和设备 IOCTL 暂不覆盖。").size(12).font(font::ui_font()),
+                            text("MAC 支持本机 Win32_NetworkAdapter、Win32_NetworkAdapterConfiguration 和 MSFT_NetAdapter 的 CIM 读取；其他身份字段的 WMI/CIM、GetUserNameEx、Native Registry API 和设备 IOCTL 暂不覆盖。").size(12).font(font::ui_font()),
                         ].spacing(8)).width(320).padding(12),
                         tooltip::Position::Left,
                     ).style(inner_card_style),

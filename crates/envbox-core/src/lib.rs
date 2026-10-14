@@ -72,8 +72,11 @@ pub enum ConsoleHost {
     Direct,
     /// Run the command through cmd.exe.
     Cmd,
-    /// Run the command through PowerShell.
+    /// Run the command through Windows PowerShell (powershell.exe).
     PowerShell,
+    /// Run the command through PowerShell 7 (pwsh.exe).
+    #[serde(rename = "powershell_7")]
+    PowerShell7,
     /// Open the command in Windows Terminal.
     WindowsTerminal,
 }
@@ -85,10 +88,11 @@ impl Default for ConsoleHost {
 }
 
 impl ConsoleHost {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Direct,
         Self::Cmd,
         Self::PowerShell,
+        Self::PowerShell7,
         Self::WindowsTerminal,
     ];
 }
@@ -98,7 +102,8 @@ impl std::fmt::Display for ConsoleHost {
         let label = match self {
             Self::Direct => "Direct",
             Self::Cmd => "cmd.exe",
-            Self::PowerShell => "PowerShell",
+            Self::PowerShell => "Windows PowerShell",
+            Self::PowerShell7 => "PowerShell 7",
             Self::WindowsTerminal => "Windows Terminal",
         };
         f.write_str(label)

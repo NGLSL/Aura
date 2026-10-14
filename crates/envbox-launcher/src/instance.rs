@@ -28,6 +28,8 @@ pub enum InstanceError {
     WindowsTerminal(String),
     #[error("console host cannot safely represent the command arguments: {0}")]
     InvalidConsoleHost(String),
+    #[error("PowerShell 7 (pwsh.exe) was not found; install PowerShell 7 or add its directory to PATH")]
+    PowerShell7NotFound,
 }
 
 /// Run With target (ticket 11). Host is the real host configuration —
@@ -82,7 +84,10 @@ impl InstanceManager {
             return self.run_windows_terminal(app, target);
         }
         let request = build_session_request(app, target)?;
-        let new_console = matches!(app.console_host, ConsoleHost::Cmd | ConsoleHost::PowerShell);
+        let new_console = matches!(
+            app.console_host,
+            ConsoleHost::Cmd | ConsoleHost::PowerShell | ConsoleHost::PowerShell7
+        );
         let session = crate::session_host::start(request, None, None, new_console)?;
         let id = session.instance.id;
         let meta = session.instance.clone();
@@ -584,7 +589,16 @@ fn console_host_target_with_path(
                 ],
             ))
         }
-        ConsoleHost::PowerShell => {
+        ConsoleHost::PowerShell | ConsoleHost::PowerShell7 => {
+            let host_launch = if app.console_host == ConsoleHost::PowerShell7 {
+                envbox_core::LaunchTarget::Executable {
+                    path: resolve_powershell7(path_env)?,
+                }
+            } else {
+                envbox_core::LaunchTarget::Command {
+                    command: "powershell.exe".into(),
+                }
+            };
             let shell_command = shell_command()?;
             let batch = Path::new(&shell_command)
                 .extension()
@@ -650,9 +664,7 @@ fn console_host_target_with_path(
                 quote_powershell_literal(&arguments),
             );
             Ok((
-                envbox_core::LaunchTarget::Command {
-                    command: "powershell.exe".into(),
-                },
+                host_launch,
                 vec![
                     "-NoLogo".into(),
                     "-NoProfile".into(),
@@ -663,6 +675,33 @@ fn console_host_target_with_path(
         }
         ConsoleHost::Direct | ConsoleHost::WindowsTerminal => Ok((launch, app.arguments.clone())),
     }
+}
+
+/// Resolve the selected shell independently of the inner command. A Profile
+/// may replace PATH, so also check the normal machine-wide installation roots.
+fn resolve_powershell7(path_env: Option<&str>) -> Result<PathBuf, InstanceError> {
+    let host_path = std::env::var_os("PATH");
+    let search_path = path_env.map(std::ffi::OsStr::new).or(host_path.as_deref());
+    if let Some(search_path) = search_path {
+        for directory in std::env::split_paths(search_path) {
+            let candidate = directory.join("pwsh.exe");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    for key in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(key) {
+            let candidate = PathBuf::from(root)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(InstanceError::PowerShell7NotFound)
 }
 
 fn target_path_environment(target: &RunTarget) -> Option<String> {

@@ -63,6 +63,16 @@ fn fail(error: impl std::fmt::Display) -> SessionError {
     SessionError::Unsupported(format!("session host: {error}"))
 }
 
+fn helper_io_error(stage: &str, path: &Path, error: io::Error) -> SessionError {
+    let hint = match error.raw_os_error() {
+        Some(225 | 226) => {
+            "；Windows 安全软件阻止了会话辅助程序，请查看 Windows 安全中心的保护历史记录"
+        }
+        _ => "",
+    };
+    fail(format!("{stage}: {}: {error}{hint}", path.display()))
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -181,20 +191,28 @@ fn read_helper(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn stage_helper(source: &Path) -> io::Result<PathBuf> {
+fn stage_helper(source: &Path) -> Result<PathBuf, SessionError> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
-    let bytes = read_helper(source)?;
+    let bytes =
+        read_helper(source).map_err(|error| helper_io_error("读取会话辅助程序", source, error))?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let directory = base.join("com.aura.envbox").join("session-host").join(hash);
-    std::fs::create_dir_all(&directory)?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| helper_io_error("创建会话辅助程序目录", &directory, error))?;
     let destination = directory.join("envbox-broker.exe");
     if destination.exists() {
-        if read_helper(&destination)? != bytes {
-            return Err(invalid("cached session helper fingerprint mismatch"));
+        if read_helper(&destination)
+            .map_err(|error| helper_io_error("读取缓存会话辅助程序", &destination, error))?
+            != bytes
+        {
+            return Err(fail(format!(
+                "cached session helper fingerprint mismatch: {}",
+                destination.display()
+            )));
         }
         return Ok(destination);
     }
@@ -203,19 +221,28 @@ fn stage_helper(source: &Path) -> io::Result<PathBuf> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+            .open(&temporary)
+            .map_err(|error| helper_io_error("创建会话辅助程序", &temporary, error))?;
+        file.write_all(&bytes)
+            .map_err(|error| helper_io_error("写入会话辅助程序", &temporary, error))?;
+        file.sync_all()
+            .map_err(|error| helper_io_error("同步会话辅助程序", &temporary, error))?;
         drop(file);
         // Windows rename never overwrites an existing, possibly running helper.
         // A concurrent publisher is accepted only after checking its content.
         if let Err(error) = std::fs::rename(&temporary, &destination) {
             if !destination.exists() {
-                return Err(error);
+                return Err(helper_io_error("保存会话辅助程序", &destination, error));
             }
         }
-        if read_helper(&destination)? != bytes {
-            return Err(invalid("staged session helper fingerprint mismatch"));
+        if read_helper(&destination)
+            .map_err(|error| helper_io_error("校验会话辅助程序", &destination, error))?
+            != bytes
+        {
+            return Err(fail(format!(
+                "staged session helper fingerprint mismatch: {}",
+                destination.display()
+            )));
         }
         Ok(destination)
     })();
@@ -338,7 +365,7 @@ fn start_impl(
     if pipe.0 == INVALID_HANDLE_VALUE {
         return Err(fail(io::Error::last_os_error()));
     }
-    let executable = stage_helper(&broker_source()?).map_err(fail)?;
+    let executable = stage_helper(&broker_source()?)?;
     // Resolve while current_exe still points at the installed/build directory.
     // Moving the host outside that directory must not change DLL discovery.
     let runtime_source = if is_packaged {
@@ -359,7 +386,7 @@ fn start_impl(
     .map_err(fail)?;
     let runtime_source =
         crate::injection::stage_runtime_dll(&runtime_source, instance_id).map_err(fail)?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(&executable);
     command
         .arg("--session-host")
         .arg(&name)
@@ -370,7 +397,9 @@ fn start_impl(
     let inherit_console =
         !create_new_console && unsafe { windows::Win32::System::Console::GetConsoleCP() } != 0;
     command.creation_flags(CREATE_NO_WINDOW.0);
-    let mut helper = command.spawn().map_err(fail)?;
+    let mut helper = command
+        .spawn()
+        .map_err(|error| helper_io_error("启动会话辅助程序", &executable, error))?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let result = (|| {
         loop {
@@ -381,8 +410,14 @@ fn start_impl(
             if unsafe { GetLastError() } != ERROR_PIPE_LISTENING {
                 return Err(fail(io::Error::last_os_error()));
             }
-            if helper.try_wait().map_err(fail)?.is_some() {
-                return Err(fail("helper exited before startup"));
+            if let Some(status) = helper
+                .try_wait()
+                .map_err(|error| helper_io_error("查询会话辅助程序", &executable, error))?
+            {
+                return Err(fail(format!(
+                    "helper exited before startup: {} ({status})",
+                    executable.display()
+                )));
             }
             pause(deadline).map_err(fail)?;
         }
@@ -441,6 +476,18 @@ fn start_impl(
             ready.identity,
         ))
     })();
+    let result = result.map_err(|error| {
+        let status = match helper.try_wait() {
+            Ok(Some(status)) => status.to_string(),
+            Ok(None) => "仍在运行".to_owned(),
+            Err(query_error) => format!("无法读取退出状态: {query_error}"),
+        };
+        fail(format!(
+            "会话启动失败；辅助程序={}；PID={}；状态={status}；{error}",
+            executable.display(),
+            helper.id()
+        ))
+    });
     if result.is_err() {
         // Only a freshly owned Win32 Job authorizes whole-tree cleanup. AUMID
         // activation can reuse an existing user process and must never kill it.

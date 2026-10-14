@@ -6,3 +6,4 @@ EXPORTS
   EnvBoxRuntimeCapabilities @4 DATA
   EnvBoxTrustedServiceBootstrapCapability @5 DATA
   EnvBoxIdentityCapabilities @6 DATA
+  EnvBoxCimMacCapability @7 DATA

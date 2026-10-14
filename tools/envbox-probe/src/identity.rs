@@ -589,6 +589,7 @@ pub fn collect() -> Section {
         adapters(&mut fields);
         machine_guid(&mut fields);
     }
+    crate::cim_identity::collect(&mut fields);
     for name in ["COMPUTERNAME", "USERNAME"] {
         push(
             &mut fields,

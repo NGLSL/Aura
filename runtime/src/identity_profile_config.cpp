@@ -5,6 +5,8 @@
 #include <vector>
 extern "C" const char EnvBoxIdentityCapabilities[] =
     "version=1;computer_name=1;user_name=1;mac_address=1;machine_guid=1";
+// Independent opt-in capability: older identity DLLs only cover IP Helper MACs.
+extern "C" const unsigned long EnvBoxCimMacCapability = 1;
 static bool AlphaNum(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
          (c >= '0' && c <= '9');
