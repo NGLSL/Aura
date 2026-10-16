@@ -4,7 +4,8 @@ use crate::{
 };
 use envbox_core::{ConsoleHost, ContainerMode, LaunchTarget, RunSnapshot};
 use envbox_launcher::{
-    start_session_in_named_job_gated, InstanceJob, SessionHandle, SessionStartRequest,
+    start_session_in_named_job, start_session_in_named_job_gated, InstanceJob, SessionHandle,
+    SessionStartRequest,
 };
 use envbox_storage::ConfigStore;
 use std::collections::{HashMap, HashSet};
@@ -345,6 +346,8 @@ fn sealed_member_evidence_complete(result: &RunResult) -> bool {
 struct OwnedRun {
     stop_failed: bool,
     retry_recovery: bool,
+    /// Read-only completion observation; never grants Stop or Runtime control.
+    observation_job: Option<InstanceJob>,
     _snapshot: Option<RunSnapshot>,
     _recovered_broker: Option<envbox_launcher::HostBroker>,
     _bundle_leases: Vec<BundleLease>,
@@ -362,7 +365,15 @@ pub(crate) struct Runs {
     store: ConfigStore,
     targets: Arc<Mutex<HashSet<ManagedTarget>>>,
     running: HashMap<Uuid, OwnedRun>,
-    requests: HashMap<String, (RunCommand, String, RunResult)>,
+    requests: HashMap<
+        String,
+        (
+            RunCommand,
+            Option<envbox_core::DetectionSite>,
+            String,
+            Option<RunResult>,
+        ),
+    >,
     control_requests: HashMap<String, (String, Option<Uuid>, Option<RunCommand>, Vec<RunView>)>,
 }
 impl Runs {
@@ -384,47 +395,75 @@ impl Runs {
         runs
     }
     pub(crate) fn run(&mut self, request_id: &str, command: &RunCommand) -> (String, RunResult) {
+        let (status, result) = self.run_intent(request_id, command, None);
+        (
+            status,
+            result.expect("ordinary Run always has an instance result"),
+        )
+    }
+    pub(crate) fn detect(
+        &mut self,
+        command: &RunCommand,
+        site: envbox_core::DetectionSite,
+        request_id: &str,
+    ) -> (String, Option<RunResult>) {
+        self.run_intent(request_id, command, Some(site))
+    }
+    fn run_intent(
+        &mut self,
+        request_id: &str,
+        command: &RunCommand,
+        detection: Option<envbox_core::DetectionSite>,
+    ) -> (String, Option<RunResult>) {
+        let rejected = |reason: &str| {
+            let (status, result) = failed(command, reason);
+            (status, Some(result))
+        };
         self.retry_scope(command.container_id);
         self.refresh();
         if let Some(error) = &self.recovery_error {
-            return failed(command, error);
+            return rejected(error);
         }
         if self.control_requests.contains_key(request_id) {
-            return failed(command, "request ID already belongs to a control operation");
+            return rejected("request ID already belongs to a control operation");
         }
-        if let Some((previous, status, result)) = self.requests.get(request_id) {
-            if previous == command {
-                if self.running.contains_key(&command.instance_id) {
-                    return self.query(command);
+        if let Some((previous, previous_intent, status, result)) = self.requests.get(request_id) {
+            if previous == command && *previous_intent == detection {
+                if result.is_some() && self.running.contains_key(&command.instance_id) {
+                    let (status, result) = self.query(command);
+                    return (status, Some(result));
                 }
                 return (status.clone(), result.clone());
             }
-            return failed(
-                command,
-                "request ID is already bound to another transaction",
-            );
+            return rejected("request ID is already bound to another transaction or intent");
         }
         if let Some(existing) = self.running.get(&command.instance_id) {
-            if existing.command == *command {
-                return self.query(command);
+            if existing.command == *command && detection.is_none() {
+                let (status, result) = self.query(command);
+                return (status, Some(result));
             }
-            return failed(
-                command,
-                "Instance UUID already belongs to another application or Container",
-            );
+            return rejected("Instance UUID already belongs to an existing transaction");
         }
         if self.running.values().any(|run| {
             run.command.container_id == command.container_id && run.result.state == "TrackingLost"
         }) {
-            return failed(command, "workspace has TrackingLost ownership; reconcile original instances before a new Run");
+            return rejected("workspace has TrackingLost ownership; reconcile original instances before a new Run");
         }
-        let (status, result) = match self.start(command, request_id) {
-            Ok(result) => ("Running".into(), result),
-            Err(error) => failed(command, &error.to_string()),
+        let outcome = if let Some(site) = detection {
+            self.detect_intent(command, site, request_id)
+        } else {
+            self.start_intent(command, request_id, None).map(Some)
+        };
+        let (status, result) = match outcome {
+            Ok(result) => (
+                if detection.is_some() { "Ok" } else { "Running" }.into(),
+                result,
+            ),
+            Err(error) => rejected(&error.to_string()),
         };
         self.requests.insert(
             request_id.into(),
-            (command.clone(), status.clone(), result.clone()),
+            (command.clone(), detection, status.clone(), result.clone()),
         );
         (status, result)
     }
@@ -448,6 +487,7 @@ impl Runs {
             let mut run = OwnedRun {
                 stop_failed: false,
                 retry_recovery: false,
+                observation_job: None,
                 _snapshot: record.snapshot,
                 _recovered_broker: None,
                 _bundle_leases: Vec::new(),
@@ -512,7 +552,7 @@ impl Runs {
     }
     pub(crate) fn refresh(&mut self) {
         for run in self.running.values_mut() {
-            let Some(job) = run.job.as_ref() else {
+            let Some(job) = run.job.as_ref().or(run.observation_job.as_ref()) else {
                 continue;
             };
             let path = self
@@ -532,6 +572,10 @@ impl Runs {
                     );
                 }
                 Ok(stats) if stats.active_processes == 0 => {
+                    if run.observation_job.is_some() {
+                        run.result.error = None;
+                        run.result.supervisor_generation = self.generation.clone();
+                    }
                     if run.result.state != "Stopping" {
                         run.result.state = "Exited".into();
                     } else {
@@ -557,8 +601,19 @@ impl Runs {
                     run._recovered_broker.take();
                     run._bundle_leases.clear();
                     run.job.take();
+                    run.observation_job.take();
                 }
                 Ok(stats) => {
+                    if run.job.is_none() {
+                        // Preserve TrackingLost while observing only the old
+                        // kernel Job. No broker/Runtime ownership is restored.
+                        run.members = stats
+                            .process_ids
+                            .into_iter()
+                            .filter_map(|pid| ManagedTarget::observe(pid).ok())
+                            .collect();
+                        continue;
+                    }
                     // Only an explicit successful Stop retry or fresh recovery can
                     // clear a failed termination; membership alone proves no control.
                     if run.stop_failed {
@@ -872,7 +927,71 @@ impl Runs {
             results,
         )
     }
-    fn start(&mut self, command: &RunCommand, request_id: &str) -> io::Result<RunResult> {
+    fn detect_intent(
+        &mut self,
+        command: &RunCommand,
+        site: envbox_core::DetectionSite,
+        request_id: &str,
+    ) -> io::Result<Option<RunResult>> {
+        let snapshot = self
+            .store
+            .load_run_snapshot(command.container_id, command.instance_id)
+            .map_err(io::Error::other)?;
+        let app = self
+            .store
+            .load_applications()
+            .map_err(io::Error::other)?
+            .applications
+            .into_iter()
+            .find(|app| app.id == command.application_id)
+            .ok_or_else(|| io::Error::other("Application not found"))?;
+        app.validate().map_err(io::Error::other)?;
+        validate_launch(&snapshot, &app)?;
+        if !self
+            .store
+            .load_containers()
+            .map_err(io::Error::other)?
+            .containers
+            .iter()
+            .any(|container| container.id == command.container_id)
+            || !self
+                .store
+                .load_profiles()
+                .map_err(io::Error::other)?
+                .profiles
+                .iter()
+                .any(|profile| profile.id == snapshot.effective_profile.id)
+        {
+            return Err(io::Error::other(
+                "Container or snapshot source Profile no longer exists",
+            ));
+        }
+        let mut request = SessionStartRequest {
+            chrome: None,
+            application_id: app.id,
+            launch: app.launch.clone(),
+            arguments: app.arguments.clone(),
+            working_directory: app.working_directory.clone(),
+            profile: Some(snapshot.effective_profile.clone()),
+            inherit_children: app.inherit_children,
+            audit: app.audit,
+        };
+        envbox_launcher::chrome::configure(&app, &mut request, Some(self.store.root()), Some(site))
+            .map_err(io::Error::other)?;
+        if envbox_launcher::chrome::reuse_detection(&request)
+            .map_err(io::Error::other)?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        self.start_intent(command, request_id, Some(site)).map(Some)
+    }
+    fn start_intent(
+        &mut self,
+        command: &RunCommand,
+        request_id: &str,
+        detection: Option<envbox_core::DetectionSite>,
+    ) -> io::Result<RunResult> {
         let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidInput, error);
         let snapshot = self
             .store
@@ -918,6 +1037,26 @@ impl Runs {
             .dns
             .validate_runtime_support()
             .map_err(|error| invalid(error.to_string()))?;
+        let mut request = SessionStartRequest {
+            chrome: None,
+            application_id: application.id,
+            launch: application.launch.clone(),
+            arguments: application.arguments.clone(),
+            working_directory: application.working_directory.clone(),
+            profile: Some(snapshot.effective_profile.clone()),
+            inherit_children: true,
+            audit: application.audit,
+        };
+        envbox_launcher::chrome::configure(
+            &application,
+            &mut request,
+            Some(self.store.root()),
+            detection,
+        )
+        .map_err(io::Error::other)?;
+        // Choose the supported Chrome contract before creating any process.
+        // Chrome has TLS callbacks and is not a no-TLS gated executable.
+        let chrome_compatibility = application.supports_chrome_data();
         let expected = envbox_launcher::ipc::profile_to_message_with_flags(
             &snapshot.effective_profile,
             &command.instance_id.to_string(),
@@ -973,16 +1112,11 @@ impl Runs {
         file.write_all(&serde_json::to_vec(&pending)?)?;
         file.sync_all()?;
         drop(file);
-        let request = SessionStartRequest {
-            application_id: application.id,
-            launch: application.launch,
-            arguments: application.arguments,
-            working_directory: application.working_directory,
-            profile: Some(snapshot.effective_profile.clone()),
-            inherit_children: true,
-            audit: application.audit,
+        let started = if chrome_compatibility {
+            start_session_in_named_job(request, command.instance_id, &name)
+        } else {
+            start_session_in_named_job_gated(request, command.instance_id, &name)
         };
-        let started = start_session_in_named_job_gated(request, command.instance_id, &name);
         let mut session = match started {
             Ok(session) => session,
             Err(error) => {
@@ -998,7 +1132,7 @@ impl Runs {
         };
         let verified = (|| -> io::Result<RunResult> {
             let observed = session.runtime_identity().ok_or_else(|| {
-                io::Error::other("Runtime identity unavailable after gate release")
+                io::Error::other("Runtime identity unavailable after startup confirmation")
             })?;
             use sha2::{Digest, Sha256};
             let actual =
@@ -1015,6 +1149,16 @@ impl Runs {
                 ));
             }
             let identity = ManagedTarget::observe(session.instance.root_pid)?;
+            if !job
+                .stats()
+                .map_err(io::Error::other)?
+                .process_ids
+                .contains(&identity.pid)
+            {
+                return Err(io::Error::other(
+                    "confirmed root is not a member of the scoped Job",
+                ));
+            }
             if identity.creation_time != observed.identity.creation_time {
                 return Err(io::Error::other("Runtime process generation mismatch"));
             }
@@ -1039,7 +1183,12 @@ impl Runs {
                     pid: identity.pid,
                     creation_time: identity.creation_time,
                 }],
-                entry_guarantee: "verified_pe_entry_no_tls".into(),
+                entry_guarantee: if chrome_compatibility {
+                    crate::ENTRY_CHROME_COMPATIBILITY
+                } else {
+                    "verified_pe_entry_no_tls"
+                }
+                .into(),
                 state: "Running".into(),
                 ..pending.clone()
             };
@@ -1086,6 +1235,7 @@ impl Runs {
             OwnedRun {
                 stop_failed: false,
                 retry_recovery: false,
+                observation_job: None,
                 _snapshot: Some(snapshot),
                 _recovered_broker: None,
                 _bundle_leases: bundle_leases,
@@ -1164,6 +1314,7 @@ impl Runs {
             OwnedRun {
                 stop_failed: terminated.is_err(),
                 retry_recovery: false,
+                observation_job: None,
                 _snapshot: Some(snapshot.clone()),
                 _recovered_broker: None,
                 _bundle_leases: Vec::new(),
@@ -1271,9 +1422,10 @@ fn member_facts(
     members: &[ManagedTarget],
 ) -> io::Result<Vec<MemberRuntimeIdentity>> {
     use sha2::{Digest, Sha256};
+    let chrome_compatibility = run.result.entry_guarantee == crate::ENTRY_CHROME_COMPATIBILITY;
     if members.is_empty()
         || members.len() > 256
-        || run.result.entry_guarantee != "verified_pe_entry_no_tls"
+        || (!chrome_compatibility && run.result.entry_guarantee != "verified_pe_entry_no_tls")
     {
         return Err(io::Error::other(
             "Job member evidence is incomplete or exceeds bounded capacity",
@@ -1303,9 +1455,19 @@ fn member_facts(
         .map_err(|_| io::Error::other("instance registry poisoned"))?;
     let mut facts = Vec::with_capacity(members.len());
     for member in members {
-        let observed = registry
-            .validate_runtime(member.pid)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let observed = match registry.validate_runtime(member.pid) {
+            Ok(observed) => observed,
+            // A sandboxed Chrome child may be tracked by the Job without a
+            // Runtime. Keep it in known_members, never fabricate a Runtime fact.
+            Err(_)
+                if chrome_compatibility
+                    && member.pid != run.result.root_pid
+                    && registry.runtime_identity(member.pid).is_none() =>
+            {
+                continue
+            }
+            Err(error) => return Err(io::Error::other(error.to_string())),
+        };
         if observed.identity.creation_time != member.creation_time
             || observed.identity.runtime_version != env!("CARGO_PKG_VERSION")
             || observed.config_sha256 != config_sha256
@@ -1414,7 +1576,10 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         || result.root_pid == 0
         || !result.inherit_children
         || result.mode != "compatibility"
-        || result.entry_guarantee != "verified_pe_entry_no_tls"
+        || !matches!(
+            result.entry_guarantee.as_str(),
+            "verified_pe_entry_no_tls" | crate::ENTRY_CHROME_COMPATIBILITY
+        )
         || snapshot.mode != ContainerMode::Compatibility
     {
         return Err(io::Error::other(
@@ -1478,6 +1643,12 @@ fn restore(run: &mut OwnedRun, generation: &str, deadline: std::time::Instant) -
         run.result.error = None;
         run._bundle_leases.clear();
         return Ok(());
+    }
+    if result.entry_guarantee == crate::ENTRY_CHROME_COMPATIBILITY {
+        run.observation_job = Some(job);
+        return Err(io::Error::other(
+            "Chrome 兼容会话保持 TrackingLost：仅观测原 Job，不恢复控制；关闭对应浏览器后刷新，Job 归零才解除。若 Supervisor 离线期间原 Job 已消失，将保留失踪状态",
+        ));
     }
     let members: Vec<_> = stats
         .process_ids
@@ -1910,6 +2081,7 @@ mod member_evidence_tests {
             OwnedRun {
                 stop_failed: false,
                 retry_recovery: false,
+                observation_job: None,
                 _snapshot: None,
                 _recovered_broker: None,
                 _bundle_leases: vec![],
@@ -2170,6 +2342,7 @@ mod member_evidence_tests {
             OwnedRun {
                 stop_failed: false,
                 retry_recovery: false,
+                observation_job: None,
                 _snapshot: None,
                 _recovered_broker: None,
                 _bundle_leases: vec![],
@@ -2200,6 +2373,7 @@ mod member_evidence_tests {
             OwnedRun {
                 stop_failed: false,
                 retry_recovery: false,
+                observation_job: None,
                 _snapshot: None,
                 _recovered_broker: None,
                 _bundle_leases: vec![],

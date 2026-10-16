@@ -278,6 +278,51 @@ fn app_overview<'a>(
             content = content.push(compatibility_notice(capability));
         }
     }
+    if let Some(application) = selected_app.filter(|value| value.supports_chrome_data()) {
+        content = content.push(kv_row(
+            "浏览器数据",
+            if application.chrome_independent_data {
+                "按应用与环境独立保存"
+            } else {
+                "沿用启动参数 / Chrome 默认目录"
+            },
+        ));
+        let choices: Vec<_> = app
+            .profiles
+            .iter()
+            .map(|profile| (Some(profile.id), profile.name.clone()))
+            .chain(std::iter::once((None, "本机 Host".into())))
+            .flat_map(|(profile_id, label)| {
+                envbox_core::DetectionSite::ALL
+                    .into_iter()
+                    .map(move |site| DetectionChoice {
+                        label: format!("{label} · {site}"),
+                        profile_id,
+                        site,
+                    })
+            })
+            .collect();
+        content = content.push(
+            text(format!(
+                "默认环境：{}",
+                app.profile_name(application.default_profile_id)
+            ))
+            .size(12)
+            .color(MUTED),
+        );
+        content = content.push(
+            pick_list(choices, None::<DetectionChoice>, move |choice| {
+                Message::AppDetect(id, choice.profile_id, choice.site)
+            })
+            .placeholder("选择环境并打开检测页")
+            .style(pick_style)
+            .menu_style(pick_menu)
+            .padding(Padding::from([7, 8]))
+            .font(font::ui_font())
+            .text_size(12)
+            .width(Fill),
+        );
+    }
     if selected_app.is_some_and(crate::package::chromium_renderer_sandbox_limited) {
         content = content.push(
             container(
@@ -291,6 +336,18 @@ fn app_overview<'a>(
         );
     }
     container(content).width(Fill).into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectionChoice {
+    label: String,
+    profile_id: Option<uuid::Uuid>,
+    site: envbox_core::DetectionSite,
+}
+impl std::fmt::Display for DetectionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 fn app_editor(app: &EnvBoxApp) -> Element<'_, Message> {
@@ -335,7 +392,7 @@ fn app_editor(app: &EnvBoxApp) -> Element<'_, Message> {
         container(text("")).into()
     };
 
-    let basic = column![
+    let mut basic = column![
         field_label("基本信息"),
         form_row(
             "应用名称",
@@ -391,6 +448,14 @@ fn app_editor(app: &EnvBoxApp) -> Element<'_, Message> {
     ]
     .spacing(8);
 
+    let chrome_supported = app.app_draft.kind == LaunchKind::Executable
+        && std::path::Path::new(&app.app_draft.path)
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("chrome.exe"));
+    if chrome_supported || app.app_draft.chrome_independent_data {
+        basic = basic.push(row![text("独立浏览器数据目录").size(12).color(INK_2).font(font::ui_font()).width(Fill), toggle(app.app_draft.chrome_independent_data, Message::AppChromeIndependentDataChanged)].align_y(Alignment::Center))
+            .push(text("按应用和本次环境保存；首次启动不会复制原有登录和书签。profile-directory 只选择此目录下的子配置。").size(12).color(MUTED).font(font::ui_font()));
+    }
     let advanced_toggle = button(
         row![
             icon(

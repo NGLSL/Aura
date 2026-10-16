@@ -182,7 +182,7 @@ fn validate_timezone_windows_id(windows_id: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
-fn windows_id_exists(windows_id: &str) -> bool {
+pub fn windows_id_exists(windows_id: &str) -> bool {
     #[cfg(windows)]
     {
         use windows::core::PCWSTR;
@@ -273,14 +273,82 @@ pub fn windows_id_to_iana(windows_id: &str) -> Option<&'static str> {
         .iter()
         .find(|(w, _)| w.eq_ignore_ascii_case(windows_id))
         .map(|(_, i)| *i)
+        .or_else(|| {
+            cldr_windows_zones().find_map(|(windows, territory, zones)| {
+                (territory == "001" && windows.eq_ignore_ascii_case(windows_id))
+                    .then(|| zones.split_whitespace().next())
+                    .flatten()
+            })
+        })
 }
 
 /// IANA timezone ID → Windows ID when known. `None` means unmapped.
 pub fn iana_to_windows(iana_id: &str) -> Option<&'static str> {
+    // Preserve the existing manual editor's case-insensitive common mappings.
     COMMON_TIMEZONE_PAIRS
         .iter()
-        .find(|(_, i)| i.eq_ignore_ascii_case(iana_id))
-        .map(|(w, _)| *w)
+        .find(|(_, iana)| iana.eq_ignore_ascii_case(iana_id))
+        .map(|(windows, _)| *windows)
+        .or_else(|| iana_to_windows_for_region(iana_id, None))
+}
+
+/// CLDR 48 exact IANA/alias mapping. Territory can disambiguate a mapped zone,
+/// but is never used to invent a zone when the concrete IANA id is absent.
+pub fn iana_to_windows_for_region(iana_id: &str, region: Option<&str>) -> Option<&'static str> {
+    let canonical = canonical_iana(iana_id);
+    let matches = |zones: &str| {
+        zones
+            .split_whitespace()
+            .any(|zone| canonical_iana(zone) == canonical)
+    };
+    let unique = |territory: Option<&str>| {
+        let mut found = None;
+        for (windows, area, zones) in cldr_windows_zones() {
+            if territory.is_some_and(|region| !area.eq_ignore_ascii_case(region)) || !matches(zones)
+            {
+                continue;
+            }
+            if found.is_some_and(|previous| previous != windows) {
+                return None;
+            }
+            found = Some(windows);
+        }
+        found
+    };
+    region
+        .and_then(|area| unique(Some(area)))
+        .or_else(|| unique(None))
+}
+
+fn canonical_iana(zone: &str) -> &str {
+    static ALIASES: std::sync::OnceLock<std::collections::HashMap<&'static str, &'static str>> =
+        std::sync::OnceLock::new();
+    ALIASES
+        .get_or_init(|| {
+            let mut aliases = std::collections::HashMap::new();
+            for group in include_str!("../data/timezone-aliases.tsv").lines() {
+                let mut members = group.split('\t');
+                if let Some(canonical) = members.next() {
+                    aliases.insert(canonical, canonical);
+                    for alias in members {
+                        aliases.insert(alias, canonical);
+                    }
+                }
+            }
+            aliases
+        })
+        .get(zone)
+        .copied()
+        .unwrap_or(zone)
+}
+
+fn cldr_windows_zones() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    include_str!("../data/windows-zones.tsv")
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split('\t');
+            Some((columns.next()?, columns.next()?, columns.next()?))
+        })
 }
 
 /// Common Windows timezone IDs for the Profile editor default list.
@@ -435,6 +503,7 @@ mod tests {
             arguments: vec![],
             default_profile_id: Uuid::nil(),
             inherit_children: true,
+            chrome_independent_data: false,
             console_host: ConsoleHost::Direct,
             audit: false,
         }

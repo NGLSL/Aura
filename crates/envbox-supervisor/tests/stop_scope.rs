@@ -34,6 +34,7 @@ fn profile(marker: &std::path::Path) -> EnvironmentProfile {
 }
 fn message(command: &str, generation: &str, scope: Uuid, run: Option<RunCommand>) -> Request {
     Request {
+        detection: None,
         version: PROTOCOL_VERSION,
         generation: Some(generation.into()),
         request_id: Uuid::new_v4().to_string(),
@@ -74,6 +75,7 @@ fn stop_all_preserves_b_and_same_executable_host_and_serializes_run() {
         arguments: vec![],
         default_profile_id: a_profile.id,
         inherit_children: true,
+        chrome_independent_data: false,
         console_host: ConsoleHost::Direct,
         audit: false,
     };

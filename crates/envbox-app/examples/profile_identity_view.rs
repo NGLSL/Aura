@@ -31,6 +31,8 @@ mod package;
 mod singleton;
 #[path = "../src/theme.rs"]
 mod theme;
+#[path = "../src/timezone_lookup.rs"]
+mod timezone_lookup;
 #[cfg(windows)]
 #[path = "../src/tray.rs"]
 mod tray;
@@ -99,6 +101,7 @@ fn main() -> iced::Result {
                     arguments: Vec::new(),
                     default_profile_id: profile_id,
                     inherit_children: true,
+                    chrome_independent_data: false,
                     console_host: envbox_core::ConsoleHost::Direct,
                     audit: false,
                 })

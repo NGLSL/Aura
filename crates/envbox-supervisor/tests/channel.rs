@@ -15,6 +15,7 @@ static PRINCIPAL_ENDPOINT: Mutex<()> = Mutex::new(());
 
 fn request(command: &str, generation: Option<String>) -> Request {
     Request {
+        detection: None,
         version: PROTOCOL_VERSION,
         request_id: uuid::Uuid::new_v4().to_string(),
         command: command.into(),

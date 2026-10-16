@@ -38,6 +38,7 @@ impl EnvBoxApp {
     }
 
     pub(super) fn begin_new_profile(&mut self) {
+        self.timezone_lookup.invalidate();
         self.workspace_management.selection_changed();
         self.workspaces.clear(Uuid::nil());
         self.nav = Nav::Profiles;
@@ -50,6 +51,7 @@ impl EnvBoxApp {
     }
 
     pub(super) fn select_profile(&mut self, id: Uuid) {
+        self.timezone_lookup.invalidate();
         self.workspace_management.selection_changed();
         if let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) {
             self.profile_draft = profile_to_draft(profile);

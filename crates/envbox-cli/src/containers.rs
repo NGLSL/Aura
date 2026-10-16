@@ -161,6 +161,7 @@ fn control_command(args: &[String]) -> Result<(), String> {
         let hello = client.ensure_started().map_err(|error| error.to_string())?;
         let response = client
             .request(Request {
+                detection: None,
                 version: PROTOCOL_VERSION,
                 generation: Some(hello.generation),
                 request_id: request_id.to_string(),
@@ -255,6 +256,7 @@ fn run_command(store: &ConfigStore, args: &[String]) -> Result<(), String> {
         let hello = client.ensure_started().map_err(|error| error.to_string())?;
         let response = client
             .request(Request {
+                detection: None,
                 version: PROTOCOL_VERSION,
                 generation: Some(hello.generation),
                 request_id: request_id.to_string(),
@@ -271,6 +273,13 @@ fn run_command(store: &ConfigStore, args: &[String]) -> Result<(), String> {
             .run
             .ok_or_else(|| format!("Supervisor {}", response.status))?;
         println!("status\t{}\nrequest_id\t{}\ncontainer_id\t{}\ninstance_id\t{}\nroot_pid\t{}\nmode\t{}\nentry_guarantee\t{}\nconfiguration_id\t{}", response.status, request_id, result.container_id, result.instance_id, result.root_pid, result.mode, result.entry_guarantee, result.configuration_id);
+        println!(
+            "entry_guarantee_label\t{}",
+            envbox_supervisor::entry_guarantee_label(&result.entry_guarantee)
+        );
+        if result.entry_guarantee == envbox_supervisor::ENTRY_CHROME_COMPATIBILITY {
+            println!("entry_limit\tchrome_compatibility_has_no_verified_entry_gate\nrecovery_limit\tchrome_compatibility_supervisor_restart_tracking_lost\ncoverage_limit\tchrome_job_members_do_not_imply_runtime_injection");
+        }
         print_environment_limits();
         print_runtime_observations(&result);
         if let Some(error) = result.error {

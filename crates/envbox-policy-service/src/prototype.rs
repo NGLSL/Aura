@@ -145,6 +145,7 @@ impl PrototypeEngine {
         request.executable = target;
         let id = request.instance_id;
         let req = SessionStartRequest {
+            chrome: None,
             application_id: Uuid::new_v4(),
             launch: envbox_core::LaunchTarget::Executable {
                 path: original_executable,

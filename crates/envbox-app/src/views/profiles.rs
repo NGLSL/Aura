@@ -82,7 +82,11 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
             let webrtc_active = p.browser.webrtc != envbox_core::WebRtcPolicy::Host;
 
             let badges = row![
-                badge(&p.locale.region, ACCENT_BG, ACCENT_TEXT),
+                badge(
+                    &crate::options::region_label(&p.locale.region),
+                    ACCENT_BG,
+                    ACCENT_TEXT
+                ),
                 badge(dns_label, dns_bg, dns_fg),
                 badge(
                     webrtc_choice.short_label(),
@@ -137,7 +141,9 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                             .font(font::name_font()),
                         text(format!(
                             "{} · {} · {}",
-                            p.locale.region, p.locale.locale_name, p.timezone.windows_id
+                            crate::options::region_label(&p.locale.region),
+                            p.locale.locale_name,
+                            p.timezone.windows_id
                         ))
                         .size(12)
                         .color(MUTED)

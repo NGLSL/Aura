@@ -15,6 +15,7 @@ use crate::widgets::{
 use super::section_title;
 
 mod dns;
+mod timezone;
 
 pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let is_new = app.profile_draft.id.is_none();
@@ -135,7 +136,7 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
             section_title("配置概览", "保存后，使用此配置启动的应用会读取这些值"),
             container(
                 column![
-                    kv_row("Region", &p.locale.region),
+                    kv_row("地区", &crate::options::region_label(&p.locale.region)),
                     kv_row("Locale", &p.locale.locale_name),
                     kv_row("界面语言", &p.locale.ui_language),
                     kv_row("Windows 时区", &p.timezone.windows_id),
@@ -201,6 +202,7 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
             )
             .width(Fill)
             .style(inner_card_style),
+            crate::views::workspaces::run_panel(app),
             button(text("编辑配置").size(12).color(INK_2).font(font::ui_font()))
                 .padding(Padding::from([7, 12]))
                 .style(secondary_btn)
@@ -239,11 +241,11 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
                 .font(font::ui_font()),
         ),
         form_row(
-            "Region",
+            "地区",
             searchable_select(
                 crate::message::ComboField::Region,
                 &app.profile_draft.region,
-                "选择 Region",
+                "选择地区",
                 app.open_combo == Some(crate::message::ComboField::Region),
                 &app.combo_query,
                 &region_opts,
@@ -485,6 +487,7 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
     column![
         section_title("编辑配置", "保存后，新的实例会使用更新后的设置"),
         basic,
+        timezone::view(app),
         advanced_toggle,
         advanced,
         row![save, cancel, delete]

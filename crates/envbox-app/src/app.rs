@@ -23,6 +23,8 @@ mod navigation;
 mod picker;
 #[path = "app/profiles.rs"]
 mod profiles;
+#[path = "app/timezone_editor.rs"]
+mod timezone_editor;
 #[path = "app/update.rs"]
 mod update;
 #[path = "app/window.rs"]
@@ -52,6 +54,7 @@ pub struct AppDraft {
     pub inherit: bool,
     pub console_host: ConsoleHost,
     pub audit: bool,
+    pub chrome_independent_data: bool,
     /// Shell icon source (`path` or `path,index`) from picker / discovery.
     #[allow(dead_code)]
     pub icon_src: String,
@@ -70,6 +73,7 @@ impl AppDraft {
             inherit: true,
             console_host: ConsoleHost::Direct,
             audit: false,
+            chrome_independent_data: false,
             icon_src: String::new(),
         }
     }
@@ -126,6 +130,7 @@ pub struct EnvBoxApp {
     pub instances: InstanceManager,
     pub app_draft: AppDraft,
     pub profile_draft: ProfileDraft,
+    pub timezone_lookup: crate::timezone_lookup::LookupState,
     app_saved_draft: AppDraft,
     profile_saved_draft: ProfileDraft,
     pending_navigation: Option<PendingNavigation>,
@@ -255,6 +260,7 @@ impl EnvBoxApp {
             timezones,
             instances: InstanceManager::new(),
             app_saved_draft: app_draft.clone(),
+            timezone_lookup: Default::default(),
             profile_saved_draft: profile_draft.clone(),
             app_draft,
             profile_draft,
@@ -329,6 +335,24 @@ impl EnvBoxApp {
     }
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
+        // A result belongs to one edit session and its current timezone inputs.
+        // Invalidate before any navigation/edit action can replace that context.
+        if matches!(
+            &msg,
+            Message::ProfileEdit
+                | Message::ProfileEditCancel
+                | Message::ProfileSave
+                | Message::ProfileDelete
+                | Message::ProfileNew
+                | Message::ProfileSelect(_)
+                | Message::ProfileTz(_)
+                | Message::ProfileTzIana(_)
+                | Message::Nav(_)
+                | Message::UnsavedDiscard
+                | Message::ComboPick(ComboField::Timezone | ComboField::TimezoneIana, _)
+        ) {
+            self.timezone_lookup.invalidate();
+        }
         match msg {
             Message::Nav(n) => {
                 if n != self.nav {
@@ -460,6 +484,13 @@ impl EnvBoxApp {
             Message::AppInherit(v) => self.app_draft.inherit = v,
             Message::AppConsoleHost(v) => self.app_draft.console_host = v,
             Message::AppAudit(v) => self.app_draft.audit = v,
+            Message::AppChromeIndependentDataChanged(value) => {
+                self.app_draft.chrome_independent_data = value;
+            }
+            Message::AppDetect(id, profile_id, site) => {
+                return self.detect_app(id, profile_id, site);
+            }
+            Message::WorkspaceDetect(site) => return self.workspace_detect(site),
             Message::AppSelect(id) => {
                 if self.app_draft.id != Some(id) {
                     return self.request_navigation(PendingNavigation::App(id));
@@ -579,6 +610,20 @@ impl EnvBoxApp {
                     return self.request_navigation(PendingNavigation::Profile(id));
                 }
             }
+            Message::TimezoneSource(source) => {
+                self.timezone_lookup.invalidate();
+                self.timezone_lookup.source = source;
+            }
+            Message::TimezoneIp(value) => {
+                self.timezone_lookup.invalidate();
+                self.timezone_lookup.input = value;
+            }
+            Message::TimezoneQuery => return self.query_timezone(),
+            Message::TimezoneResult(generation, result) => {
+                self.finish_timezone_query(generation, result)
+            }
+            Message::TimezoneFill => self.fill_timezone(),
+            Message::TimezoneDismiss => self.timezone_lookup.invalidate(),
             Message::ProfileEdit => {
                 self.profile_saved_draft = self.profile_draft.clone();
                 self.profile_edit_mode = true;

@@ -200,6 +200,7 @@ impl EnvBoxApp {
                 LaunchKind::Executable
             },
             path: item.path.clone(),
+            chrome_independent_data: false,
             console_host: envbox_core::ConsoleHost::Direct,
             args: item.args.clone(),
             work_dir: item.work_dir.clone(),

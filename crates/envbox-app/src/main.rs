@@ -18,6 +18,7 @@ mod package;
 #[cfg(windows)]
 mod singleton;
 mod theme;
+mod timezone_lookup;
 #[cfg(windows)]
 mod tray;
 pub(crate) mod updater;

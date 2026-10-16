@@ -121,6 +121,7 @@ impl Drop for ActivationCleanup<'_> {
 
 /// One Environment Session (control-plane aggregate + runtime handles).
 pub struct SessionHandle {
+    pub chrome_lease: Option<crate::chrome::ChromeLease>,
     pub session: EnvironmentSession,
     pub instance: RuntimeInstance,
     pub job: Option<InstanceJob>,
@@ -158,6 +159,7 @@ impl SessionHandle {
         identity: Option<crate::ipc::ObservedRuntimeIdentity>,
     ) -> Self {
         Self {
+            chrome_lease: None,
             session,
             instance,
             job: Some(job),
@@ -226,8 +228,10 @@ impl SessionHandle {
 }
 
 /// Start request for one Run (CLI/GUI share this seam).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionStartRequest {
+    #[serde(default)]
+    pub chrome: Option<crate::chrome::ChromeContext>,
     pub application_id: Uuid,
     pub launch: LaunchTarget,
     pub arguments: Vec<String>,
@@ -352,6 +356,11 @@ pub(crate) fn start_session_with_options_and_tracking(
         launch: crate::package_discovery::normalize_launch_target(&req.launch),
         ..req
     };
+    let mut chrome_lease = crate::chrome::ChromeLease::acquire(&req)?;
+    let mut req = req;
+    if let Some(site) = req.chrome.as_ref().and_then(|context| context.detection) {
+        req.arguments.push(site.url().into());
+    }
     let instance_id = requested_instance_id.unwrap_or_else(Uuid::new_v4);
     let profile_id = req.profile.as_ref().map(|p| p.id).unwrap_or_default();
     let host_mode = req.profile.is_none();
@@ -489,6 +498,13 @@ pub(crate) fn start_session_with_options_and_tracking(
         }
         if entry_gate {
             env.insert("ENVBOX_STARTUP_GATE".into(), "1".into());
+        }
+        // Retain the named tracking Job independently of entry gating. A
+        // Chrome compatibility run needs read-only completion observation
+        // after its Supervisor exits, without claiming verified EXE entry.
+        let chrome_compatibility = matches!(&req.launch, LaunchTarget::Executable { path }
+            if path.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("chrome.exe")));
+        if entry_gate || chrome_compatibility {
             if let Some(name) = &requested_job_name {
                 env.insert("ENVBOX_RECOVERY_JOB_NAME".into(), name.clone());
             }
@@ -871,7 +887,14 @@ pub(crate) fn start_session_with_options_and_tracking(
         (Some(process), thread)
     };
 
+    if let Some(lease) = chrome_lease.as_mut() {
+        if let Err(error) = lease.publish(instance_id, instance.root_pid) {
+            let _ = job.terminate();
+            return Err(error);
+        }
+    }
     Ok(SessionHandle {
+        chrome_lease,
         session,
         instance,
         job: Some(job),
@@ -946,6 +969,7 @@ mod tests {
     #[test]
     fn host_session_target_has_no_profile() {
         let req = SessionStartRequest {
+            chrome: None,
             application_id: Uuid::nil(),
             launch: LaunchTarget::Command {
                 command: "cmd".into(),
@@ -981,6 +1005,7 @@ mod tests {
             ),
         ] {
             let result = start_session_gated(SessionStartRequest {
+                chrome: None,
                 application_id: Uuid::nil(),
                 launch,
                 arguments: vec![],
@@ -1008,6 +1033,7 @@ mod tests {
             }],
         );
         let result = start_session(SessionStartRequest {
+            chrome: None,
             application_id: Uuid::nil(),
             launch: LaunchTarget::Command {
                 command: "must-not-be-created".into(),
@@ -1095,6 +1121,7 @@ mod tests {
     #[test]
     fn windows_apps_executable_is_normalized_to_packaged() {
         let req = SessionStartRequest {
+            chrome: None,
             application_id: Uuid::nil(),
             launch: LaunchTarget::Executable {
                 path: r"C:\Program Files\WindowsApps\OpenAI.Codex_26.924.1866.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
@@ -1129,6 +1156,7 @@ mod tests {
             "{launch:?}"
         );
         let req = SessionStartRequest {
+            chrome: None,
             application_id: Uuid::nil(),
             launch,
             arguments: vec![],

@@ -28,7 +28,9 @@ pub enum InstanceError {
     WindowsTerminal(String),
     #[error("console host cannot safely represent the command arguments: {0}")]
     InvalidConsoleHost(String),
-    #[error("PowerShell 7 (pwsh.exe) was not found; install PowerShell 7 or add its directory to PATH")]
+    #[error(
+        "PowerShell 7 (pwsh.exe) was not found; install PowerShell 7 or add its directory to PATH"
+    )]
     PowerShell7NotFound,
 }
 
@@ -80,10 +82,36 @@ impl InstanceManager {
     /// `Application.default_profile_id`). Packaged/AUMID targets use
     /// `start_session` (never CreateProcess a WindowsApps exe).
     pub fn run(&mut self, app: &Application, target: RunTarget) -> Result<Uuid, InstanceError> {
+        self.run_intent(app, target, None)
+    }
+
+    pub fn run_detection(
+        &mut self,
+        app: &Application,
+        target: RunTarget,
+        site: envbox_core::DetectionSite,
+    ) -> Result<Uuid, InstanceError> {
+        self.run_intent(app, target, Some(site))
+    }
+
+    fn run_intent(
+        &mut self,
+        app: &Application,
+        target: RunTarget,
+        detection: Option<envbox_core::DetectionSite>,
+    ) -> Result<Uuid, InstanceError> {
         if app.console_host == ConsoleHost::WindowsTerminal {
             return self.run_windows_terminal(app, target);
         }
-        let request = build_session_request(app, target)?;
+        let mut request = build_session_request(app, target)?;
+        if let Some(site) = detection {
+            // Rebuild from saved arguments so an automatic directory is never inserted twice.
+            request.arguments = app.arguments.clone();
+            crate::chrome::configure(app, &mut request, None, Some(site))?;
+            if let Some(id) = crate::chrome::reuse_detection(&request)? {
+                return Ok(id);
+            }
+        }
         let new_console = matches!(
             app.console_host,
             ConsoleHost::Cmd | ConsoleHost::PowerShell | ConsoleHost::PowerShell7
@@ -487,7 +515,8 @@ fn build_session_request(
     };
     let path_env = target_path_environment(&target);
     let (launch, arguments) = console_host_target_with_path(app, path_env.as_deref())?;
-    Ok(SessionStartRequest {
+    let mut request = SessionStartRequest {
+        chrome: None,
         application_id: app.id,
         launch,
         arguments,
@@ -495,7 +524,9 @@ fn build_session_request(
         profile,
         inherit_children,
         audit: app.audit,
-    })
+    };
+    crate::chrome::configure(app, &mut request, None, None)?;
+    Ok(request)
 }
 
 /// Materialize the selected console host into the Session request. This keeps
@@ -768,6 +799,7 @@ mod tests {
             launch: LaunchTarget::Command {
                 command: "cmd".into(),
             },
+            chrome_independent_data: false,
             console_host: envbox_core::ConsoleHost::Direct,
             working_directory: None,
             arguments: vec!["/c".into(), "exit 0".into()],
@@ -906,6 +938,7 @@ mod tests {
             launch: LaunchTarget::Executable {
                 path: "shell:AppsFolder\\OpenAi.Codex_2p2nqsd0c76g0!App".into(),
             },
+            chrome_independent_data: false,
             console_host: envbox_core::ConsoleHost::Direct,
             working_directory: None,
             arguments: vec![],

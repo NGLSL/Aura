@@ -4,6 +4,7 @@
 pub mod activation;
 pub mod attach;
 pub mod capability;
+pub mod chrome;
 pub mod command;
 pub mod environment;
 pub mod injection;

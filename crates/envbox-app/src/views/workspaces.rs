@@ -82,6 +82,32 @@ pub fn run_panel(app: &EnvBoxApp) -> Element<'_, Message> {
         .menu_style(theme::pick_menu),
     );
     runs = runs.push(run_button.width(Fill));
+    if management
+        .application_id
+        .and_then(|id| {
+            app.applications
+                .iter()
+                .find(|application| application.id == id)
+        })
+        .is_some_and(|application| application.supports_chrome_data())
+    {
+        let detection = pick_list(
+            envbox_core::DetectionSite::ALL,
+            None::<envbox_core::DetectionSite>,
+            Message::WorkspaceDetect,
+        )
+        .placeholder("使用此环境打开检测页")
+        .text_size(12)
+        .font(font::ui_font())
+        .padding(Padding::from([7, 8]))
+        .width(Fill)
+        .style(theme::pick_style)
+        .menu_style(theme::pick_menu);
+        // The action handler applies the same saved/idle checks as snapshot startup.
+        if !management.busy {
+            runs = runs.push(detection);
+        }
+    }
     runs = runs.push(row![refresh_button, stop_all].spacing(8));
     if let Some(error) = &state.error {
         runs = runs.push(
@@ -230,7 +256,7 @@ pub fn run_panel(app: &EnvBoxApp) -> Element<'_, Message> {
                     technical_info(format!("实例 {} · 标识详情", short_id(result.instance_id)), details, MUTED),
                     text(format!(
                         "{} · 入口保证 {}",
-                        result.mode, result.entry_guarantee
+                        result.mode, envbox_supervisor::entry_guarantee_label(&result.entry_guarantee)
                     )).size(12).color(INK_2).font(font::ui_font()),
                     text(environment_observation).size(12).color(INK_2).font(font::ui_font()),
                     text(format!(
@@ -242,6 +268,10 @@ pub fn run_panel(app: &EnvBoxApp) -> Element<'_, Message> {
                     text(format!("当前 Job 进程：{:?}", view.process_ids)).size(12).color(MUTED).font(font::ui_font()),
                 ]
                 .spacing(8);
+            if result.entry_guarantee == envbox_supervisor::ENTRY_CHROME_COMPATIBILITY {
+                instance = instance.push(text("仅核验已认证成员的环境；沙箱子进程可能读取本机信息。退出 Aura 界面不影响浏览器；Supervisor 重启后仅观测原 Job，关闭浏览器并刷新后才解除 TrackingLost。服务离线期间 Job 已消失时将保留失踪状态。")
+                    .size(12).color(MUTED).font(font::ui_font()));
+            }
             if let Some(error) = &result.error {
                 instance = instance.push(
                     text(error)

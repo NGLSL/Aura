@@ -370,7 +370,7 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
                 "GenerationMismatch"
             } else if matches!(
                 request.command.as_str(),
-                "Run" | "RunStatus" | "List" | "Stop" | "StopAll"
+                "Run" | "Detect" | "RunStatus" | "List" | "Stop" | "StopAll"
             ) && request.generation.is_none()
             {
                 "GenerationRequired"
@@ -385,12 +385,19 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
                     .generation
                     .as_ref()
                     .is_some_and(|expected| expected == &generation)
-                && matches!(request.command.as_str(), "Run" | "RunStatus")
+                && matches!(request.command.as_str(), "Run" | "Detect" | "RunStatus")
             {
                 match request.run.as_ref() {
                     Some(_) if uuid::Uuid::parse_str(&request.request_id).is_err() => {
                         ("InvalidRequest".into(), None, vec![])
                     }
+                    Some(command) if request.command == "Detect" => match request.detection {
+                        Some(site) => {
+                            let (status, result) = runs.detect(command, site, &request.request_id);
+                            (status, result, vec![])
+                        }
+                        None => ("InvalidRequest".into(), None, vec![]),
+                    },
                     Some(command) => {
                         let (status, result) = if request.command == "Run" {
                             runs.run(&request.request_id, command)
@@ -503,6 +510,7 @@ impl SupervisorClient {
     }
     fn ping_request(&self, generation: Option<String>) -> Request {
         Request {
+            detection: None,
             version: PROTOCOL_VERSION,
             generation,
             request_id: uuid::Uuid::new_v4().to_string(),

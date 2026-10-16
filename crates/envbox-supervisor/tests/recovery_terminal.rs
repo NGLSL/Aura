@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 fn request(command: &str, generation: Option<String>, container: Option<Uuid>) -> Request {
     Request {
+        detection: None,
         version: PROTOCOL_VERSION,
         generation,
         request_id: Uuid::new_v4().to_string(),
@@ -82,6 +83,7 @@ fn missing_job_with_absent_sealed_generations_stays_tracking_lost() {
         arguments: vec![],
         default_profile_id: profile.id,
         inherit_children: true,
+        chrome_independent_data: false,
         console_host: ConsoleHost::Direct,
         audit: false,
     };

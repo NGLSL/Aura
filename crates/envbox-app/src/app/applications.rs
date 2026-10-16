@@ -33,6 +33,7 @@ impl EnvBoxApp {
                     .unwrap_or_default(),
                 profile_id: app.default_profile_id,
                 inherit: app.inherit_children,
+                chrome_independent_data: app.chrome_independent_data,
                 console_host: app.console_host,
                 audit: app.audit,
                 icon_src: match &app.launch {
@@ -120,6 +121,7 @@ impl EnvBoxApp {
             arguments,
             default_profile_id: self.app_draft.profile_id,
             inherit_children: self.app_draft.inherit,
+            chrome_independent_data: self.app_draft.chrome_independent_data,
             console_host: self.app_draft.console_host,
             audit: self.app_draft.audit,
         };
@@ -179,7 +181,29 @@ impl EnvBoxApp {
         Task::none()
     }
 
+    pub(super) fn detect_app(
+        &mut self,
+        app_id: Uuid,
+        profile_id: Option<Uuid>,
+        site: envbox_core::DetectionSite,
+    ) -> Task<Message> {
+        self.run_app_intent(
+            app_id,
+            profile_id
+                .map(RunSelection::Profile)
+                .unwrap_or(RunSelection::Host),
+            Some(site),
+        )
+    }
     pub(super) fn run_app(&mut self, app_id: Uuid, sel: RunSelection) -> Task<Message> {
+        self.run_app_intent(app_id, sel, None)
+    }
+    fn run_app_intent(
+        &mut self,
+        app_id: Uuid,
+        sel: RunSelection,
+        detection: Option<envbox_core::DetectionSite>,
+    ) -> Task<Message> {
         let Some(app) = self.applications.iter().find(|a| a.id == app_id).cloned() else {
             self.set_status(StatusKind::Error, "应用不存在");
             return Task::none();
@@ -221,9 +245,25 @@ impl EnvBoxApp {
                 RunTarget::Profile(profile)
             }
         };
-        match self.instances.run(&app, target) {
+        let environment = match &target {
+            RunTarget::Host => "本机 Host".into(),
+            RunTarget::Profile(profile) => profile.name.clone(),
+        };
+        let result = if let Some(site) = detection {
+            self.instances.run_detection(&app, target, site)
+        } else {
+            self.instances.run(&app, target)
+        };
+        match result {
             Ok(id) => {
-                self.set_status(StatusKind::Success, format!("已启动实例 {id}"));
+                self.set_status(
+                    StatusKind::Success,
+                    if let Some(site) = detection {
+                        format!("已在 {environment} 打开 {site}（实例 {id}）")
+                    } else {
+                        format!("已启动实例 {id}")
+                    },
+                );
                 self.nav = Nav::Apps;
                 self.instances.refresh_all();
             }

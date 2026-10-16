@@ -119,6 +119,9 @@ pub struct Application {
     pub arguments: Vec<String>,
     pub default_profile_id: Uuid,
     pub inherit_children: bool,
+    /// Separate Chrome data root per Application and effective Profile/Host.
+    #[serde(default)]
+    pub chrome_independent_data: bool,
     /// Console host preference for command targets. Older documents default
     /// to direct launch for backwards compatibility.
     #[serde(default)]
@@ -160,7 +163,32 @@ impl Application {
                 "non-direct console hosts are available only for command targets".into(),
             ));
         }
+        if self.chrome_independent_data && !self.supports_chrome_data() {
+            return Err(DomainError::InvalidApplication("独立浏览器数据目录仅支持 Chrome 可执行应用".into()));
+        }
         Ok(())
+    }
+
+    pub fn supports_chrome_data(&self) -> bool {
+        matches!(&self.launch, LaunchTarget::Executable { path }
+            if BrowserEngine::from_image(&path.to_string_lossy()) == BrowserEngine::Chromium
+            && path.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("chrome.exe")))
+    }
+}
+
+/// Fixed browser intents; management services never accept a URL supplied by a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionSite { IpPure, NetCoffee }
+impl DetectionSite {
+    pub const ALL: [Self; 2] = [Self::IpPure, Self::NetCoffee];
+    pub fn url(self) -> &'static str {
+        match self { Self::IpPure => "https://ippure.com/claude.html", Self::NetCoffee => "https://ip.net.coffee/claude/" }
+    }
+}
+impl std::fmt::Display for DetectionSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { Self::IpPure => "IPPure Claude", Self::NetCoffee => "Net.Coffee Claude" })
     }
 }
 
@@ -646,6 +674,7 @@ mod tests {
             arguments: vec![],
             default_profile_id: Uuid::nil(),
             inherit_children: true,
+            chrome_independent_data: false,
             console_host: ConsoleHost::Direct,
             audit: false,
         };
@@ -699,6 +728,7 @@ mod tests {
                 arguments: vec![],
                 default_profile_id: Uuid::nil(),
                 inherit_children: true,
+                chrome_independent_data: false,
                 console_host,
                 audit: false,
             };

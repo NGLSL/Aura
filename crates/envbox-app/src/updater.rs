@@ -137,7 +137,7 @@ pub fn check_latest(current: &str) -> Result<CheckResult, String> {
     parse_release_json(&output.stdout, current)
 }
 
-fn curl_command() -> Result<Command, String> {
+pub(crate) fn curl_command() -> Result<Command, String> {
     #[cfg(windows)]
     let mut command = Command::new(system_curl_path()?);
     #[cfg(not(windows))]

@@ -7,12 +7,28 @@ use std::time::Duration;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Chrome's TLS callbacks exclude it from the verified no-TLS entry gate.
+/// This token records a different startup contract, never a retry fallback.
+pub const ENTRY_CHROME_COMPATIBILITY: &str = "chrome_compatibility_root_runtime";
+
+pub fn entry_guarantee_label(guarantee: &str) -> &str {
+    match guarantee {
+        ENTRY_CHROME_COMPATIBILITY => "Chrome 兼容启动：根进程 Runtime 已核验，未启用入口门禁",
+        "verified_pe_entry_no_tls" => "已核验 EXE 入口门禁（不含 TLS 回调）",
+        "pending" => "等待核验",
+        "unverified" => "未核验",
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub version: u32,
     pub generation: Option<String>,
     pub request_id: String,
     pub command: String,
+    #[serde(default)]
+    pub detection: Option<envbox_core::DetectionSite>,
     #[serde(default)]
     pub run: Option<RunCommand>,
     #[serde(default)]

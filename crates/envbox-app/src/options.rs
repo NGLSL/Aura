@@ -1,5 +1,5 @@
 //! Curated Profile editor option lists (common values only).
-//! Display: region codes / locale tokens / timezone Chinese names.
+//! Display: Chinese region names / locale tokens / timezone Chinese names.
 
 /// Common regions supported by the Profile editor.
 pub const COMMON_REGIONS: &[&str] = &[
@@ -12,11 +12,20 @@ pub const COMMON_LOCALES: &[&str] = &[
     "ko-KR", "es-BO", "tr-TR",
 ];
 
-/// Region display: 中国 / 美国 only. Other codes stay as codes (no long names).
+/// Shared Chinese region labels; unknown codes remain visible unchanged.
 pub fn region_label(code: &str) -> String {
     match code.trim().to_ascii_uppercase().as_str() {
         "CN" => "中国".into(),
         "US" => "美国".into(),
+        "TW" => "台湾".into(),
+        "SG" => "新加坡".into(),
+        "JP" => "日本".into(),
+        "PH" => "菲律宾".into(),
+        "GB" => "英国".into(),
+        "DE" => "德国".into(),
+        "KR" => "韩国".into(),
+        "BO" => "玻利维亚".into(),
+        "TR" => "土耳其".into(),
         _ => code.to_string(),
     }
 }
@@ -233,7 +242,6 @@ fn localize_tz_words(s: &str) -> String {
         ("Canada", "加拿大"),
         ("Greenland", "格陵兰"),
         ("GMT", "格林尼治"),
-        ("UTC", "UTC"),
         ("Coordinated Universal", "协调世界"),
     ];
 
@@ -333,7 +341,7 @@ mod tests {
     fn labels_show_only_cn_us_and_timezone() {
         assert_eq!(region_label("CN"), "中国");
         assert_eq!(region_label("US"), "美国");
-        assert_eq!(region_label("JP"), "JP");
+        assert_eq!(region_label("JP"), "日本");
         assert_eq!(locale_label("zh-CN"), "zh-CN");
         assert_eq!(locale_label("en-US"), "en-US");
         assert_eq!(timezone_label("China Standard Time"), "中国标准时间");

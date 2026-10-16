@@ -34,6 +34,7 @@ fn request(
     container: Option<Uuid>,
 ) -> Request {
     Request {
+        detection: None,
         version: PROTOCOL_VERSION,
         generation,
         request_id: Uuid::new_v4().to_string(),
@@ -264,6 +265,7 @@ fn exercise_crash(child_tree: bool, root32: bool, child32: bool, live_root: bool
         },
         default_profile_id: profile.id,
         inherit_children: true,
+        chrome_independent_data: false,
         console_host: ConsoleHost::Direct,
         audit: false,
     };

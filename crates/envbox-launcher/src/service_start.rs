@@ -521,6 +521,7 @@ mod tests {
         }
         assert!(std::fs::File::open(&path).is_ok());
         let req = SessionStartRequest {
+            chrome: None,
             application_id: uuid::Uuid::nil(),
             launch: envbox_core::LaunchTarget::Executable { path },
             arguments: vec![],
@@ -603,6 +604,7 @@ mod tests {
                 .environment
                 .insert("AURA_GATE_MARKER".into(), marker.display().to_string());
             let req = SessionStartRequest {
+                chrome: None,
                 application_id: uuid::Uuid::nil(),
                 launch: LaunchTarget::Executable {
                     path: target.clone(),

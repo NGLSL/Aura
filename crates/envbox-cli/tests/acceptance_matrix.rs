@@ -390,6 +390,7 @@ fn acceptance_notepad_launch_and_stop() {
         launch: LaunchTarget::Command {
             command: "notepad".into(),
         },
+        chrome_independent_data: false,
         console_host: envbox_core::ConsoleHost::Direct,
         working_directory: None,
         arguments: vec![],

@@ -639,6 +639,7 @@ fn sample_app(args: Vec<String>) -> envbox_core::Application {
         launch: LaunchTarget::Command {
             command: "cmd".into(),
         },
+        chrome_independent_data: false,
         console_host: envbox_core::ConsoleHost::Direct,
         working_directory: None,
         arguments: args,

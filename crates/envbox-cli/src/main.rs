@@ -404,6 +404,7 @@ fn cmd_run(store: &ConfigStore, args: &[String]) -> ExitCode {
     };
 
     let request = envbox_launcher::SessionStartRequest {
+        chrome: None,
         application_id: Uuid::nil(),
         launch,
         arguments: command_args.to_vec(),
@@ -589,6 +590,7 @@ fn cmd_terminal_run(store: &ConfigStore, args: &[String]) -> ExitCode {
     };
 
     let request = envbox_launcher::SessionStartRequest {
+        chrome: None,
         application_id,
         launch: app.launch,
         arguments: app.arguments,
@@ -949,6 +951,7 @@ fn cmd_app_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         id: Uuid::new_v4(),
         name,
         launch,
+        chrome_independent_data: false,
         console_host: envbox_core::ConsoleHost::Direct,
         working_directory,
         arguments,

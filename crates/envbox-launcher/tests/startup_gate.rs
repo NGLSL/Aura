@@ -301,6 +301,7 @@ fn public_gated_session_publishes_only_approved_entry() {
             browser: Default::default(),
         };
         let request = SessionStartRequest {
+            chrome: None,
             application_id: uuid::Uuid::new_v4(),
             launch: LaunchTarget::Executable {
                 path: target
@@ -442,6 +443,7 @@ fn cmd_intermediary_preserves_child_identity_gate_and_job() {
             bundle.join(format!("envbox-runtime{parent_arch}.dll")),
         );
         let request = SessionStartRequest {
+            chrome: None,
             application_id: uuid::Uuid::new_v4(),
             launch: LaunchTarget::Executable { path: cmd },
             arguments: vec!["/d".into(), "/c".into(), fixture.to_string_lossy().into()],

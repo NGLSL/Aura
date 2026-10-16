@@ -163,6 +163,79 @@ fn prepare_run(
 }
 
 impl EnvBoxApp {
+    pub(super) fn workspace_detect(&mut self, site: envbox_core::DetectionSite) -> Task<Message> {
+        if self.workspaces.dirty() || self.profile_draft != self.profile_saved_draft {
+            self.workspace_management.error =
+                Some("请先保存或取消环境配置修改，再打开检测页".into());
+            return Task::none();
+        }
+        if self.workspace_management.busy || self.workspace_management.pending_run.is_some() {
+            return Task::none();
+        }
+        let (Some(profile_id), Some(application_id)) = (
+            self.profile_draft.id,
+            self.workspace_management.application_id,
+        ) else {
+            self.workspace_management.error = Some("请选择已保存环境配置及 Chrome 应用".into());
+            return Task::none();
+        };
+        self.bind_profile_scope();
+        let Some(container_id) = self.workspaces.selected else {
+            return Task::none();
+        };
+        let Some(generation) = self.workspace_management.generation.clone() else {
+            self.workspace_management.error = Some("请先刷新运行状态".into());
+            return Task::none();
+        };
+        self.workspace_management.busy = true;
+        self.workspace_management.error = None;
+        let store = self.store.clone();
+        let epoch = self.workspace_management.epoch;
+        let workspace_id = Some(container_id);
+        Task::perform(
+            async move {
+                let (tx, rx) = iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<Response, String> {
+                        let command = prepare_run(
+                            &store,
+                            container_id,
+                            application_id,
+                            Uuid::new_v4(),
+                            Some(profile_id),
+                        )?;
+                        let mut client =
+                            envbox_supervisor::SupervisorClient::beside_current_executable()
+                                .map_err(|e| e.to_string())?;
+                        client.timeout = std::time::Duration::from_secs(25);
+                        client
+                            .request(Request {
+                                version: PROTOCOL_VERSION,
+                                generation: Some(generation),
+                                request_id: Uuid::new_v4().to_string(),
+                                command: "Detect".into(),
+                                detection: Some(site),
+                                run: Some(command),
+                                container_id: Some(container_id),
+                            })
+                            .map_err(|e| e.to_string())
+                    })();
+                    let _ = tx.send(result);
+                });
+                ManagementReply {
+                    epoch,
+                    workspace_id,
+                    operation: "Detect".into(),
+                    result: rx.await.unwrap_or_else(|_| {
+                        Err("检测请求后台异常终止；请刷新运行状态确认浏览器".into())
+                    }),
+                    run_submission_unknown: false,
+                }
+            },
+            Message::WorkspaceManagementResult,
+        )
+    }
+
     pub(super) fn workspace_list(&mut self) -> Task<Message> {
         self.workspace_request("List", None, None)
     }
@@ -360,6 +433,7 @@ fn stop_profile_runs(
     mut exchange: impl FnMut(Request) -> Result<Response, String>,
 ) -> Result<Response, String> {
     let request = |command: &str, run: Option<RunCommand>| Request {
+        detection: None,
         version: PROTOCOL_VERSION,
         generation: Some(generation.into()),
         request_id: Uuid::new_v4().to_string(),
@@ -469,6 +543,7 @@ fn management_exchange(
         submitted = operation == "Run";
         client
             .request(Request {
+                detection: None,
                 version: PROTOCOL_VERSION,
                 generation: Some(generation),
                 request_id: Uuid::new_v4().to_string(),
@@ -955,6 +1030,7 @@ mod tests {
             arguments: vec![],
             default_profile_id: profile.id,
             inherit_children: true,
+            chrome_independent_data: false,
             console_host: ConsoleHost::Direct,
             audit: false,
         };

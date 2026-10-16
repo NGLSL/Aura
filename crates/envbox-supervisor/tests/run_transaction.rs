@@ -54,6 +54,7 @@ fn public_run_uses_immutable_snapshot_and_is_idempotent() {
         arguments: vec![],
         default_profile_id: profile.id,
         inherit_children: true,
+        chrome_independent_data: false,
         console_host: ConsoleHost::Direct,
         audit: false,
     };
@@ -109,6 +110,7 @@ fn public_run_uses_immutable_snapshot_and_is_idempotent() {
         application_id: application.id,
     };
     let mut request = Request {
+        detection: None,
         version: PROTOCOL_VERSION,
         generation: None,
         request_id: Uuid::new_v4().to_string(),
