@@ -203,6 +203,7 @@ pub enum Message {
     WorkspaceStop(Uuid),
     WorkspaceStopAll,
     WorkspaceRunStatus,
+    WorkspaceDiagnostics(Uuid),
     WorkspaceManagementResult(crate::app::workspace_management::ManagementReply),
     Nav(Nav),
     Search(String),

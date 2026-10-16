@@ -11,6 +11,7 @@ pub struct ManagementState {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub pending_run: Option<RunCommand>,
+    pub diagnostics_instance: Option<Uuid>,
     pending_profile_id: Option<Uuid>,
     epoch: u64,
 }
@@ -43,6 +44,7 @@ impl ManagementState {
     pub fn selection_changed(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.application_id = None;
+        self.diagnostics_instance = None;
     }
 
     fn accept(&mut self, reply: &ManagementReply, selected: Option<Uuid>) -> bool {
@@ -82,6 +84,7 @@ impl ManagementState {
                     .is_some_and(|old| old != &response.generation);
                 if changed {
                     self.instances.clear();
+                    self.diagnostics_instance = None;
                     self.clear_pending();
                     self.notice = Some("Supervisor 已换代；列表以当前服务端记录为准。TrackingLost 表示未恢复跟踪，不能保证进程已退出。".into());
                 }

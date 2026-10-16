@@ -415,6 +415,10 @@ impl EnvBoxApp {
             Message::WorkspaceStop(id) => return self.workspace_stop(Some(id)),
             Message::WorkspaceStopAll => return self.workspace_stop(None),
             Message::WorkspaceRunStatus => return self.workspace_run_status(),
+            Message::WorkspaceDiagnostics(id) => {
+                let expanded = &mut self.workspace_management.diagnostics_instance;
+                *expanded = if *expanded == Some(id) { None } else { Some(id) };
+            }
             Message::WorkspaceManagementResult(value) => {
                 return self.finish_workspace_management(value)
             }

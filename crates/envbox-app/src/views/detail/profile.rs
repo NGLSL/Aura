@@ -119,16 +119,6 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
         }
     };
 
-    let dns = if p.dns.mode == envbox_core::DnsMode::Host {
-        "跟随系统 DNS".to_string()
-    } else {
-        p.dns
-            .effective_upstreams()
-            .iter()
-            .map(|s| s.label())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let webrtc = WebRtcChoice::from_policy(&p.browser.webrtc);
 
     container(
@@ -160,7 +150,7 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
                             &p.timezone.iana_id
                         },
                     ),
-                    kv_row("DNS", &format!("{} · {}", dns_mode_label(&p.dns.mode), dns)),
+                    dns::overview(&p.dns),
                     kv_row(
                         "WebRTC",
                         &format!("{} · {}", webrtc, browser_guarantee_label(p.browser.webrtc)),
@@ -414,12 +404,9 @@ fn profile_editor(app: &EnvBoxApp) -> Element<'_, Message> {
                     .padding(Padding::from([5, 8]))
                     .font(font::ui_font()),
                 ),
-                form_row(
-                    "DNS 上游顺序",
-                    dns::view(
-                        &app.profile_draft.dns_editor,
-                        app.profile_draft.dns_mode.to_mode(),
-                    ),
+                dns::view(
+                    &app.profile_draft.dns_editor,
+                    app.profile_draft.dns_mode.to_mode(),
                 ),
                 form_row(
                     "WebRTC",
