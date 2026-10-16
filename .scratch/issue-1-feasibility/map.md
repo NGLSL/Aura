@@ -14,10 +14,11 @@ Date: 2026-10-16
 | [04](./issues/04-chrome-independent-data.md) | Chrome 独立数据目录与跨入口安全启动 | — | resolved | A5、A6、A7、A13 的目录兼容 |
 | [05](./issues/05-claude-detection-pages.md) | 在所选 Chrome 环境打开两个固定检测页 | 04 | resolved | A7 的受控复用、A8；A9 的页面失败 |
 | [06](./issues/06-integrated-runtime-acceptance.md) | 首版组合流程、退出界面后续用与最终验收 | 01、03、05 | resolved | 汇总 A1–A13；负责 A10 的 Chrome 实际操作证据 |
+| [07](./issues/07-profile-proxy-and-readonly-egress.md) | 只读实际出口、Profile HTTP/SOCKS5 代理及共享路径 | 02、04、05 | resolved | 替换 A2，补 A14、A15 |
 
 依赖图：02 → 03 → 06；04 → 05 → 06；01 → 06。06 的三个前置包含所有功能票的传递依赖，不重复列出 02、04。
 
-六票均已实现并完成约定的正常路径验收；[验收记录](./evidence/runtime-acceptance.md)区分实际运行、静态复核与未触发的服务异常。Workspace 按用户批准的 Chrome 显式兼容保证完成运行和恢复验收；两轴审查及必要修复已完成。
+01–06 已随 `446a7f4` 交付，原[验收记录](./evidence/runtime-acceptance.md)对应该提交。07 已按用户新决定移除手填 IP 并加入 Profile 代理；[本轮验收](./evidence/profile-proxy-acceptance.md)覆盖真实两种代理与启动路径。整体 review 的非 Stable Chrome 默认目录 P2 及增量发现的问题均已修复。
 
 ## 为什么这样拆
 

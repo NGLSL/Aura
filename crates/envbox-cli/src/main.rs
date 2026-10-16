@@ -839,7 +839,10 @@ fn cmd_profile_add(store: &ConfigStore, args: &[String]) -> ExitCode {
         },
         environment,
         registry: RegistryProfile::default(),
-        browser: BrowserPrivacyProfile { webrtc },
+        browser: BrowserPrivacyProfile {
+            webrtc,
+            proxy: None,
+        },
         identity,
     };
 

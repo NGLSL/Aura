@@ -1,7 +1,7 @@
 //! Lookup preview belongs to the current Profile edit session, never storage.
 use super::EnvBoxApp;
 use crate::message::{Message, Nav};
-use crate::timezone_lookup::{self, LookupResult, Source};
+use crate::timezone_lookup::{self, LookupResult};
 use iced::Task;
 
 impl EnvBoxApp {
@@ -12,24 +12,19 @@ impl EnvBoxApp {
         {
             return Task::none();
         }
-        let source = self.timezone_lookup.source;
-        let explicit = if source == Source::Explicit {
-            match timezone_lookup::parse_public_ip(&self.timezone_lookup.input) {
-                Ok(ip) => Some(ip),
-                Err(error) => {
-                    self.timezone_lookup.error = Some(error);
-                    return Task::none();
-                }
+        let proxy = match self.profile_draft.proxy.to_profile() {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                self.timezone_lookup.error = Some(error);
+                return Task::none();
             }
-        } else {
-            None
         };
         self.timezone_lookup.invalidate();
         self.timezone_lookup.pending = true;
         let generation = self.timezone_lookup.generation;
         let (sender, receiver) = iced::futures::channel::oneshot::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(timezone_lookup::query(source, explicit));
+            let _ = sender.send(timezone_lookup::query(proxy.as_ref()));
         });
         Task::perform(
             async move {

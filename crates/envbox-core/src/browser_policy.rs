@@ -37,7 +37,9 @@ impl WebRtcPolicy {
             "public_interface_only" | "public-interface-only" => {
                 Some(WebRtcPolicy::PublicInterfaceOnly)
             }
-            "proxy_only" | "proxy-only" | "disable_non_proxied_udp" => Some(WebRtcPolicy::ProxyOnly),
+            "proxy_only" | "proxy-only" | "disable_non_proxied_udp" => {
+                Some(WebRtcPolicy::ProxyOnly)
+            }
             "strict" => Some(WebRtcPolicy::Strict),
             _ => None,
         }
@@ -83,6 +85,69 @@ pub enum BrowserGuarantee {
 pub struct BrowserPrivacyProfile {
     #[serde(default)]
     pub webrtc: WebRtcPolicy,
+    /// Chrome and explicit egress lookup only; absent preserves existing networking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<BrowserProxy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserProxyKind {
+    Http,
+    Socks5,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserProxy {
+    pub kind: BrowserProxyKind,
+    pub host: String,
+    pub port: u16,
+}
+
+impl BrowserProxy {
+    pub fn validate(&self) -> Result<(), crate::DomainError> {
+        let host = &self.host;
+        let domain = host.strip_suffix('.').unwrap_or(host);
+        let valid = host.parse::<std::net::IpAddr>().is_ok()
+            || (host.len() <= 253
+                && !domain.is_empty()
+                && domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                }));
+        if self.port == 0 || !valid {
+            return Err(crate::DomainError::InvalidProfile(
+                "代理需要有效的 IPv4、IPv6 或域名及 1–65535 端口；不支持网址、路径和认证信息"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn endpoint(&self, socks_scheme: &str) -> String {
+        let scheme = match self.kind {
+            BrowserProxyKind::Http => "http",
+            BrowserProxyKind::Socks5 => socks_scheme,
+        };
+        let host = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{scheme}://{host}:{}", self.port)
+    }
+
+    pub fn chrome_server(&self) -> String {
+        self.endpoint("socks5")
+    }
+    pub fn curl_server(&self) -> String {
+        self.endpoint("socks5h")
+    }
 }
 
 /// Explicit browser engine classification (never bare substring match).

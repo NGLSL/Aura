@@ -132,9 +132,17 @@ fn decode_effective_profile(
         ("locale", &["locale_name", "ui_language", "region"][..]),
         ("timezone", &["windows_id", "iana_id"][..]),
         ("registry", &["whitelist_paths"][..]),
-        ("browser", &["webrtc"][..]),
     ] {
         fields(&value[key], required)?;
+    }
+    // Proxy is optional in legacy snapshots. When present, bind its complete
+    // shape instead of letting Profile's compatibility defaults ignore fields.
+    let browser = &value["browser"];
+    if let Some(proxy) = browser.get("proxy") {
+        fields(browser, &["webrtc", "proxy"])?;
+        fields(proxy, &["kind", "host", "port"])?;
+    } else {
+        fields(browser, &["webrtc"])?;
     }
     serde_json::from_value(value).map_err(|err| err.to_string())
 }

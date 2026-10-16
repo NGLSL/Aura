@@ -32,6 +32,197 @@ fn data_root() -> Result<PathBuf, SessionError> {
         .map(|root| PathBuf::from(root).join("com.aura.envbox"))
         .ok_or_else(|| error("无法确定 Aura 用户数据目录"))
 }
+/// Read branding without loading or executing the browser. Install channels
+/// share "Google Chrome" branding, so that name alone cannot imply Stable.
+fn product_name(executable: &Path) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    let path: Vec<u16> = executable
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(path.as_ptr()), None) };
+    if size == 0 || size > 1024 * 1024 {
+        return None;
+    }
+    // DWORD alignment is required by the Windows version-information buffer.
+    let mut data = vec![0u32; (size as usize).div_ceil(4)];
+    unsafe { GetFileVersionInfoW(PCWSTR(path.as_ptr()), 0, size, data.as_mut_ptr().cast()) }
+        .ok()?;
+    let query = |block: &str| -> Option<(*const u8, usize)> {
+        let key: Vec<u16> = block.encode_utf16().chain(Some(0)).collect();
+        let mut pointer = std::ptr::null_mut();
+        let mut length = 0;
+        if !unsafe {
+            VerQueryValueW(
+                data.as_ptr().cast(),
+                PCWSTR(key.as_ptr()),
+                &mut pointer,
+                &mut length,
+            )
+        }
+        .as_bool()
+            || pointer.is_null()
+        {
+            return None;
+        }
+        Some((pointer.cast(), length as usize))
+    };
+    let (translation, bytes) = query(r"\VarFileInfo\Translation")?;
+    if bytes < 4 {
+        return None;
+    }
+    // Every translation is a pair of WORDs (language, code page).
+    for offset in (0..bytes.saturating_sub(3)).step_by(4) {
+        let language = unsafe { std::ptr::read_unaligned(translation.add(offset).cast::<u16>()) };
+        let page = unsafe { std::ptr::read_unaligned(translation.add(offset + 2).cast::<u16>()) };
+        if let Some((value, length)) = query(&format!(
+            r"\StringFileInfo\{language:04x}{page:04x}\ProductName"
+        )) {
+            if length == 0 || length > 256 {
+                continue;
+            }
+            let value = unsafe { std::slice::from_raw_parts(value.cast::<u16>(), length) };
+            return String::from_utf16(value.strip_suffix(&[0]).unwrap_or(value)).ok();
+        }
+    }
+    None
+}
+
+/// Windows defaults follow branding and the registered installation layout,
+/// not the executable's basename. See Chromium docs/user_data_dir.md#Windows.
+fn default_chrome_directory(launch: &LaunchTarget) -> Result<PathBuf, SessionError> {
+    let unknown = || {
+        SessionError::Unsupported(
+        "Chrome：无法可靠确定此浏览器渠道的默认数据目录；请显式设置 --user-data-dir 或开启独立浏览器数据目录".into())
+    };
+    let LaunchTarget::Executable { path } = launch else {
+        return Err(unknown());
+    };
+    let product = product_name(path).ok_or_else(unknown)?;
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or_else(unknown)?);
+    // These build brands have distinct fixed defaults, including portable CfT.
+    if product == "Google Chrome for Testing" {
+        return Ok(local.join("Google/Chrome for Testing/User Data"));
+    }
+    if product == "Chromium" {
+        return Ok(local.join("Chromium/User Data"));
+    }
+    if product != "Google Chrome" {
+        return Err(unknown());
+    }
+    let executable = std::fs::canonicalize(path).map_err(|_| unknown())?;
+    // Only recognize actual standard installations. A renamed/copied custom
+    // chrome.exe must not inherit Stable's default or touch its data root.
+    for root in [
+        "ProgramW6432",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "LOCALAPPDATA",
+    ] {
+        let Some(root) = std::env::var_os(root) else {
+            continue;
+        };
+        let Ok(root) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        for channel in ["Chrome", "Chrome Beta", "Chrome Dev", "Chrome SxS"] {
+            let installed = root
+                .join("Google")
+                .join(channel)
+                .join("Application")
+                .join("chrome.exe");
+            if executable
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&installed.as_os_str().to_string_lossy())
+            {
+                return Ok(local.join("Google").join(channel).join("User Data"));
+            }
+        }
+    }
+    Err(unknown())
+}
+
+// Chromium trims each argv token before recognizing prefixes or the terminator.
+// Keep the stored argv untouched; only its interpretation uses this view.
+fn chrome_token(argument: &str) -> &str {
+    argument.trim()
+}
+fn chrome_switch(argument: &str) -> Option<&str> {
+    let token = chrome_token(argument);
+    token
+        .strip_prefix("--")
+        .or_else(|| token.strip_prefix('-'))
+        .or_else(|| token.strip_prefix('/'))
+}
+fn chrome_switch_end(arguments: &[String]) -> usize {
+    arguments
+        .iter()
+        .position(|arg| chrome_token(arg) == "--")
+        .unwrap_or(arguments.len())
+}
+
+/// Effective root arguments. Requests retain original user arguments for stable reuse comparisons.
+/// Proxy settings deliberately apply only to the supported Win32 chrome.exe entry.
+pub fn proxy_arguments(req: &SessionStartRequest) -> Result<Vec<String>, SessionError> {
+    let mut arguments = req.arguments.clone();
+    let Some(proxy) = req.profile.as_ref().and_then(|p| p.browser.proxy.as_ref()) else {
+        return Ok(arguments);
+    };
+    proxy
+        .validate()
+        .map_err(|e| SessionError::InvalidProfile(e.to_string()))?;
+    if !supports_proxy(req) {
+        return Ok(arguments);
+    }
+    let switch_end = chrome_switch_end(&arguments);
+    if arguments[..switch_end].iter().any(|arg| {
+        let switch = chrome_switch(arg).unwrap_or("");
+        let name = switch.split('=').next().unwrap_or(switch);
+        [
+            "proxy-server",
+            "proxy-pac-url",
+            "proxy-auto-detect",
+            "no-proxy-server",
+            "proxy-bypass-list",
+        ]
+        .iter()
+        .any(|switch| name.eq_ignore_ascii_case(switch))
+    }) {
+        return Err(SessionError::Unsupported("Chrome：Profile 代理与应用手填代理参数冲突；请移除 proxy-server、PAC、自动检测、禁用代理或绕过参数".into()));
+    }
+    arguments.insert(
+        switch_end,
+        format!("--proxy-server={}", proxy.chrome_server()),
+    );
+    Ok(arguments)
+}
+
+fn supports_proxy(req: &SessionStartRequest) -> bool {
+    matches!(&req.launch, LaunchTarget::Executable { path }
+        if path.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("chrome.exe")))
+}
+fn has_proxy(req: &SessionStartRequest) -> bool {
+    supports_proxy(req)
+        && req
+            .profile
+            .as_ref()
+            .is_some_and(|p| p.browser.proxy.is_some())
+}
+
+/// Raw CLI keeps its original directory selection; only proxy runs need ownership checks.
+pub(crate) fn prepare_session(req: &mut SessionStartRequest) -> Result<(), SessionError> {
+    proxy_arguments(req)?;
+    if req.chrome.is_none() && has_proxy(req) {
+        configure_directory(req, None, None, None)?;
+    }
+    Ok(())
+}
+
 /// Used before either startup path, never by raw CLI commands without Application identity.
 pub fn configure(
     app: &Application,
@@ -39,27 +230,47 @@ pub fn configure(
     root: Option<&Path>,
     detection: Option<DetectionSite>,
 ) -> Result<(), SessionError> {
-    if !app.chrome_independent_data && detection.is_none() {
+    proxy_arguments(req)?;
+    if !app.chrome_independent_data && detection.is_none() && !has_proxy(req) {
         return Ok(());
     }
     if !app.supports_chrome_data() || app.id.is_nil() {
         return Err(error("此功能仅支持已保存的 Chrome 可执行应用"));
     }
+    configure_directory(
+        req,
+        app.chrome_independent_data.then_some(app.id),
+        root,
+        detection,
+    )
+}
+
+fn configure_directory(
+    req: &mut SessionStartRequest,
+    independent_app: Option<Uuid>,
+    root: Option<&Path>,
+    detection: Option<DetectionSite>,
+) -> Result<(), SessionError> {
     let mut explicit = None;
-    for (index, arg) in req.arguments.iter().enumerate() {
-        if arg.eq_ignore_ascii_case("--user-data-dir") {
+    let switch_end = chrome_switch_end(&req.arguments);
+    for (index, arg) in req.arguments[..switch_end].iter().enumerate() {
+        let switch = chrome_switch(arg).unwrap_or("");
+        if switch.eq_ignore_ascii_case("user-data-dir") {
             explicit = Some(
-                req.arguments
+                req.arguments[..switch_end]
                     .get(index + 1)
+                    .map(|value| chrome_token(value))
                     .filter(|value| !value.starts_with("--"))
                     .ok_or_else(|| error("user-data-dir 缺少目录"))?
-                    .clone(),
+                    .to_owned(),
             );
-        } else if arg.to_ascii_lowercase().starts_with("--user-data-dir=") {
-            explicit = Some(arg[16..].to_string());
+        } else if let Some((name, value)) = switch.split_once('=') {
+            if name.eq_ignore_ascii_case("user-data-dir") {
+                explicit = Some(value.to_string());
+            }
         }
     }
-    let directory = if app.chrome_independent_data {
+    let directory = if let Some(application_id) = independent_app {
         if explicit.is_some() {
             return Err(error(
                 "独立数据目录与手填 --user-data-dir 冲突；移除参数或关闭开关",
@@ -76,7 +287,7 @@ pub fn configure(
             .unwrap_or_else(|| "host".into());
         let directory = root
             .join("browser-data")
-            .join(app.id.to_string())
+            .join(application_id.to_string())
             .join(identity);
         directory
     } else if let Some(value) = explicit {
@@ -95,10 +306,7 @@ pub fn configure(
             .join(path)
         }
     } else {
-        PathBuf::from(
-            std::env::var_os("LOCALAPPDATA").ok_or_else(|| error("无法确定 Chrome 默认目录"))?,
-        )
-        .join("Google/Chrome/User Data")
+        default_chrome_directory(&req.launch)?
     };
     std::fs::create_dir_all(&directory).map_err(error)?;
     let directory = std::fs::canonicalize(directory).map_err(error)?;
@@ -109,9 +317,11 @@ pub fn configure(
             .strip_prefix(r"\\?\")
             .unwrap_or(&directory.to_string_lossy()),
     );
-    if app.chrome_independent_data {
-        req.arguments
-            .push(format!("--user-data-dir={}", directory.display()));
+    if independent_app.is_some() {
+        req.arguments.insert(
+            switch_end,
+            format!("--user-data-dir={}", directory.display()),
+        );
     }
     req.working_directory = crate::launcher::effective_working_directory(
         &req.launch,
@@ -240,6 +450,17 @@ impl ChromeLease {
         self.file.sync_data().map_err(error)
     }
 }
+/// Capability created only after reuse_detection verifies the live owner and full request.
+/// Its request cannot be replaced by another caller to bypass a directory lease.
+pub(crate) struct VerifiedDetectionHandoff {
+    request: SessionStartRequest,
+}
+impl VerifiedDetectionHandoff {
+    pub(crate) fn into_request(self) -> SessionStartRequest {
+        self.request
+    }
+}
+
 /// Open a fixed page only when a live owner and the exact effective configuration match.
 pub fn reuse_detection(req: &SessionStartRequest) -> Result<Option<Uuid>, SessionError> {
     let Some(context) = &req.chrome else {
@@ -292,7 +513,8 @@ pub fn reuse_detection(req: &SessionStartRequest) -> Result<Option<Uuid>, Sessio
     let mut handoff = req.clone();
     handoff.chrome = None;
     handoff.arguments.push(site.url().into());
-    let mut session = crate::session::start_session(handoff)?;
+    let mut session =
+        crate::session::start_detection_handoff(VerifiedDetectionHandoff { request: handoff })?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let exited = session

@@ -1,34 +1,14 @@
-//! Explicit IP-specific timezone lookup. No country/offset fallback or retries.
+//! Actual egress timezone lookup through the captured Profile proxy. No country/offset fallback or retries.
+use envbox_core::BrowserProxy;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::process::Stdio;
 #[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Source {
-    #[default]
-    Current,
-    Explicit,
-}
-impl Source {
-    pub const ALL: [Self; 2] = [Self::Current, Self::Explicit];
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Current => "当前网络出口",
-            Self::Explicit => "指定出口 IP",
-        }
-    }
-}
-impl std::fmt::Display for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct LookupResult {
-    pub source: Source,
+    pub source: String,
     pub queried_at: String,
     pub ip: IpAddr,
     pub location: String,
@@ -40,8 +20,6 @@ pub struct LookupResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct LookupState {
-    pub source: Source,
-    pub input: String,
     pub generation: u64,
     pub pending: bool,
     pub result: Option<LookupResult>,
@@ -56,63 +34,14 @@ impl LookupState {
     }
 }
 
-pub fn parse_public_ip(value: &str) -> Result<IpAddr, String> {
-    let ip: IpAddr = value
-        .trim()
-        .parse()
-        .map_err(|_| "请输入公网 IPv4 或 IPv6 地址，不要包含网址、域名或端口".to_string())?;
-    let public = match ip {
-        IpAddr::V4(v4) => public_v4(v4),
-        IpAddr::V6(v6) => public_v6(v6),
-    };
-    if !public {
-        return Err("只支持公网 IP；私有、回环、链路本地、组播及保留地址不能查询".into());
+pub fn query(proxy: Option<&BrowserProxy>) -> Result<LookupResult, String> {
+    if let Some(proxy) = proxy {
+        proxy.validate().map_err(|e| e.to_string())?;
     }
-    Ok(ip)
-}
-fn public_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    !(a == 0
-        || a == 10
-        || a == 127
-        || a >= 224
-        || (a == 100 && (64..=127).contains(&b))
-        || (a == 169 && b == 254)
-        || (a == 172 && (16..=31).contains(&b))
-        || (a == 192 && b == 168)
-        || (a == 192 && b == 0 && ((c == 0 && !matches!(ip.octets()[3], 9 | 10)) || c == 2))
-        || (a == 192 && b == 88 && c == 99)
-        || (a == 198 && (b == 18 || b == 19))
-        || (a == 198 && b == 51 && c == 100)
-        || (a == 203 && b == 0 && c == 113))
-}
-fn public_v6(ip: Ipv6Addr) -> bool {
-    // IANA globally-reachable unicast, including the more-specific public
-    // allocations inside 2001::/23. Never send local/mapped/multicast addresses.
-    // https://www.iana.org/assignments/iana-ipv6-special-registry/
-    let s = ip.segments();
-    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        return true;
-    }
-    if (s[0] & 0xe000) != 0x2000 {
-        return false;
-    }
-    if s[0] == 0x2001 && s[1] < 0x200 {
-        return (s[1] == 1 && s[2..7] == [0, 0, 0, 0, 0] && (1..=3).contains(&s[7]))
-            || s[1] == 3
-            || (s[1] == 4 && s[2] == 0x112)
-            || (0x20..=0x3f).contains(&s[1]);
-    }
-    !(s[0] == 0x2001 && s[1] == 0xdb8) && s[0] != 0x2002 && !(s[0] == 0x3fff && s[1] < 0x1000)
-}
-
-pub fn query(source: Source, explicit: Option<IpAddr>) -> Result<LookupResult, String> {
-    let url = match (source, explicit) {
-        (Source::Current, _) => "https://my.ippure.com/v1/info".to_owned(),
-        (Source::Explicit, Some(ip)) => format!("https://ip.net.coffee/api/iprisk/{ip}"),
-        _ => return Err("请先输入公网 IP".into()),
-    };
-    let body = request(&url)?;
+    let source = proxy
+        .map(|p| format!("Profile {}", p.chrome_server()))
+        .unwrap_or_else(|| "Aura 当前网络（无 Profile 代理）".into());
+    let body = request(proxy)?;
     let response: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| "查询失败：服务返回格式已变化（不是有效 JSON）".to_string())?;
     let field = |name: &str| {
@@ -123,17 +52,9 @@ pub fn query(source: Source, explicit: Option<IpAddr>) -> Result<LookupResult, S
             .trim()
     };
     let reported = field("ip");
-    let ip = match explicit {
-        Some(expected) => {
-            if !reported.is_empty() && reported.parse::<IpAddr>().ok() != Some(expected) {
-                return Err("查询失败：响应 IP 与本次指定出口不一致".into());
-            }
-            expected
-        }
-        None => reported
-            .parse::<IpAddr>()
-            .map_err(|_| "查询失败：响应缺少有效出口 IP".to_string())?,
-    };
+    let ip = reported
+        .parse::<IpAddr>()
+        .map_err(|_| "查询失败：响应缺少有效出口 IP".to_string())?;
     let iana = field("timezone").to_owned();
     let mapped = if iana.is_empty() {
         None
@@ -189,11 +110,15 @@ fn query_time() -> String {
     }
 }
 
-fn request(url: &str) -> Result<Vec<u8>, String> {
+fn request(proxy: Option<&BrowserProxy>) -> Result<Vec<u8>, String> {
     const LIMIT: u64 = 1024 * 1024;
-    let mut child = crate::updater::curl_command()?
+    let mut command = crate::updater::curl_command()?;
+    command.arg("--disable");
+    if let Some(proxy) = proxy {
+        command.args(["--proxy", &proxy.curl_server(), "--noproxy", ""]);
+    }
+    let mut child = command
         .args([
-            "--disable",
             "--fail",
             "--silent",
             "--show-error",
@@ -204,7 +129,7 @@ fn request(url: &str) -> Result<Vec<u8>, String> {
             "--proto",
             "=https",
             "--url",
-            url,
+            "https://my.ippure.com/v1/info",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

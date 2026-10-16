@@ -345,18 +345,68 @@ pub(crate) fn start_session_with_options_and_tracking(
     requested_job_name: Option<String>,
     create_new_console: bool,
     entry_gate: bool,
+    #[cfg(windows)] service: Option<crate::service_start::ServiceStartOptions<'_>>,
+    #[cfg(not(windows))] _service: Option<()>,
+    allow_packaged_job_failure: bool,
+) -> Result<SessionHandle, SessionError> {
+    start_session_impl(
+        req,
+        requested_instance_id,
+        requested_job_name,
+        create_new_console,
+        entry_gate,
+        #[cfg(windows)]
+        service,
+        #[cfg(not(windows))]
+        _service,
+        allow_packaged_job_failure,
+        false,
+    )
+}
+
+/// Only chrome::reuse_detection can produce this verified, request-bound capability.
+pub(crate) fn start_detection_handoff(
+    handoff: crate::chrome::VerifiedDetectionHandoff,
+) -> Result<SessionHandle, SessionError> {
+    start_session_impl(
+        handoff.into_request(),
+        None,
+        None,
+        false,
+        false,
+        None,
+        false,
+        true,
+    )
+}
+
+fn start_session_impl(
+    req: SessionStartRequest,
+    requested_instance_id: Option<Uuid>,
+    requested_job_name: Option<String>,
+    create_new_console: bool,
+    entry_gate: bool,
     #[cfg(windows)] mut service: Option<crate::service_start::ServiceStartOptions<'_>>,
     #[cfg(not(windows))] _service: Option<()>,
     allow_packaged_job_failure: bool,
+    verified_detection_handoff: bool,
 ) -> Result<SessionHandle, SessionError> {
     // Safety net: every caller (GUI/CLI/tests) gets Packaged for AUMID /
     // WindowsApps targets. Never CreateProcess a WindowsApps exe (package
     // identity would be dropped — ChatGPT: "该进程没有程序包标识符").
-    let req = SessionStartRequest {
+    let mut req = SessionStartRequest {
         launch: crate::package_discovery::normalize_launch_target(&req.launch),
         ..req
     };
-    let mut chrome_lease = crate::chrome::ChromeLease::acquire(&req)?;
+    let mut chrome_lease = if verified_detection_handoff {
+        // The original root retains the lifetime lease. This short injected
+        // process must exit after singleton forwarding; reuse_detection checks
+        // that exit and the original root identity before reporting success.
+        None
+    } else {
+        crate::chrome::prepare_session(&mut req)?;
+        crate::chrome::ChromeLease::acquire(&req)?
+    };
     let mut req = req;
     if let Some(site) = req.chrome.as_ref().and_then(|context| context.detection) {
         req.arguments.push(site.url().into());
@@ -614,7 +664,7 @@ pub(crate) fn start_session_with_options_and_tracking(
         } else {
             Some(job.creation_assignment())
         },
-        arguments: req.arguments.clone(),
+        arguments: crate::chrome::proxy_arguments(&req)?,
         working_directory: req.working_directory.clone(),
         environment: env.clone(),
         runtime_dll: runtime_dll.clone(),

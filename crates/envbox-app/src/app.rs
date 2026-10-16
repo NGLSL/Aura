@@ -23,6 +23,8 @@ mod navigation;
 mod picker;
 #[path = "app/profiles.rs"]
 mod profiles;
+#[path = "app/proxy_editor.rs"]
+pub mod proxy_editor;
 #[path = "app/timezone_editor.rs"]
 mod timezone_editor;
 #[path = "app/update.rs"]
@@ -91,6 +93,7 @@ pub struct ProfileDraft {
     pub dns_mode: DnsChoice,
     pub dns_editor: dns_editor::DnsEditor,
     pub webrtc: WebRtcChoice,
+    pub proxy: proxy_editor::ProxyDraft,
     pub identity: identity_editor::IdentityDraft,
     pub env: String,
 }
@@ -216,6 +219,7 @@ impl EnvBoxApp {
             dns_mode: DnsChoice::Host,
             dns_editor: Default::default(),
             webrtc: WebRtcChoice::Host,
+            proxy: Default::default(),
             identity: Default::default(),
             env: String::new(),
         };
@@ -610,13 +614,17 @@ impl EnvBoxApp {
                     return self.request_navigation(PendingNavigation::Profile(id));
                 }
             }
-            Message::TimezoneSource(source) => {
+            Message::ProfileProxyChoice(value) => {
                 self.timezone_lookup.invalidate();
-                self.timezone_lookup.source = source;
+                self.profile_draft.proxy.choice = value;
             }
-            Message::TimezoneIp(value) => {
+            Message::ProfileProxyHost(value) => {
                 self.timezone_lookup.invalidate();
-                self.timezone_lookup.input = value;
+                self.profile_draft.proxy.host = value;
+            }
+            Message::ProfileProxyPort(value) => {
+                self.timezone_lookup.invalidate();
+                self.profile_draft.proxy.port = value;
             }
             Message::TimezoneQuery => return self.query_timezone(),
             Message::TimezoneResult(generation, result) => {

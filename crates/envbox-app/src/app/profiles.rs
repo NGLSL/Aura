@@ -32,6 +32,7 @@ impl EnvBoxApp {
             dns_mode: DnsChoice::Host,
             dns_editor: Default::default(),
             webrtc: WebRtcChoice::Host,
+            proxy: Default::default(),
             identity: Default::default(),
             env: String::new(),
         }
@@ -171,6 +172,13 @@ impl EnvBoxApp {
                 return Task::none();
             }
         };
+        let proxy = match self.profile_draft.proxy.to_profile() {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                self.set_status(StatusKind::Error, format!("保存失败：{error}"));
+                return Task::none();
+            }
+        };
         let mut environment = HashMap::new();
         for line in self
             .profile_draft
@@ -216,6 +224,7 @@ impl EnvBoxApp {
             registry: RegistryProfile::default(),
             browser: BrowserPrivacyProfile {
                 webrtc: self.profile_draft.webrtc.to_policy(),
+                proxy,
             },
         };
         if let Err(err) = validate_profile(&profile) {
@@ -322,6 +331,7 @@ pub fn profile_to_draft(p: &EnvironmentProfile) -> ProfileDraft {
         dns_mode: DnsChoice::from_mode(&p.dns.mode),
         dns_editor: dns_editor::DnsEditor::from_profile(&p.dns),
         webrtc: WebRtcChoice::from_policy(&p.browser.webrtc),
+        proxy: super::proxy_editor::ProxyDraft::from_profile(p.browser.proxy.as_ref()),
         identity: identity_editor::IdentityDraft::from_profile(&p.identity),
         env: p
             .environment

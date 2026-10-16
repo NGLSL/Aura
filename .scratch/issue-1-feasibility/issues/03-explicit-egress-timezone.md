@@ -4,6 +4,7 @@ Parent: [浏览器环境配置与检测](../spec.md)
 Status: resolved
 Category: enhancement
 Blocked by: 02
+Superseded by: [07：只读实际出口与 Profile 代理](./07-profile-proxy-and-readonly-egress.md)
 
 ## 交付行为
 

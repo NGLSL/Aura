@@ -23,8 +23,8 @@ pub use run_snapshot::RunSnapshot;
 pub use browser_policy::{
     browser_env_entries, ensure_chromium_webrtc_argv, ensure_chromium_webrtc_switch,
     ensure_webview2_arguments, plan_child_policy, BrowserChildPolicy, BrowserEngine,
-    BrowserGuarantee, BrowserPrivacyProfile, CommandLinePolicy, NetworkGuardCapability,
-    PolicyApply, WebRtcPolicy, AUDIT_API_NETWORK_UDP_DENY,
+    BrowserGuarantee, BrowserPrivacyProfile, BrowserProxy, BrowserProxyKind, CommandLinePolicy,
+    NetworkGuardCapability, PolicyApply, WebRtcPolicy, AUDIT_API_NETWORK_UDP_DENY,
 };
 pub use session::{
     capabilities_for_target, evaluate_injection_support, is_packaged_target,
@@ -308,6 +308,9 @@ impl EnvironmentProfile {
         self.timezone.validate()?;
         self.dns.validate()?;
         self.identity.validate()?;
+        if let Some(proxy) = &self.browser.proxy {
+            proxy.validate()?;
+        }
         for (key, value) in &self.environment {
             if key.to_ascii_uppercase().starts_with("ENVBOX_IDENTITY_") {
                 return Err(DomainError::InvalidProfile(

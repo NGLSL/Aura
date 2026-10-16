@@ -119,6 +119,7 @@ pub fn message_to_profile(msg: &IpcMessage) -> Result<EnvironmentProfile, IpcErr
         },
         browser: envbox_core::BrowserPrivacyProfile {
             webrtc: webrtc_policy,
+            proxy: None,
         },
     })
 }

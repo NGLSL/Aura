@@ -140,6 +140,9 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
                     kv_row("Locale", &p.locale.locale_name),
                     kv_row("界面语言", &p.locale.ui_language),
                     kv_row("Windows 时区", &p.timezone.windows_id),
+                    kv_row("Chrome / 检测代理", &p.browser.proxy.as_ref().map(|p| p.chrome_server()).unwrap_or_else(|| "无 Profile 代理".into())),
+                    text("代理仅用于 Chrome 与出口查询；其他应用网络保持原有行为。")
+                        .size(12).color(MUTED).font(font::ui_font()),
                 ]
                 .spacing(7)
                 .padding(10),
