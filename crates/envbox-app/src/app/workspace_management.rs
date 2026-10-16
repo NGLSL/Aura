@@ -70,8 +70,11 @@ impl ManagementState {
             self.clear_pending();
             self.notice = None;
         }
-        // A delayed A response must never update B's workspace view.
-        if reply.epoch != self.epoch || reply.workspace_id != selected {
+        // Legacy scoped Run replies retain their navigation guard. All-instance
+        // list/stop/recovery replies are independent of the selected Profile.
+        if reply.workspace_id.is_some()
+            && (reply.epoch != self.epoch || reply.workspace_id != selected)
+        {
             return false;
         }
         match &reply.result {
@@ -295,13 +298,6 @@ impl EnvBoxApp {
         let Some(command) = self.workspace_management.pending_run.clone() else {
             return Task::none();
         };
-        if !self
-            .profile_draft
-            .id
-            .is_some_and(|id| self.workspace_management.pending_belongs_to_profile(id))
-        {
-            return Task::none();
-        }
         self.workspace_request(
             "RunStatus",
             Some(command),
@@ -350,19 +346,68 @@ impl EnvBoxApp {
         )
     }
 
+    pub(super) fn managed_instance_stop(&mut self, instance_id: Uuid) -> Task<Message> {
+        let Some(generation) = self.workspace_management.generation.clone() else {
+            self.workspace_management.error = Some("请先刷新运行管理状态".into());
+            return Task::none();
+        };
+        let Some(view) = self.workspace_management.instances.iter().find(|view| {
+            view.result.instance_id == instance_id
+                && view.result.supervisor_generation == generation
+                && !matches!(
+                    view.result.state.as_str(),
+                    "TrackingLost" | "Exited" | "Stopped" | "Failed"
+                )
+        }) else {
+            self.workspace_management.error = Some("实例已结束或运行管理会话已失效；请刷新".into());
+            return Task::none();
+        };
+        let command = RunCommand {
+            container_id: view.result.container_id,
+            instance_id,
+            application_id: view.result.application_id,
+        };
+        self.management_request("Stop", Some(command), Some(generation), None)
+    }
+
+    pub(super) fn managed_profile_stop(&mut self, profile_id: Uuid) -> Task<Message> {
+        // This action addresses the entire Profile, never a filtered subset.
+        if self.instance_filter.is_some() {
+            return Task::none();
+        }
+        let Some(generation) = self.workspace_management.generation.clone() else {
+            return Task::none();
+        };
+        self.management_request("StopAll", None, Some(generation), Some(profile_id))
+    }
+
     fn workspace_request(
         &mut self,
         operation: &str,
         run: Option<RunCommand>,
         generation: Option<String>,
     ) -> Task<Message> {
+        self.management_request(operation, run, generation, self.profile_draft.id)
+    }
+
+    fn management_request(
+        &mut self,
+        operation: &str,
+        run: Option<RunCommand>,
+        generation: Option<String>,
+        profile_id: Option<Uuid>,
+    ) -> Task<Message> {
         if self.workspace_management.busy {
             return Task::none();
         }
         self.workspace_management.busy = true;
         self.workspace_management.error = None;
-        let workspace_id = self.workspaces.selected;
-        let profile_id = self.profile_draft.id;
+        // List, stop, and recovery are global management operations, not Profile views.
+        let workspace_id = if operation == "Run" {
+            self.workspaces.selected
+        } else {
+            None
+        };
         let epoch = self.workspace_management.epoch;
         let operation = operation.to_string();
         let store = self.store.clone();

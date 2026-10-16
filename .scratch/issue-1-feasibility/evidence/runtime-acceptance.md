@@ -40,7 +40,7 @@ Branch: `dev`
 
 新 renderer 均创建于 GUI 正常退出之后；三个新标签的 Date.now() 分别为 1792123762521、1792123762543、1792123762558，宿主 UTC 同期为 2026-10-16T04:09:22Z。Profile 的 languages 为 en-US/en，Host 为 zh-CN/zh。
 
-应用参数始终为 `--no-first-run --no-default-browser-check --remote-debugging-port=0 about:blank`，默认 Profile 保持原 UUID。GUI 验收新暴露出 Profile 概览缺少已有 Workspace run_panel 的问题，已将原面板接回概览；实际渲染确认可选择应用并展开两个检测站点。
+应用参数始终为 `--no-first-run --no-default-browser-check --remote-debugging-port=0 about:blank`，默认 Profile 保持原 UUID。当时将 Workspace run_panel 接入 Profile 概览，并实际渲染了应用选择和两个检测站点。2026-10-16 用户确认该入口违反页面分工：Profile 只负责配置，启动／检测在应用页，运行管理在实例页；本次页面调整撤除该面板。此前这项集成不再作为正确界面布局的验收依据。
 
 ## 构建、既有检查与审查
 

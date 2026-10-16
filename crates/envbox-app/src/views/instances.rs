@@ -12,7 +12,7 @@ use crate::widgets::{secondary_btn, short_id, status_dot};
 
 pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
     use crate::message::Nav;
-    use crate::widgets::{badge, danger_btn, empty_state, primary_btn};
+    use crate::widgets::{badge, danger_btn, primary_btn};
 
     let selected_name = app.instance_filter.and_then(|id| {
         app.applications
@@ -26,22 +26,40 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
         .list()
         .into_iter()
         .filter(|instance| {
+            !app.workspace_management
+                .instances
+                .iter()
+                .any(|view| view.result.instance_id == instance.id)
+                && app
+                    .instance_filter
+                    .map(|application_id| instance.application_id == application_id)
+                    .unwrap_or(true)
+        })
+        .collect();
+    let managed: Vec<_> = app
+        .workspace_management
+        .instances
+        .iter()
+        .filter(|view| {
             app.instance_filter
-                .map(|application_id| instance.application_id == application_id)
-                .unwrap_or(true)
+                .is_none_or(|id| view.result.application_id == id)
         })
         .collect();
     let active_count = instances
         .iter()
         .filter(|i| i.status == envbox_core::InstanceStatus::Running)
-        .count();
+        .count()
+        + managed
+            .iter()
+            .filter(|view| view.result.state == "Running")
+            .count();
 
     let header = row![
         column![
             text("运行实例").size(24).color(INK).font(font::name_font()),
             text(format!(
-                "当前 Aura 管理 {} 个实例 · 活跃 {} 个 · 关闭 Aura 后不会继续显示这些实例",
-                instances.len(),
+                "共 {} 个实例 · 运行中 {} 个",
+                instances.len() + managed.len(),
                 active_count
             ))
             .size(12)
@@ -85,9 +103,10 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
         .style(primary_btn)
         .on_press(Message::Nav(Nav::Apps));
 
-        if selected_name.is_some() {
-            empty_state(
-                Icon::Monitor,
+        if !managed.is_empty() {
+            column![].into()
+        } else if app.instance_filter.is_some() {
+            instance_empty_state(
                 "当前应用暂无实例",
                 "可以切换到其他应用，或查看全部实例。",
                 Some(
@@ -99,9 +118,8 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                 ),
             )
         } else {
-            empty_state(
-                Icon::Monitor,
-                "暂无活跃的运行实例",
+            instance_empty_state(
+                "暂无运行实例",
                 "在「应用」页面中点击「运行」启动程序后，实例会显示在这里；点击“刷新实例状态”查看最新状态。",
                 Some(launch_btn.into()),
             )
@@ -240,12 +258,20 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                 col.push(card)
             });
 
-        scrollable(rows)
-            .height(Fill)
-            .style(theme::dark_scrollable)
-            .into()
+        column![
+            text("本次会话实例")
+                .size(17)
+                .color(INK)
+                .font(font::name_font()),
+            rows
+        ]
+        .spacing(10)
+        .into()
     };
 
+    let content = scrollable(column![super::workspaces::view(app), content].spacing(16))
+        .height(Fill)
+        .style(theme::dark_scrollable);
     column![header, filter_bar, content]
         .spacing(12)
         .width(Fill)
@@ -288,7 +314,13 @@ fn instance_filter_bar<'a>(
 
     let label = selected_name
         .map(|name| format!("当前筛选：{name}"))
-        .unwrap_or_else(|| "查看全部应用的实例".to_string());
+        .unwrap_or_else(|| {
+            if app.instance_filter.is_some() {
+                "当前筛选：应用已删除".into()
+            } else {
+                "查看全部应用的实例".into()
+            }
+        });
 
     container(
         column![
@@ -305,4 +337,31 @@ fn instance_filter_bar<'a>(
     .width(Fill)
     .style(theme::inner_card_style)
     .into()
+}
+
+// Unlike the full-page empty_state helper, this body is intrinsic-height:
+// it shares a vertical scroller with management state and must not request Fill.
+fn instance_empty_state<'a>(
+    title: &'static str,
+    description: &'static str,
+    action: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut body = column![
+        icon(Icon::Monitor, theme::ACCENT_LINE, 28.0),
+        text(title).size(17).color(INK).font(font::name_font()),
+        text(description)
+            .size(13)
+            .color(MUTED)
+            .font(font::ui_font()),
+    ]
+    .spacing(12)
+    .align_x(Alignment::Center);
+    if let Some(action) = action {
+        body = body.push(container(action).padding(Padding::from([6, 0])));
+    }
+    container(body)
+        .padding(Padding::from([56, 24]))
+        .width(Fill)
+        .center_x(Fill)
+        .into()
 }

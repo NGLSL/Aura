@@ -195,7 +195,6 @@ fn profile_overview(app: &EnvBoxApp) -> Element<'_, Message> {
             )
             .width(Fill)
             .style(inner_card_style),
-            crate::views::workspaces::run_panel(app),
             button(text("编辑配置").size(12).color(INK_2).font(font::ui_font()))
                 .padding(Padding::from([7, 12]))
                 .style(secondary_btn)

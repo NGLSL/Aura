@@ -303,8 +303,7 @@ impl EnvBoxApp {
             let id = first.id;
             app.select_app(id);
         }
-        let management_task = app.workspace_list();
-        (app, Task::batch([icons_task, management_task]))
+        (app, icons_task)
     }
 
     pub fn set_status(&mut self, kind: StatusKind, msg: impl Into<String>) {
@@ -313,11 +312,25 @@ impl EnvBoxApp {
     }
 
     pub fn running_count(&self, id: Uuid) -> usize {
-        self.instances
-            .list()
-            .into_iter()
-            .filter(|inst| inst.application_id == id && inst.status == InstanceStatus::Running)
+        let local = self.instances.list();
+        local
+            .iter()
+            .filter(|instance| {
+                instance.application_id == id
+                    && instance.status == InstanceStatus::Running
+                    && !self
+                        .workspace_management
+                        .instances
+                        .iter()
+                        .any(|view| view.result.instance_id == instance.id)
+            })
             .count()
+            + self
+                .workspace_management
+                .instances
+                .iter()
+                .filter(|view| view.result.application_id == id && view.result.state == "Running")
+                .count()
     }
 
     pub fn view(&self) -> iced::Element<'_, Message> {
@@ -417,7 +430,11 @@ impl EnvBoxApp {
             Message::WorkspaceRunStatus => return self.workspace_run_status(),
             Message::WorkspaceDiagnostics(id) => {
                 let expanded = &mut self.workspace_management.diagnostics_instance;
-                *expanded = if *expanded == Some(id) { None } else { Some(id) };
+                *expanded = if *expanded == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
             }
             Message::WorkspaceManagementResult(value) => {
                 return self.finish_workspace_management(value)
@@ -660,8 +677,10 @@ impl EnvBoxApp {
             Message::ProfileNew => return self.request_navigation(PendingNavigation::NewProfile),
             Message::InstanceRefresh => {
                 self.instances.refresh_all();
-                self.set_status(StatusKind::Success, "实例已刷新");
+                return self.workspace_list();
             }
+            Message::ManagedInstanceStop(id) => return self.managed_instance_stop(id),
+            Message::ManagedProfileStop(id) => return self.managed_profile_stop(id),
             Message::InstanceFilter(id) => {
                 return self.request_navigation(PendingNavigation::InstancesOf(id));
             }

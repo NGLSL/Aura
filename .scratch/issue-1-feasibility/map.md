@@ -20,6 +20,8 @@ Date: 2026-10-16
 
 01–06 已随 `446a7f4` 交付，原[验收记录](./evidence/runtime-acceptance.md)对应该提交。07 已按用户新决定移除手填 IP 并加入 Profile 代理；[本轮验收](./evidence/profile-proxy-acceptance.md)覆盖真实两种代理与启动路径。整体 review 的非 Stable Chrome 默认目录 P2 及增量发现的问题均已修复。
 
+2026-10-16 用户确认恢复既有页面分工：Profile 只维护配置，启动／浏览器检测留在应用页，实例管理集中到运行实例页。实施与审查结果、实际窗口证据及后台服务验收缺口见[页面分工调整](./evidence/page-responsibilities.md)；不把此前接入 Profile 的运行面板继续作为需求。
+
 ## 为什么这样拆
 
 - 每张功能票交付一个可独立演示的完整流程；不把模型、网络请求和 GUI 分成无法独立使用的水平任务。

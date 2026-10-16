@@ -101,8 +101,8 @@ impl EnvBoxApp {
                         self.select_app(id);
                     }
                 }
-                if nav == Nav::Profiles {
-                    self.bind_profile_scope();
+                if nav == Nav::Instances {
+                    self.instances.refresh_all();
                     return self.workspace_list();
                 }
                 if nav == Nav::Workspaces {
@@ -114,7 +114,8 @@ impl EnvBoxApp {
                 self.instance_filter = id;
                 self.nav = Nav::Instances;
                 self.resume_new_app = false;
-                Task::none()
+                self.instances.refresh_all();
+                self.workspace_list()
             }
             PendingNavigation::App(id) => {
                 self.select_app(id);
@@ -122,7 +123,7 @@ impl EnvBoxApp {
             }
             PendingNavigation::Profile(id) => {
                 self.select_profile(id);
-                self.workspace_list()
+                Task::none()
             }
             PendingNavigation::NewApp => self.begin_new_app(),
             PendingNavigation::NewProfile => {

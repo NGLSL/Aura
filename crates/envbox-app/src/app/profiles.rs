@@ -40,7 +40,6 @@ impl EnvBoxApp {
 
     pub(super) fn begin_new_profile(&mut self) {
         self.timezone_lookup.invalidate();
-        self.workspace_management.selection_changed();
         self.workspaces.clear(Uuid::nil());
         self.nav = Nav::Profiles;
         self.profile_draft = self.blank_profile();
@@ -53,7 +52,6 @@ impl EnvBoxApp {
 
     pub(super) fn select_profile(&mut self, id: Uuid) {
         self.timezone_lookup.invalidate();
-        self.workspace_management.selection_changed();
         if let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) {
             self.profile_draft = profile_to_draft(profile);
             self.profile_saved_draft = self.profile_draft.clone();
@@ -66,7 +64,6 @@ impl EnvBoxApp {
     }
 
     pub(super) fn bind_profile_scope(&mut self) {
-        let previous_scope = self.workspaces.selected;
         let profile = self
             .profile_draft
             .id
@@ -78,9 +75,6 @@ impl EnvBoxApp {
             }
         } else {
             self.workspaces.clear(Uuid::nil());
-        }
-        if previous_scope != self.workspaces.selected {
-            self.workspace_management.selection_changed();
         }
     }
 
@@ -260,7 +254,7 @@ impl EnvBoxApp {
                     self.resume_new_app = false;
                     return self.begin_new_app();
                 }
-                return self.workspace_list();
+                return Task::none();
             }
             Err(err) => self.set_status(StatusKind::Error, format!("保存失败: {err}")),
         }
@@ -308,7 +302,6 @@ impl EnvBoxApp {
                     self.profile_draft = self.blank_profile();
                     self.profile_saved_draft = self.profile_draft.clone();
                     self.profile_edit_mode = false;
-                    self.workspace_management.selection_changed();
                     self.workspaces.clear(Uuid::nil());
                 }
                 self.set_status(StatusKind::Success, "环境配置已删除");

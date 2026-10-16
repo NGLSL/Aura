@@ -292,6 +292,8 @@ pub enum Message {
     InstanceRefresh,
     InstanceFilter(Option<Uuid>),
     InstanceStop(Uuid),
+    ManagedInstanceStop(Uuid),
+    ManagedProfileStop(Uuid),
     AuditRefresh,
     AuditFilter(String),
     OpenAuditDir,
