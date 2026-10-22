@@ -26,6 +26,8 @@ mod message;
 mod options;
 #[path = "../src/package.rs"]
 mod package;
+#[path = "../src/shortcut.rs"]
+mod shortcut;
 #[cfg(windows)]
 #[path = "../src/singleton.rs"]
 mod singleton;
