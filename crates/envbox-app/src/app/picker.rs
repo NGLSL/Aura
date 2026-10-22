@@ -1,9 +1,7 @@
 //! Installed application picker and icon loading.
 
 use std::path::PathBuf;
-use uuid::Uuid;
 use iced::Task;
-use envbox_core::LaunchTarget;
 use crate::message::{LaunchKind, Message, StatusKind};
 use super::{AppDraft, EnvBoxApp};
 
@@ -108,27 +106,16 @@ impl EnvBoxApp {
     /// Background-extract icons for configured applications (cards + detail).
     pub fn refresh_app_icons(&mut self) -> Task<Message> {
         let icon_dir = self.icon_dir();
-        let targets: Vec<(Uuid, String)> = self
-            .applications
-            .iter()
-            .map(|a| {
-                let src = match &a.launch {
-                    LaunchTarget::Command { command } => command.clone(),
-                    LaunchTarget::Executable { path } => path.display().to_string(),
-                    LaunchTarget::Packaged { aumid, .. } => aumid.clone(),
-                };
-                (a.id, src)
-            })
-            .collect();
+        let targets = self.applications.clone();
         Task::perform(
             async move {
                 let (tx, rx) = iced::futures::channel::oneshot::channel();
                 std::thread::spawn(move || {
                     let mut out = Vec::new();
-                    for (id, src) in targets {
-                        if let Some(png) = crate::app_icon::cache_app_icon(&icon_dir, &id.to_string(), &src)
+                    for app in targets {
+                        if let Some(png) = crate::app_icon::cache_application_icon(&icon_dir, &app)
                         {
-                            out.push((id, png));
+                            out.push((app.id, png));
                         }
                     }
                     let _ = tx.send(out);

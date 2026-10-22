@@ -6,6 +6,7 @@
 
 mod app;
 mod app_icon;
+mod app_launch;
 mod close_behavior;
 mod combo_overlay;
 mod discover;
@@ -15,6 +16,7 @@ mod icons;
 mod message;
 mod options;
 mod package;
+mod shortcut;
 #[cfg(windows)]
 mod singleton;
 mod theme;
@@ -29,6 +31,14 @@ mod widgets;
 use iced::{Size, Theme};
 
 fn main() -> iced::Result {
+    if let Some(result) = app_launch::handle_startup() {
+        if let Err(error) = result {
+            show_startup_error(&error);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     #[cfg(windows)]
     match singleton::claim() {
         Ok(singleton::Claim::Primary) => {}

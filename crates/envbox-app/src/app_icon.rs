@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const ICON_CACHE_SCHEMA: &str = "v2";
+use envbox_core::{Application, LaunchTarget};
+
+const ICON_CACHE_SCHEMA: &str = "v4";
 
 /// In-memory id → cached PNG path (avoids re-extracting on every redraw).
 fn mem_cache() -> &'static Mutex<HashMap<String, Option<PathBuf>>> {
@@ -16,8 +18,9 @@ fn mem_cache() -> &'static Mutex<HashMap<String, Option<PathBuf>>> {
 /// Extract/caches a 64×64 PNG for `icon_src` (`path` or `path,index`).
 /// `id` is a stable key (app id / discovered path). Returns the PNG path.
 pub fn cache_app_icon(icon_dir: &Path, id: &str, icon_src: &str) -> Option<PathBuf> {
+    let cache_key = cache_key(id, icon_src);
     if let Ok(g) = mem_cache().lock() {
-        if let Some(hit) = g.get(id) {
+        if let Some(hit) = g.get(&cache_key) {
             return hit.clone();
         }
     }
@@ -27,11 +30,11 @@ pub fn cache_app_icon(icon_dir: &Path, id: &str, icon_src: &str) -> Option<PathB
     // cannot keep the small-artwork result alive after an upgrade.
     let out = icon_dir.join(format!(
         "{id_hash}.png",
-        id_hash = hash_id(&format!("{ICON_CACHE_SCHEMA}:{id}"))
+        id_hash = hash_id(&format!("{ICON_CACHE_SCHEMA}:{cache_key}"))
     ));
     if out.is_file() {
         if let Ok(mut g) = mem_cache().lock() {
-            g.insert(id.to_string(), Some(out.clone()));
+            g.insert(cache_key, Some(out.clone()));
         }
         return Some(out);
     }
@@ -41,16 +44,45 @@ pub fn cache_app_icon(icon_dir: &Path, id: &str, icon_src: &str) -> Option<PathB
     std::fs::create_dir_all(icon_dir).ok()?;
     std::fs::write(&out, &png).ok()?;
     if let Ok(mut g) = mem_cache().lock() {
-        g.insert(id.to_string(), Some(out.clone()));
+        g.insert(cache_key, Some(out.clone()));
     }
     Some(out)
+}
+
+fn cache_key(id: &str, icon_src: &str) -> String {
+    format!("{id}\0{icon_src}")
+}
+
+/// Resolve the icon source for a saved application and cache its PNG.
+///
+/// Packaged applications expose an AUMID rather than a filesystem path.  The
+/// shell AppsFolder namespace is the stable icon provider for those entries;
+/// callers should use this helper instead of passing the bare AUMID to
+/// `cache_app_icon`.
+pub fn cache_application_icon(icon_dir: &Path, app: &Application) -> Option<PathBuf> {
+    let source = application_icon_source(app);
+    cache_app_icon(icon_dir, &app.id.to_string(), &source)
+}
+
+fn application_icon_source(app: &Application) -> String {
+    match &app.launch {
+        LaunchTarget::Command { command } => {
+            let path_env = std::env::var("PATH").ok();
+            envbox_launcher::resolve_command(command, path_env.as_deref())
+                .map(|resolved| resolved.program.display().to_string())
+                .unwrap_or_else(|_| command.clone())
+        }
+        LaunchTarget::Executable { path } => path.display().to_string(),
+        LaunchTarget::Packaged { aumid, .. } => format!("shell:AppsFolder\\{aumid}"),
+    }
 }
 
 /// Drop the in-memory entry so a changed source is re-extracted.
 #[allow(dead_code)]
 pub fn invalidate_icon(id: &str) {
     if let Ok(mut g) = mem_cache().lock() {
-        g.remove(id);
+        let prefix = format!("{id}\0");
+        g.retain(|key, _| key != id && !key.starts_with(&prefix));
     }
 }
 
@@ -89,8 +121,12 @@ fn extract_icon_png(path: &Path, index: Option<i32>) -> Option<Vec<u8>> {
             return encode_png(&normalize_icon(&image));
         }
     }
-    // shell: namespace targets do not exist as filesystem paths.
-    let is_shell = lower.trim_start().starts_with("shell:");
+    // Shell namespace targets do not exist as filesystem paths. Resolve the
+    // AppsFolder item to a PIDL first so SHGetFileInfoW asks the shell for the
+    // package's registered icon rather than treating the string as a filename.
+    if lower.trim_start().starts_with("shell:") {
+        return extract_shell_icon_png(path.to_string_lossy().as_ref());
+    }
     unsafe {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::UI::Shell::{
@@ -98,7 +134,7 @@ fn extract_icon_png(path: &Path, index: Option<i32>) -> Option<Vec<u8>> {
         };
         use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
-        if !is_shell && !path.exists() {
+        if !path.exists() {
             return None;
         }
 
@@ -136,6 +172,71 @@ fn extract_icon_png(path: &Path, index: Option<i32>) -> Option<Vec<u8>> {
             return png;
         }
         None
+    }
+}
+
+fn extract_shell_icon_png(display_name: &str) -> Option<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        SHGetFileInfoW, SHParseDisplayName, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(display_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if com_initialized.is_err() {
+        return None;
+    }
+    let _com = ComApartment;
+    unsafe {
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        if SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None).is_err()
+        {
+            return None;
+        }
+        let _pidl = Pidl(pidl);
+
+        let mut shfi = std::mem::zeroed::<SHFILEINFOW>();
+        let ok = SHGetFileInfoW(
+            PCWSTR(pidl.cast()),
+            Default::default(),
+            Some(&mut shfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_PIDL | SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        if ok == 0 || shfi.hIcon.is_invalid() {
+            return None;
+        }
+        let png = hicon_to_png(shfi.hIcon);
+        let _ = DestroyIcon(shfi.hIcon);
+        png
+    }
+}
+
+struct ComApartment;
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
+/// PIDLs returned by SHParseDisplayName are task-allocator memory.
+struct Pidl(*mut windows::Win32::UI::Shell::Common::ITEMIDLIST);
+
+impl Drop for Pidl {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows::Win32::System::Com::CoTaskMemFree(Some(self.0.cast()));
+            }
+        }
     }
 }
 

@@ -272,6 +272,36 @@ impl EnvBoxApp {
         Task::none()
     }
 
+    pub(super) fn create_desktop_shortcut(&mut self, app_id: Uuid) -> Task<Message> {
+        let Some(app) = self
+            .applications
+            .iter()
+            .find(|app| app.id == app_id)
+            .cloned()
+        else {
+            self.set_status(StatusKind::Error, "请先保存应用");
+            return Task::none();
+        };
+        let root = self.store.root().to_path_buf();
+        let icon = self.app_icons.get(&app_id).cloned();
+        Task::perform(
+            async move {
+                let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(crate::shortcut::create_desktop(
+                        &app,
+                        &root,
+                        icon.as_deref(),
+                    ));
+                });
+                receiver
+                    .await
+                    .unwrap_or_else(|_| Err("快捷方式创建任务意外结束".into()))
+            },
+            Message::AppDesktopShortcutCreated,
+        )
+    }
+
     pub(super) fn open_app_location(&mut self, app_id: Uuid) {
         let Some(app) = self.applications.iter().find(|app| app.id == app_id) else {
             self.set_status(StatusKind::Error, "应用不存在");

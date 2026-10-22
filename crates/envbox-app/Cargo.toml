@@ -26,7 +26,7 @@ toml = { workspace = true }
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true }
+windows = { workspace = true, features = ["Win32_UI_Shell_Common"] }
 tray-icon = { version = "0.24.2", default-features = false }
 
 [build-dependencies]

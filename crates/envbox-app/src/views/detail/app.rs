@@ -273,6 +273,22 @@ fn app_overview<'a>(
             .style(inner_card_style),
     ]
     .spacing(10);
+    if selected_app.is_some() {
+        content = content.push(
+            button(
+                row![
+                    icon(Icon::ExternalLink, INK_2, 12.0),
+                    text("创建桌面快捷方式").size(12).font(font::ui_font()),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([8, 12]))
+            .width(Fill)
+            .style(secondary_btn)
+            .on_press(Message::AppCreateDesktopShortcut(id)),
+        );
+    }
     if let Some(capability) = app.app_capabilities.get(&id) {
         if capability.injection != InjectionSupport::Supported {
             content = content.push(compatibility_notice(capability));

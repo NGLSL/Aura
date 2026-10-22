@@ -94,6 +94,75 @@ impl InstanceManager {
         self.run_intent(app, target, Some(site))
     }
 
+    /// Wait until a Windows Terminal launch has handed the named Job to the
+    /// hidden `terminal-run` process.  `run` intentionally returns before that
+    /// asynchronous client/server handoff, so callers that are about to drop
+    /// the manager must keep the external Job handle alive until this method
+    /// observes the root marker (or a concrete failure).
+    ///
+    /// Direct and ordinary Profile sessions already complete their startup
+    /// handshake in `run`; for those instances this is a no-op.
+    pub fn wait_for_handoff(&mut self, id: Uuid) -> Result<(), InstanceError> {
+        let handoff_deadline = self
+            .instances
+            .get(&id)
+            .ok_or(InstanceError::NotFound(id))?
+            .handoff_deadline;
+        let Some(handoff_deadline) = handoff_deadline else {
+            return Ok(());
+        };
+
+        loop {
+            if Instant::now() >= handoff_deadline {
+                self.cancel_handoff(id);
+                return Err(InstanceError::WindowsTerminal(
+                    "handoff timed out before publishing a root".into(),
+                ));
+            }
+            let status = match self.refresh(id) {
+                Ok(status) => status,
+                Err(error) => {
+                    self.cancel_handoff(id);
+                    return Err(error);
+                }
+            };
+            match status {
+                InstanceStatus::Running | InstanceStatus::Exited => return Ok(()),
+                InstanceStatus::Failed => {
+                    self.cancel_handoff(id);
+                    return Err(InstanceError::WindowsTerminal(
+                        "handoff did not publish a running root".into(),
+                    ));
+                }
+                InstanceStatus::Starting | InstanceStatus::Stopping => {
+                    // `refresh` enforces the ten-second handoff deadline and
+                    // transitions a still-Starting instance to Failed.  Keep
+                    // this wait short and yielding so a shortcut invocation
+                    // never pins a thread while WT starts its server/tab.
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    fn cancel_handoff(&mut self, id: Uuid) {
+        // Publish cancellation before closing the named Job.  A WT client can
+        // still be racing to start its hidden terminal-run process; the
+        // marker makes that process abort even if it opens the Job at the
+        // boundary of this cleanup.
+        if self
+            .instances
+            .get(&id)
+            .is_some_and(|handle| handle.external_job.is_some())
+        {
+            let _ = std::fs::write(
+                crate::session::terminal_cancel_marker_path(id),
+                "cancelled\n",
+            );
+        }
+        let _ = self.stop(id);
+    }
+
     fn run_intent(
         &mut self,
         app: &Application,

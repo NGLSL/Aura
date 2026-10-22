@@ -553,6 +553,14 @@ impl EnvBoxApp {
             }
             Message::AppSave => return self.save_app(),
             Message::AppDelete => return self.delete_app(),
+            Message::AppCreateDesktopShortcut(id) => return self.create_desktop_shortcut(id),
+            Message::AppDesktopShortcutCreated(result) => match result {
+                Ok(path) => self.set_status(
+                    StatusKind::Success,
+                    format!("已创建桌面快捷方式：{}", path.display()),
+                ),
+                Err(error) => self.set_status(StatusKind::Error, format!("创建失败：{error}")),
+            },
             Message::AppRunId(id) => return self.run_app(id, RunSelection::Default),
             Message::AppRunWithId(id, profile_id) => {
                 let selection = profile_id

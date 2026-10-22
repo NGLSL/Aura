@@ -239,6 +239,8 @@ pub enum Message {
     AppDelete,
     AppRunId(Uuid),
     AppRunWithId(Uuid, Option<Uuid>),
+    AppCreateDesktopShortcut(Uuid),
+    AppDesktopShortcutCreated(Result<std::path::PathBuf, String>),
     AppOpenLocation,
     AppOpenLocationId(Uuid),
     AppBrowseWorkDir,
