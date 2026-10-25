@@ -114,8 +114,15 @@ impl EnvBoxApp {
     }
 
     fn start_pending_installer(&mut self) -> Task<Message> {
+        if !self.pending_launches.is_empty() {
+            self.set_status(StatusKind::Info, "应用正在启动，请启动完成后再安装更新");
+            return Task::none();
+        }
         if self.has_unsaved_edits() {
             self.set_status(StatusKind::Error, "请先保存或放弃未保存修改，再启动安装器");
+            return Task::none();
+        }
+        if !self.flush_pane_ratios() {
             return Task::none();
         }
 
@@ -151,6 +158,7 @@ impl EnvBoxApp {
                 // behavior contract.  Exit only after ShellExecute accepted
                 // the verified installer.
                 self.set_status(StatusKind::Success, "安装器已启动，Aura 即将退出");
+                self.flush_pane_ratios();
                 iced::exit()
             }
             Err(updater::InstallError::Verification(error)) => {

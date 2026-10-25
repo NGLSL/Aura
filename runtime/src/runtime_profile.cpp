@@ -68,8 +68,21 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
   // TimeZoneInformation walks the whole host table (100+ rows), which made
   // Chrome-style workloads ~300x slower. Profile tz is process-immutable, so
   // cache successful lookups and definitive misses, but retry transient errors.
-  // Serialize initialization and reads so callers never observe a partial entry.
+  // Shared reads cover cache hits; initialization still publishes a complete
+  // entry under the exclusive lock, including definitive misses.
   static SRWLOCK s_lock = SRWLOCK_INIT;
+  static DYNAMIC_TIME_ZONE_INFORMATION s_cache = {};
+  static int s_cached = 0;
+  static int s_found = 0;
+  static wchar_t s_id[128] = {0};
+  AcquireSRWLockShared(&s_lock);
+  if (s_cached && _wcsicmp(s_id, windows_id) == 0) {
+    const int found = s_found;
+    if (found) *out = s_cache;
+    ReleaseSRWLockShared(&s_lock);
+    return found;
+  }
+  ReleaseSRWLockShared(&s_lock);
   struct CacheLock {
     explicit CacheLock(SRWLOCK* lock) : lock(lock) {
       AcquireSRWLockExclusive(lock);
@@ -77,10 +90,7 @@ int EnvBoxLookupTimeZone(const wchar_t* windows_id,
     ~CacheLock() { ReleaseSRWLockExclusive(lock); }
     SRWLOCK* lock;
   } guard(&s_lock);
-  static DYNAMIC_TIME_ZONE_INFORMATION s_cache = {};
-  static int s_cached = 0;
-  static int s_found = 0;
-  static wchar_t s_id[128] = {0};
+  // Another caller may have initialized this entry while we changed locks.
   if (s_cached && _wcsicmp(s_id, windows_id) == 0) {
     if (s_found) {
       *out = s_cache;
@@ -125,16 +135,11 @@ LCID EnvBoxProfileLcid() {
   // Hot path: IME / Chrome call GetUserDefaultLCID and registry Locale value
   // in tight loops while typing. Locale is process-immutable - cache the
   // LocaleNameToLCID result once.
-  static LCID s_lcid = 0;
-  static int s_cached = 0;
   const RuntimeProfile* pfl = EnvBoxProfile();
   if (pfl == nullptr || !pfl->has_locale) {
     return 0;
   }
-  if (!s_cached) {
-    s_lcid = LocaleNameToLCID(pfl->locale_name, 0);
-    s_cached = 1;
-  }
+  static const LCID s_lcid = LocaleNameToLCID(pfl->locale_name, 0);
   return s_lcid;
 }
 

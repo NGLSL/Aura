@@ -10,6 +10,7 @@ use crate::font;
 use crate::icons::{icon, nav_icon_for};
 use crate::message::{Message, Nav};
 use crate::theme::{self, BORDER, FAINT, INK, INK_2, MUTED, SUCCESS};
+use crate::theme::{TEXT_BODY, TEXT_CAPTION, TEXT_TITLE};
 use crate::widgets::status_dot;
 
 fn logo_handle() -> image::Handle {
@@ -32,7 +33,9 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     .width(Length::Fixed(40.0))
     .height(Length::Fixed(40.0))
     .style(|_| container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb(0.08, 0.12, 0.20))),
+        background: Some(iced::Background::Color(iced::Color::from_rgb(
+            0.08, 0.12, 0.20,
+        ))),
         border: iced::Border {
             color: BORDER,
             width: 1.0,
@@ -47,11 +50,11 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         mark,
         column![
             text("Aura")
-                .size(19)
+                .size(TEXT_TITLE)
                 .color(INK)
                 .font(font::name_font()),
             text("EnvBox")
-                .size(12)
+                .size(TEXT_CAPTION)
                 .color(MUTED)
                 .font(font::ui_font()),
         ]
@@ -65,7 +68,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         let icon_color = if selected { INK } else { MUTED };
         let ic = icon(nav_icon_for(n), icon_color, 18.0);
         let label = text(n.label())
-            .size(14)
+            .size(TEXT_BODY)
             .color(if selected { INK } else { INK_2 })
             .font(font::ui_font());
         let btn = button(row![ic, label].spacing(12).align_y(Alignment::Center))
@@ -80,14 +83,14 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         row![
             status_dot(SUCCESS),
             text(crate::version::product_label())
-                .size(12)
+                .size(TEXT_CAPTION)
                 .color(INK_2)
                 .font(font::ui_font()),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
         text(crate::version::engine_label())
-            .size(11)
+            .size(TEXT_CAPTION)
             .color(FAINT)
             .font(font::ui_font()),
     ]
@@ -106,7 +109,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         .width(Fill)
         .height(Fill),
     )
-    .width(Length::Fixed(220.0))
+    .width(Length::Fixed(theme::SIDEBAR_WIDTH))
     .height(Fill)
     .style(theme::sidebar_style)
     .into()

@@ -331,11 +331,20 @@ pub fn validate_runtime_for_profile(
     dns: &envbox_core::DnsProfile,
     entry_gate: bool,
 ) -> Result<(), RecoveryError> {
-    use envbox_core::{DnsMode, DnsUpstream};
+    use envbox_core::DnsMode;
     if !entry_gate && dns.mode != DnsMode::VirtualView {
         return Ok(());
     }
     let capabilities = read_runtime_capabilities(path)?;
+    validate_dns_capabilities(capabilities, dns, entry_gate)
+}
+
+fn validate_dns_capabilities(
+    capabilities: RuntimeCapabilities,
+    dns: &envbox_core::DnsProfile,
+    entry_gate: bool,
+) -> Result<(), RecoveryError> {
+    use envbox_core::{DnsMode, DnsUpstream};
     if entry_gate && !capabilities.entry_gate {
         return Err(refused("Runtime lacks entry gate capability"));
     }
@@ -367,7 +376,14 @@ pub fn validate_runtime_identity(
     }
     identity.validate().map_err(refused)?;
     let bytes = read_image(path)?;
-    let (_, _, _, offset) = export_rva(&bytes, b"EnvBoxIdentityCapabilities\0", false)?;
+    validate_identity_capabilities(&bytes, identity)
+}
+
+fn validate_identity_capabilities(
+    bytes: &[u8],
+    identity: &envbox_core::IdentityProfile,
+) -> Result<(), RecoveryError> {
+    let (_, _, _, offset) = export_rva(bytes, b"EnvBoxIdentityCapabilities\0", false)?;
     let data = &bytes[offset..offset + 256];
     let end = data
         .iter()
@@ -402,7 +418,7 @@ pub fn validate_runtime_identity(
         }
     }
     if identity.mac_address.is_some() {
-        let (_, _, _, offset) = export_rva_length(&bytes, b"EnvBoxCimMacCapability\0", false, 4)
+        let (_, _, _, offset) = export_rva_length(bytes, b"EnvBoxCimMacCapability\0", false, 4)
             .map_err(|_| refused("Runtime lacks local WMI/CIM MAC read support"))?;
         if bytes[offset..offset + 4] != 1u32.to_le_bytes() {
             return Err(refused("Runtime lacks local WMI/CIM MAC read support"));
@@ -413,7 +429,37 @@ pub fn validate_runtime_identity(
 
 pub fn read_runtime_capabilities(path: &Path) -> Result<RuntimeCapabilities, RecoveryError> {
     let bytes = read_image(path)?;
-    let (_, _, _, offset) = export_rva(&bytes, b"EnvBoxRuntimeCapabilities\0", false)?;
+    runtime_capabilities_from_image(&bytes)
+}
+
+/// Both preflights inspect the same bounded PE snapshot. Keep the public
+/// individual checks for callers that only need one capability family.
+pub(crate) fn validate_runtime_profile(
+    path: &Path,
+    dns: &envbox_core::DnsProfile,
+    identity: &envbox_core::IdentityProfile,
+    entry_gate: bool,
+) -> Result<(), RecoveryError> {
+    let check_dns = entry_gate || dns.mode == envbox_core::DnsMode::VirtualView;
+    if !check_dns && identity.is_host() {
+        return Ok(());
+    }
+    if !check_dns {
+        identity.validate().map_err(refused)?;
+    }
+    let bytes = read_image(path)?;
+    if check_dns {
+        validate_dns_capabilities(runtime_capabilities_from_image(&bytes)?, dns, entry_gate)?;
+    }
+    if !identity.is_host() {
+        identity.validate().map_err(refused)?;
+        validate_identity_capabilities(&bytes, identity)?;
+    }
+    Ok(())
+}
+
+fn runtime_capabilities_from_image(bytes: &[u8]) -> Result<RuntimeCapabilities, RecoveryError> {
+    let (_, _, _, offset) = export_rva(bytes, b"EnvBoxRuntimeCapabilities\0", false)?;
     let data = &bytes[offset..offset + 256];
     let end = data
         .iter()

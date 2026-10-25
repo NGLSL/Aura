@@ -1,14 +1,38 @@
 //! Window close preference and tray transitions.
 
-use iced::Task;
+use super::{EnvBoxApp, PendingNavigation};
 use crate::close_behavior::{self, CloseBehavior};
 use crate::message::{Message, StatusKind};
 #[cfg(windows)]
 use crate::tray::TrayState;
-use super::{EnvBoxApp, PendingNavigation};
+use iced::Task;
 
 impl EnvBoxApp {
+    pub(super) fn flush_pane_ratios(&mut self) -> bool {
+        self.pane_save_deadline = None;
+        if !self.pane_save_dirty {
+            return true;
+        }
+        match close_behavior::save_pane_ratios(self.store.root(), self.pane_ratios) {
+            Ok(()) => {
+                self.pane_save_dirty = false;
+                true
+            }
+            Err(error) => {
+                self.set_status(StatusKind::Error, format!("保存分栏宽度失败：{error}"));
+                false
+            }
+        }
+    }
+
     pub(super) fn finish_exit(&mut self, remember: bool) -> Task<Message> {
+        if !self.pending_launches.is_empty() {
+            self.set_status(StatusKind::Info, "应用正在启动，请启动完成后再退出 Aura");
+            return Task::none();
+        }
+        if !self.flush_pane_ratios() {
+            return Task::none();
+        }
         if remember {
             if let Err(err) = close_behavior::save(self.store.root(), CloseBehavior::Exit) {
                 self.set_status(StatusKind::Error, format!("记住关闭选择失败：{err}"));
@@ -97,5 +121,4 @@ impl EnvBoxApp {
             Task::none()
         }
     }
-
 }

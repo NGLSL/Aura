@@ -34,7 +34,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             )
             .width(Fill)
             .height(Fill)
-            .spacing(6)
+            .spacing(theme::PANE_SPACING)
             .on_resize(8, Message::ContentPaneResized)
             .style(|theme| {
                 let mut style = pane_grid::default(theme);
@@ -97,7 +97,10 @@ fn status_banner(app: &EnvBoxApp) -> Element<'_, Message> {
     };
     container(
         row![
-            text(&app.status).size(12).color(foreground).width(Fill),
+            text(&app.status)
+                .size(theme::TEXT_BODY)
+                .color(foreground)
+                .width(Fill),
             button(icon(Icon::Close, foreground, 11.0))
                 .on_press(Message::StatusDismiss)
                 .style(win_button)

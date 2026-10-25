@@ -188,7 +188,9 @@ pub enum ComboField {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Message {
+    WindowResized(iced::Size),
     ContentPaneResized(iced::widget::pane_grid::ResizeEvent),
+    PaneSaveTick,
     WorkspaceNew,
     WorkspaceRefresh,
     WorkspaceSelect(Uuid),
@@ -239,6 +241,12 @@ pub enum Message {
     AppDelete,
     AppRunId(Uuid),
     AppRunWithId(Uuid, Option<Uuid>),
+    AppLaunchFinished(
+        Uuid,
+        String,
+        Option<envbox_core::DetectionSite>,
+        Result<envbox_launcher::instance::PendingLaunch, String>,
+    ),
     AppCreateDesktopShortcut(Uuid),
     AppDesktopShortcutCreated(Result<std::path::PathBuf, String>),
     AppOpenLocation,
@@ -297,6 +305,7 @@ pub enum Message {
     ManagedInstanceStop(Uuid),
     ManagedProfileStop(Uuid),
     AuditRefresh,
+    AuditLoaded(u64, Result<crate::app::audit::AuditSnapshot, String>),
     AuditFilter(String),
     OpenAuditDir,
     // Settings / diagnostics
@@ -326,7 +335,8 @@ pub enum Message {
     WindowCloseToTray,
     WindowExit,
     WindowClosePreferenceReset,
-    WindowTrayPoll,
+    #[cfg(windows)]
+    WindowTrayEvent(crate::tray::TrayEvent),
     WindowRestore,
 }
 

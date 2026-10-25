@@ -54,9 +54,13 @@ fn main() -> iced::Result {
         .subscription(app::EnvBoxApp::subscription)
         .exit_on_close_request(false)
         .theme(|_| Theme::Dark)
-        .default_font(ui_font)
+        .settings(iced::Settings {
+            default_font: ui_font,
+            default_text_size: iced::Pixels(theme::TEXT_BODY),
+            ..Default::default()
+        })
         .window(iced::window::Settings {
-            size: Size::new(1400.0, 880.0),
+            size: Size::new(theme::DEFAULT_WINDOW_WIDTH, 880.0),
             min_size: Some(Size::new(1100.0, 720.0)),
             position: iced::window::Position::Centered,
             // Custom title bar matches the dark mockup (no native chrome).

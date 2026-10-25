@@ -10,6 +10,7 @@ use envbox_core::{Application, ConsoleHost, EnvironmentProfile, InstanceStatus, 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use uuid::Uuid;
@@ -67,6 +68,29 @@ pub struct InstanceHandle {
     handoff_deadline: Option<Instant>,
 }
 
+/// A completed launch awaiting adoption by the GUI. Cloned messages share one
+/// transfer slot, so replaying a result cannot duplicate owned kernel handles.
+#[derive(Clone)]
+pub struct PendingLaunch {
+    id: Uuid,
+    outcome: Arc<Mutex<Option<LaunchOutcome>>>,
+}
+
+enum LaunchOutcome {
+    Created(InstanceHandle),
+    // Detection can hand a URL to an already authenticated Chrome root. That
+    // instance remains owned by its existing manager/session host.
+    Reused,
+}
+
+impl std::fmt::Debug for PendingLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLaunch")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
 /// Process-scoped instance registry (GUI holds one of these).
 #[derive(Default)]
 pub struct InstanceManager {
@@ -76,6 +100,52 @@ pub struct InstanceManager {
 impl InstanceManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Execute a single launch on a worker without borrowing the GUI registry.
+    /// Windows Terminal must finish its handoff before the transfer can be
+    /// dropped: the tab then owns the named Job independently of the GUI.
+    pub fn launch(
+        app: &Application,
+        target: RunTarget,
+        detection: Option<envbox_core::DetectionSite>,
+    ) -> Result<PendingLaunch, InstanceError> {
+        let mut manager = Self::new();
+        let id = manager.run_intent(app, target, detection)?;
+        let outcome = if manager.instances.contains_key(&id) {
+            manager.wait_for_handoff(id)?;
+            let _ = manager.refresh(id);
+            LaunchOutcome::Created(
+                manager
+                    .instances
+                    .remove(&id)
+                    .ok_or(InstanceError::NotFound(id))?,
+            )
+        } else {
+            LaunchOutcome::Reused
+        };
+        Ok(PendingLaunch {
+            id,
+            outcome: Arc::new(Mutex::new(Some(outcome))),
+        })
+    }
+
+    /// Adopt exactly once, retaining every other instance already in the GUI.
+    pub fn accept_launch(&mut self, launch: PendingLaunch) -> Option<Uuid> {
+        let mut slot = launch
+            .outcome
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match slot.take()? {
+            LaunchOutcome::Created(handle) => {
+                if self.instances.contains_key(&launch.id) {
+                    return None;
+                }
+                self.instances.insert(launch.id, handle);
+            }
+            LaunchOutcome::Reused => {}
+        }
+        Some(launch.id)
     }
 
     /// Run Application with a Profile or true Host (Run With; does not mutate
@@ -444,9 +514,7 @@ impl InstanceManager {
         let Some(job) = job else {
             return Ok(0);
         };
-        Ok(children_from_active_processes(
-            job.stats()?.active_processes,
-        ))
+        Ok(children_from_active_processes(job.active_process_count()?))
     }
 }
 

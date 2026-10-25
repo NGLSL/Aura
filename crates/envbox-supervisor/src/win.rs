@@ -13,6 +13,7 @@ use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::Pipes::*;
 use windows::Win32::System::Threading::*;
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 struct Handle(HANDLE);
 impl Drop for Handle {
@@ -47,6 +48,116 @@ fn pause(end: Instant, cancel: Option<&AtomicBool>) -> io::Result<()> {
     }
     std::thread::sleep(Duration::from_millis(10));
     Ok(())
+}
+
+const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+
+// The server owns an overlapped pipe; clients retain the existing NOWAIT
+// handle. Every server operation has its own stable OVERLAPPED and event.
+#[derive(Clone, Copy)]
+enum PipeMode {
+    Nonblocking,
+    Overlapped,
+}
+
+struct PipeOperation {
+    pipe: HANDLE,
+    overlapped: Box<OVERLAPPED>,
+    _event: Handle,
+    pending: bool,
+}
+
+impl PipeOperation {
+    fn new(pipe: HANDLE) -> io::Result<Self> {
+        let event = Handle(unsafe { CreateEventW(None, true, false, None) }?);
+        Ok(Self {
+            pipe,
+            overlapped: Box::new(OVERLAPPED {
+                hEvent: event.0,
+                ..Default::default()
+            }),
+            _event: event,
+            pending: false,
+        })
+    }
+
+    fn begin(&mut self, result: windows::core::Result<()>) -> io::Result<()> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
+                self.pending = true;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn wait(&mut self, duration: Duration) -> io::Result<Option<u32>> {
+        // Round up so a sub-millisecond remainder cannot become a busy loop
+        // immediately before the next refresh/deadline.
+        let milliseconds = duration
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(u128::from(u32::MAX - 1)) as u32;
+        match unsafe { WaitForSingleObject(self.overlapped.hEvent, milliseconds) } {
+            WAIT_OBJECT_0 => {
+                let mut transferred = 0;
+                let result = unsafe {
+                    GetOverlappedResult(self.pipe, &*self.overlapped, &mut transferred, false)
+                };
+                // A signaled event completes the operation, including errors.
+                self.pending = false;
+                result?;
+                Ok(Some(transferred))
+            }
+            WAIT_TIMEOUT => Ok(None),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        result: windows::core::Result<()>,
+        immediate_count: u32,
+        end: Instant,
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<u32> {
+        self.begin(result)?;
+        check_cancel(cancel)?;
+        if Instant::now() >= end {
+            return Err(timeout());
+        }
+        if !self.pending {
+            return Ok(immediate_count);
+        }
+        loop {
+            check_cancel(cancel)?;
+            let remaining = end
+                .checked_duration_since(Instant::now())
+                .ok_or_else(timeout)?;
+            if let Some(count) = self.wait(remaining.min(REFRESH_INTERVAL))? {
+                check_cancel(cancel)?;
+                if Instant::now() >= end {
+                    return Err(timeout());
+                }
+                return Ok(count);
+            }
+        }
+    }
+}
+
+impl Drop for PipeOperation {
+    fn drop(&mut self) {
+        if self.pending {
+            // CancelIoEx only requests cancellation. Drain it before freeing
+            // OVERLAPPED, its event, or the caller-owned I/O buffer.
+            unsafe {
+                let _ = CancelIoEx(self.pipe, Some(&*self.overlapped));
+                let mut transferred = 0;
+                let _ = GetOverlappedResult(self.pipe, &*self.overlapped, &mut transferred, true);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,13 +345,47 @@ fn authenticate(pipe: HANDLE, owner: &Principal, config: &ServerConfig) -> io::R
     Ok(())
 }
 
-fn receive(pipe: HANDLE, end: Instant, cancel: Option<&AtomicBool>) -> io::Result<Vec<u8>> {
+fn receive(
+    pipe: HANDLE,
+    end: Instant,
+    cancel: Option<&AtomicBool>,
+    mode: PipeMode,
+) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
     loop {
         check_cancel(cancel)?;
+        if Instant::now() >= end {
+            return Err(timeout());
+        }
         let mut buffer = [0u8; 4096];
         let mut count = 0;
-        let result = unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut count), None) };
+        let result = match mode {
+            PipeMode::Nonblocking => {
+                unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut count), None) }
+                    .map_err(io::Error::from)
+            }
+            PipeMode::Overlapped => {
+                let mut operation = PipeOperation::new(pipe)?;
+                let result = unsafe {
+                    ReadFile(
+                        pipe,
+                        Some(&mut buffer),
+                        Some(&mut count),
+                        Some(&mut *operation.overlapped),
+                    )
+                };
+                operation
+                    .finish(result, count, end, cancel)
+                    .map(|read| count = read)
+            }
+        };
+        if let Err(error) = result {
+            let code = error.raw_os_error().map(|code| code as u32 & 0xffff);
+            if code != Some(ERROR_NO_DATA.0) && code != Some(ERROR_PIPE_LISTENING.0) {
+                return Err(error);
+            }
+            count = 0;
+        }
         if count > 0 {
             data.extend_from_slice(&buffer[..count as usize]);
         }
@@ -254,13 +399,9 @@ fn receive(pipe: HANDLE, end: Instant, cancel: Option<&AtomicBool>) -> io::Resul
             data.truncate(index);
             return Ok(data);
         }
-        if let Err(error) = result {
-            let code = error.code().0 as u32 & 0xffff;
-            if code != ERROR_NO_DATA.0 && code != ERROR_PIPE_LISTENING.0 {
-                return Err(error.into());
-            }
+        if matches!(mode, PipeMode::Nonblocking) || count == 0 {
+            pause(end, cancel)?;
         }
-        pause(end, cancel)?;
     }
 }
 fn send<T: Serialize>(
@@ -268,14 +409,35 @@ fn send<T: Serialize>(
     value: &T,
     end: Instant,
     cancel: Option<&AtomicBool>,
+    mode: PipeMode,
 ) -> io::Result<()> {
     check_cancel(cancel)?;
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     let mut offset = 0;
     while offset < bytes.len() {
+        check_cancel(cancel)?;
+        if Instant::now() >= end {
+            return Err(timeout());
+        }
         let mut count = 0;
-        unsafe { WriteFile(pipe, Some(&bytes[offset..]), Some(&mut count), None) }?;
+        match mode {
+            PipeMode::Nonblocking => {
+                unsafe { WriteFile(pipe, Some(&bytes[offset..]), Some(&mut count), None) }?
+            }
+            PipeMode::Overlapped => {
+                let mut operation = PipeOperation::new(pipe)?;
+                let result = unsafe {
+                    WriteFile(
+                        pipe,
+                        Some(&bytes[offset..]),
+                        Some(&mut count),
+                        Some(&mut *operation.overlapped),
+                    )
+                };
+                count = operation.finish(result, count, end, cancel)?;
+            }
+        }
         offset += count as usize;
         if offset < bytes.len() {
             pause(end, cancel)?;
@@ -305,8 +467,8 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
     let pipe = Handle(unsafe {
         CreateNamedPipeW(
             PCWSTR(name.as_ptr()),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             65536,
             65536,
@@ -324,22 +486,50 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
         generation.clone(),
     );
     let mut refreshed = Instant::now();
-    while !config.stop.load(Ordering::Acquire) {
-        if refreshed.elapsed() >= Duration::from_millis(250) {
+    'accept: while !config.stop.load(Ordering::Acquire) {
+        if refreshed.elapsed() >= REFRESH_INTERVAL {
             runs.refresh();
             refreshed = Instant::now();
         }
-        let connected = unsafe { ConnectNamedPipe(pipe.0, None) };
+        let mut operation = PipeOperation::new(pipe.0)?;
+        let connected = unsafe { ConnectNamedPipe(pipe.0, Some(&mut *operation.overlapped)) };
         if let Err(error) = connected {
-            match unsafe { GetLastError() } {
+            match WIN32_ERROR(error.code().0 as u32 & 0xffff) {
                 ERROR_PIPE_CONNECTED => {}
-                ERROR_PIPE_LISTENING => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
+                ERROR_IO_PENDING => {
+                    operation.pending = true;
+                    loop {
+                        if config.stop.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        if refreshed.elapsed() >= REFRESH_INTERVAL {
+                            runs.refresh();
+                            refreshed = Instant::now();
+                        }
+                        let wait = REFRESH_INTERVAL.saturating_sub(refreshed.elapsed());
+                        match operation.wait(wait) {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {}
+                            Err(error)
+                                if error.raw_os_error().is_some_and(|code| {
+                                    matches!(
+                                        WIN32_ERROR(code as u32 & 0xffff),
+                                        ERROR_NO_DATA | ERROR_BROKEN_PIPE
+                                    )
+                                }) =>
+                            {
+                                unsafe {
+                                    let _ = DisconnectNamedPipe(pipe.0);
+                                }
+                                continue 'accept;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
                 }
                 ERROR_NO_DATA => {
-                    // A client can close before the nonblocking accept observes
-                    // it. Reset this pipe rather than spin forever on NO_DATA.
+                    // A client can close before accept observes it. Reset the
+                    // pipe and continue serving other managers.
                     unsafe {
                         let _ = DisconnectNamedPipe(pipe.0);
                     }
@@ -355,7 +545,7 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
         if let Err(error) = &authenticated {
             eprintln!("Supervisor authentication: {error}");
         }
-        let request = receive(pipe.0, end, Some(&config.stop))
+        let request = receive(pipe.0, end, Some(&config.stop), PipeMode::Overlapped)
             .and_then(|bytes| serde_json::from_slice::<Request>(&bytes).map_err(Into::into));
         if let Ok(request) = request {
             let status = if authenticated.is_err() {
@@ -440,10 +630,16 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
                 instances,
             };
             let end = Instant::now() + config.request_timeout;
-            let _ = send(pipe.0, &response, end, Some(&config.stop));
+            let _ = send(
+                pipe.0,
+                &response,
+                end,
+                Some(&config.stop),
+                PipeMode::Overlapped,
+            );
             // Give the bounded client time to consume the response. Disconnect
             // after an acknowledged close, with a strict server deadline.
-            let _ = receive(pipe.0, end, Some(&config.stop));
+            let _ = receive(pipe.0, end, Some(&config.stop), PipeMode::Overlapped);
         }
         unsafe {
             let _ = DisconnectNamedPipe(pipe.0);
@@ -609,8 +805,8 @@ fn exchange(
     end: Instant,
     cancel: Option<&AtomicBool>,
 ) -> io::Result<Response> {
-    send(pipe.0, &request, end, cancel)?;
-    let bytes = receive(pipe.0, end, cancel)?;
+    send(pipe.0, &request, end, cancel, PipeMode::Nonblocking)?;
+    let bytes = receive(pipe.0, end, cancel, PipeMode::Nonblocking)?;
     let response: Response = serde_json::from_slice(&bytes)?;
     if response.request_id != request.request_id {
         return Err(io::Error::new(

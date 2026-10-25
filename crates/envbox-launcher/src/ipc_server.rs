@@ -260,6 +260,11 @@ pub struct HostBroker {
 #[cfg(windows)]
 struct PipeOwner(windows::Win32::Foundation::HANDLE);
 
+// The reservation mutex is created without initial ownership. Only its handle
+// lifetime reserves the pipe name, and CloseHandle is valid on any thread.
+#[cfg(windows)]
+unsafe impl Send for PipeOwner {}
+
 #[cfg(windows)]
 impl Drop for PipeOwner {
     fn drop(&mut self) {

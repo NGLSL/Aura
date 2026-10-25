@@ -191,6 +191,30 @@ fn read_helper(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// Keep the full source snapshot for publication, but compare a cached helper
+// in chunks instead of retaining a second complete executable in memory.
+fn helper_matches(path: &Path, expected: &[u8]) -> io::Result<bool> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    let mut offset = 0;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer)?;
+        if length == 0 {
+            return Ok(offset == expected.len());
+        }
+        if length > expected.len() - offset || buffer[..length] != expected[offset..offset + length]
+        {
+            return Ok(false);
+        }
+        offset += length;
+    }
+}
+
 fn stage_helper(source: &Path) -> Result<PathBuf, SessionError> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
@@ -205,9 +229,8 @@ fn stage_helper(source: &Path) -> Result<PathBuf, SessionError> {
         .map_err(|error| helper_io_error("创建会话辅助程序目录", &directory, error))?;
     let destination = directory.join("envbox-broker.exe");
     if destination.exists() {
-        if read_helper(&destination)
+        if !helper_matches(&destination, &bytes)
             .map_err(|error| helper_io_error("读取缓存会话辅助程序", &destination, error))?
-            != bytes
         {
             return Err(fail(format!(
                 "cached session helper fingerprint mismatch: {}",
@@ -235,9 +258,8 @@ fn stage_helper(source: &Path) -> Result<PathBuf, SessionError> {
                 return Err(helper_io_error("保存会话辅助程序", &destination, error));
             }
         }
-        if read_helper(&destination)
+        if !helper_matches(&destination, &bytes)
             .map_err(|error| helper_io_error("校验会话辅助程序", &destination, error))?
-            != bytes
         {
             return Err(fail(format!(
                 "staged session helper fingerprint mismatch: {}",
@@ -637,8 +659,8 @@ pub fn run(name: &str, parent_pid: u32) -> Result<(), SessionError> {
     // registry supplies generation-bound membership for that fallback.
     loop {
         let job_active = session.job.as_ref().is_some_and(|job| {
-            job.stats()
-                .map(|stats| stats.active_processes != 0)
+            job.active_process_count()
+                .map(|count| count != 0)
                 .unwrap_or(true)
         });
         let members = session.broker.as_ref().map(|broker| {

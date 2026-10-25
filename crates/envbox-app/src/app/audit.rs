@@ -1,19 +1,25 @@
 //! Audit loading and software labels used by the audit view and filter.
 
 use super::EnvBoxApp;
+use crate::message::{Message, StatusKind};
 use envbox_core::AuditEvent;
+use iced::Task;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-impl EnvBoxApp {
-    pub fn load_audit(&mut self) {
+#[derive(Debug, Clone, Default)]
+pub struct AuditSnapshot {
+    pub events: Vec<AuditEvent>,
+    pub total: usize,
+}
+
+impl AuditSnapshot {
+    fn load(dir: PathBuf) -> Self {
         const AUDIT_LIMIT: usize = 500;
-        let dir = self.store.audit_dir();
-        self.audit_events.clear();
-        self.audit_total = 0;
+        let mut snapshot = Self::default();
         let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
+            return snapshot;
         };
         let mut files: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
@@ -31,10 +37,10 @@ impl EnvBoxApp {
                     continue;
                 };
                 if let Ok(ev) = AuditEvent::parse_json_line(&line) {
-                    self.audit_total += 1;
+                    snapshot.total += 1;
                     // UTC timestamps use the same ISO format. The sequence makes
                     // equal timestamps deterministic and keeps later records first.
-                    let key = (ev.ts_utc.clone(), self.audit_total);
+                    let key = (ev.ts_utc.clone(), snapshot.total);
                     if latest.len() < AUDIT_LIMIT
                         || latest
                             .first_key_value()
@@ -48,7 +54,59 @@ impl EnvBoxApp {
                 }
             }
         }
-        self.audit_events = latest.into_values().rev().collect();
+        snapshot.events = latest.into_values().rev().collect();
+        snapshot
+    }
+}
+
+impl EnvBoxApp {
+    pub(super) fn load_audit(&mut self) -> Task<Message> {
+        // Coalesce repeated requests instead of starting competing full scans.
+        if self.audit_loading {
+            self.audit_reload_requested = true;
+            return Task::none();
+        }
+        self.audit_loading = true;
+        self.audit_generation = self.audit_generation.wrapping_add(1);
+        let generation = self.audit_generation;
+        let directory = self.store.audit_dir();
+        Task::perform(
+            async move {
+                let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                let worker = std::thread::Builder::new()
+                    .name("aura-audit-load".into())
+                    .spawn(move || {
+                        let _ = sender.send(AuditSnapshot::load(directory));
+                    });
+                worker.map_err(|error| format!("无法启动审计加载任务：{error}"))?;
+                receiver
+                    .await
+                    .map_err(|_| "审计加载任务意外结束".to_string())
+            },
+            move |result| Message::AuditLoaded(generation, result),
+        )
+    }
+
+    pub(super) fn finish_audit_load(
+        &mut self,
+        generation: u64,
+        result: Result<AuditSnapshot, String>,
+    ) -> Task<Message> {
+        if generation != self.audit_generation || !self.audit_loading {
+            return Task::none();
+        }
+        self.audit_loading = false;
+        match result {
+            Ok(snapshot) => {
+                self.audit_events = snapshot.events;
+                self.audit_total = snapshot.total;
+            }
+            Err(error) => self.set_status(StatusKind::Error, error),
+        }
+        if std::mem::take(&mut self.audit_reload_requested) {
+            return self.load_audit();
+        }
+        Task::none()
     }
 
     /// Display label for an audit row: configured app name if image matches, else image, else PID.

@@ -37,11 +37,11 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let title = column![
         text("选择应用")
-            .size(18)
+            .size(TEXT_TITLE)
             .color(INK)
             .font(font::name_font()),
         text("从本机应用或命令行工具中选择。商店 / AppContainer 目标可能无法注入 Runtime。")
-            .size(12)
+            .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font()),
     ]
@@ -61,6 +61,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             icon(Icon::Search, MUTED, 13.0),
             text_input("搜索应用、命令或路径…", &state.query)
                 .on_input(Message::AppPickerQuery)
+                .size(TEXT_BODY)
                 .padding(Padding::from([8, 10]))
                 .style(input_style)
                 .font(font::ui_font())
@@ -85,7 +86,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             column![
                 icon(Icon::Apps, MUTED, 22.0),
                 text("正在读取开始菜单 / 桌面 / 命令目录…")
-                    .size(13)
+                    .size(TEXT_BODY)
                     .color(INK_2)
                     .font(font::name_font()),
             ]
@@ -101,11 +102,11 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             column![
                 icon(Icon::Search, MUTED, 22.0),
                 text("未找到匹配的应用")
-                    .size(13)
+                    .size(TEXT_BODY)
                     .color(INK_2)
                     .font(font::name_font()),
                 text("试试其他关键字，或使用「手动添加」")
-                    .size(12)
+                    .size(TEXT_CAPTION)
                     .color(MUTED)
                     .font(font::ui_font()),
             ]
@@ -116,24 +117,22 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         .center_x(Fill)
         .into()
     } else {
-        let col = filtered.into_iter().fold(
-            column![].spacing(4),
-            |c, (idx, item)| c.push(item_row(idx, item, state.selected == Some(idx))),
-        );
-        scrollable(col)
-            .height(Fill)
-            .style(dark_scrollable)
-            .into()
+        let col = filtered
+            .into_iter()
+            .fold(column![].spacing(4), |c, (idx, item)| {
+                c.push(item_row(idx, item, state.selected == Some(idx)))
+            });
+        scrollable(col).height(Fill).style(dark_scrollable).into()
     };
 
     let footer_count = text(count_text)
-        .size(12)
+        .size(TEXT_CAPTION)
         .color(MUTED)
         .font(font::ui_font());
 
     let manual_btn = button(
         text("手动添加")
-            .size(12)
+            .size(TEXT_BODY)
             .color(INK_2)
             .font(font::name_font()),
     )
@@ -144,7 +143,10 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let use_btn = button(
         row![
             icon(Icon::Play, INK, 11.0),
-            text("使用所选").size(12).color(INK).font(font::name_font()),
+            text("使用所选")
+                .size(TEXT_BODY)
+                .color(INK)
+                .font(font::name_font()),
         ]
         .spacing(5)
         .align_y(Alignment::Center),
@@ -153,13 +155,9 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     .style(primary_btn)
     .on_press(Message::AppPickerUseSelected);
 
-    let footer = row![
-        footer_count.width(Fill),
-        manual_btn,
-        use_btn,
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
+    let footer = row![footer_count.width(Fill), manual_btn, use_btn,]
+        .spacing(10)
+        .align_y(Alignment::Center);
 
     let panel = container(
         column![header, search, list, footer]
@@ -200,7 +198,7 @@ fn item_row<'a>(idx: usize, item: &'a DiscoveredApp, selected: bool) -> Element<
     let tile = app_tile(item);
 
     let name = text(item.name.clone())
-        .size(13)
+        .size(TEXT_BODY)
         .color(INK)
         .font(font::name_font());
 
@@ -210,21 +208,15 @@ fn item_row<'a>(idx: usize, item: &'a DiscoveredApp, selected: bool) -> Element<
         "Windows 应用".to_string()
     };
     let path = text(path_label)
-        .size(11)
+        .size(TEXT_CAPTION)
         .color(MUTED)
         .font(font::ui_font());
 
-    let source_badge = badge(
-        source_label(item.source),
-        ACCENT_BG,
-        ACCENT_TEXT,
-    );
+    let source_badge = badge(source_label(item.source), ACCENT_BG, ACCENT_TEXT);
 
     let support_badge = match item.capability.injection {
         InjectionSupport::Supported => None,
-        InjectionSupport::Delayed => {
-            Some(badge(item.capability.badge(), ACCENT_BG, ACCENT_TEXT))
-        }
+        InjectionSupport::Delayed => Some(badge(item.capability.badge(), ACCENT_BG, ACCENT_TEXT)),
         InjectionSupport::Unsupported => {
             Some(badge(item.capability.badge(), DANGER_BG, DANGER_TEXT))
         }
@@ -236,35 +228,27 @@ fn item_row<'a>(idx: usize, item: &'a DiscoveredApp, selected: bool) -> Element<
     if let Some(support_badge) = support_badge {
         title_row = title_row.push(support_badge);
     }
-    let meta = column![
-        title_row,
-        path,
-    ]
-    .spacing(4);
+    let meta = column![title_row, path,].spacing(4);
 
-    button(
-        row![tile, meta]
-            .spacing(12)
-            .align_y(Alignment::Center),
-    )
-    .padding(Padding::from([8, 12]))
-    .width(Fill)
-    .style(move |_t, _s| button::Style {
-        background: Some(iced::Background::Color(if selected {
-            ACCENT_SOFT
-        } else {
-            CARD_IDLE
-        })),
-        border: iced::Border {
-            color: if selected { ACCENT_LINE } else { BORDER },
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        text_color: INK,
-        ..Default::default()
-    })
-    .on_press(Message::AppPickerSelect(idx))
-    .into()
+    button(row![tile, meta].spacing(12).align_y(Alignment::Center))
+        .padding(Padding::from([8, 12]))
+        .width(Fill)
+        .style(move |_t, _s| button::Style {
+            background: Some(iced::Background::Color(if selected {
+                ACCENT_SOFT
+            } else {
+                CARD_IDLE
+            })),
+            border: iced::Border {
+                color: if selected { ACCENT_LINE } else { BORDER },
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            text_color: INK,
+            ..Default::default()
+        })
+        .on_press(Message::AppPickerSelect(idx))
+        .into()
 }
 
 fn app_tile(item: &DiscoveredApp) -> Element<'static, Message> {

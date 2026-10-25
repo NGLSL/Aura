@@ -42,19 +42,18 @@ static LANGID ProfileUiLangId() {
   if (pfl == nullptr || !pfl->has_ui) {
     return 0;
   }
-  LCID lcid = LocaleNameToLCID(pfl->ui_language, 0);
-  if (lcid == 0) {
-    return 0;
-  }
-  return LANGIDFROMLCID(lcid);
+  static const LANGID id = LANGIDFROMLCID(LocaleNameToLCID(pfl->ui_language, 0));
+  return id;
 }
 
 static LANGID WINAPI HookGetUserDefaultUILanguage() {
   LANGID id = ProfileUiLangId();
   if (id != 0) {
-    char buf[16];
-    _snprintf_s(buf, _TRUNCATE, "0x%04x", (unsigned)id);
-    EnvBoxAuditEvent("GetUserDefaultUILanguage", 1, buf);
+    if (EnvBoxAuditEnabled()) {
+      char buf[16];
+      _snprintf_s(buf, _TRUNCATE, "0x%04x", (unsigned)id);
+      EnvBoxAuditEvent("GetUserDefaultUILanguage", 1, buf);
+    }
     return id;
   }
   EnvBoxAuditEvent("GetUserDefaultUILanguage", 0, nullptr);
@@ -65,9 +64,11 @@ static LANGID WINAPI HookGetSystemDefaultUILanguage() {
   // Environment-consistent with user UI language.
   LANGID id = ProfileUiLangId();
   if (id != 0) {
-    char buf[16];
-    _snprintf_s(buf, _TRUNCATE, "0x%04x", (unsigned)id);
-    EnvBoxAuditEvent("GetSystemDefaultUILanguage", 1, buf);
+    if (EnvBoxAuditEnabled()) {
+      char buf[16];
+      _snprintf_s(buf, _TRUNCATE, "0x%04x", (unsigned)id);
+      EnvBoxAuditEvent("GetSystemDefaultUILanguage", 1, buf);
+    }
     return id;
   }
   EnvBoxAuditEvent("GetSystemDefaultUILanguage", 0, nullptr);

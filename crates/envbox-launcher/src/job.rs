@@ -32,6 +32,11 @@ mod win {
     /// RAII wrapper for a process/thread/job HANDLE.
     pub struct SafeHandle(pub HANDLE);
 
+    // Kernel Job/process/thread handles belong to the process, not the creating
+    // thread. Ownership may move to another thread and CloseHandle is valid
+    // there; no shared access or duplicate owner is introduced.
+    unsafe impl Send for SafeHandle {}
+
     impl Drop for SafeHandle {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
@@ -253,33 +258,52 @@ impl InstanceJob {
         Ok(())
     }
 
+    /// Query liveness without allocating or enumerating the Job's PID list.
+    /// A failed query stays an error so callers cannot mistake it for exit.
+    pub fn active_process_count(&self) -> Result<u32, JobError> {
+        #[cfg(windows)]
+        {
+            Ok(self.accounting()?.ActiveProcesses)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(0)
+        }
+    }
+
+    #[cfg(windows)]
+    fn accounting(
+        &self,
+    ) -> Result<windows::Win32::System::JobObjects::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobError>
+    {
+        use windows::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        unsafe {
+            QueryInformationJobObject(
+                self.handle.0,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of_val(&info) as u32,
+                None,
+            )
+        }
+        .map_err(|_| JobError::Query(last_error()))?;
+        Ok(info)
+    }
+
     pub fn stats(&self) -> Result<JobStats, JobError> {
         #[cfg(windows)]
         {
-            use windows::Win32::System::JobObjects::{
-                JobObjectBasicAccountingInformation, QueryInformationJobObject,
-                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-            };
-            unsafe {
-                let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-                if QueryInformationJobObject(
-                    self.handle.0,
-                    JobObjectBasicAccountingInformation,
-                    &mut info as *mut _ as *mut _,
-                    std::mem::size_of_val(&info) as u32,
-                    None,
-                )
-                .is_err()
-                {
-                    return Err(JobError::Query(last_error()));
-                }
-                Ok(JobStats {
-                    active_processes: info.ActiveProcesses,
-                    total_user_time_100ns: info.TotalUserTime as u64,
-                    total_page_fault_count: info.TotalPageFaultCount,
-                    process_ids: query_process_ids(self.handle.0)?,
-                })
-            }
+            let info = self.accounting()?;
+            Ok(JobStats {
+                active_processes: info.ActiveProcesses,
+                total_user_time_100ns: info.TotalUserTime as u64,
+                total_page_fault_count: info.TotalPageFaultCount,
+                process_ids: unsafe { query_process_ids(self.handle.0) }?,
+            })
         }
         #[cfg(not(windows))]
         {

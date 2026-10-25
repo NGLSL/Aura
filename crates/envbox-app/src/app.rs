@@ -7,12 +7,13 @@ use envbox_storage::{enumerate_dynamic_timezone_ids, windows_id_to_iana, ConfigS
 use iced::{Subscription, Task};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[path = "app/applications.rs"]
 mod applications;
 #[path = "app/audit.rs"]
-mod audit;
+pub(crate) mod audit;
 #[path = "app/dns_editor.rs"]
 pub mod dns_editor;
 #[path = "app/identity_editor.rs"]
@@ -124,6 +125,10 @@ pub struct EnvBoxApp {
     pub content_panes: iced::widget::pane_grid::State<bool>,
     pub profile_panes: iced::widget::pane_grid::State<bool>,
     pane_ratios: close_behavior::PaneRatios,
+    window_width: f32,
+    pane_last_saved: [Option<Instant>; 2],
+    pane_save_dirty: bool,
+    pane_save_deadline: Option<Instant>,
     pub search: String,
     pub applications: Vec<Application>,
     pub profiles: Vec<EnvironmentProfile>,
@@ -131,6 +136,7 @@ pub struct EnvBoxApp {
     pub workspace_management: workspace_management::ManagementState,
     pub timezones: Vec<String>,
     pub instances: InstanceManager,
+    pending_launches: HashSet<Uuid>,
     pub app_draft: AppDraft,
     pub profile_draft: ProfileDraft,
     pub timezone_lookup: crate::timezone_lookup::LookupState,
@@ -147,6 +153,9 @@ pub struct EnvBoxApp {
     resume_new_app: bool,
     pub audit_events: Vec<AuditEvent>,
     pub audit_total: usize,
+    pub audit_loading: bool,
+    audit_generation: u64,
+    audit_reload_requested: bool,
     /// Empty = show all software.
     pub audit_filter: String,
     /// Open searchable-select field in the Profile editor.
@@ -225,6 +234,7 @@ impl EnvBoxApp {
         };
         let close_behavior = close_behavior::load(store.root());
         let pane_ratios = close_behavior::load_pane_ratios(store.root());
+        let window_width = crate::theme::DEFAULT_WINDOW_WIDTH;
         let workspaces = workspaces::WorkspaceState::load(
             &store,
             profiles
@@ -242,7 +252,7 @@ impl EnvBoxApp {
             content_panes: iced::widget::pane_grid::State::with_configuration(
                 iced::widget::pane_grid::Configuration::Split {
                     axis: iced::widget::pane_grid::Axis::Vertical,
-                    ratio: pane_ratios.apps,
+                    ratio: pane_ratio_for_width(pane_ratios.apps, 0.35, window_width),
                     a: Box::new(iced::widget::pane_grid::Configuration::Pane(false)),
                     b: Box::new(iced::widget::pane_grid::Configuration::Pane(true)),
                 },
@@ -250,19 +260,24 @@ impl EnvBoxApp {
             profile_panes: iced::widget::pane_grid::State::with_configuration(
                 iced::widget::pane_grid::Configuration::Split {
                     axis: iced::widget::pane_grid::Axis::Vertical,
-                    ratio: pane_ratios.profiles,
+                    ratio: pane_ratio_for_width(pane_ratios.profiles, 0.32, window_width),
                     a: Box::new(iced::widget::pane_grid::Configuration::Pane(false)),
                     b: Box::new(iced::widget::pane_grid::Configuration::Pane(true)),
                 },
             ),
             search: String::new(),
             pane_ratios,
+            window_width,
+            pane_last_saved: [None, None],
+            pane_save_dirty: false,
+            pane_save_deadline: None,
             applications,
             profiles,
             workspaces,
             workspace_management: Default::default(),
             timezones,
             instances: InstanceManager::new(),
+            pending_launches: HashSet::new(),
             app_saved_draft: app_draft.clone(),
             timezone_lookup: Default::default(),
             profile_saved_draft: profile_draft.clone(),
@@ -279,6 +294,9 @@ impl EnvBoxApp {
             resume_new_app: false,
             audit_events: Vec::new(),
             audit_total: 0,
+            audit_loading: false,
+            audit_generation: 0,
+            audit_reload_requested: false,
             audit_filter: String::new(),
             open_combo: None,
             combo_query: String::new(),
@@ -297,13 +315,13 @@ impl EnvBoxApp {
             #[cfg(windows)]
             tray: None,
         };
-        app.load_audit();
+        let audit_task = app.load_audit();
         let icons_task = app.refresh_app_icons();
         if let Some(first) = app.applications.first() {
             let id = first.id;
             app.select_app(id);
         }
-        (app, icons_task)
+        (app, Task::batch([audit_task, icons_task]))
     }
 
     pub fn set_status(&mut self, kind: StatusKind, msg: impl Into<String>) {
@@ -340,11 +358,18 @@ impl EnvBoxApp {
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             iced::window::close_requests().map(Message::WindowCloseRequested),
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Window(
+                    iced::window::Event::Opened { size, .. } | iced::window::Event::Resized(size),
+                ) => Some(Message::WindowResized(size)),
+                _ => None,
+            }),
             #[cfg(windows)]
             crate::singleton::subscription(),
-            if self.tray.is_some() {
-                iced::time::every(std::time::Duration::from_millis(200))
-                    .map(|_| Message::WindowTrayPoll)
+            #[cfg(windows)]
+            crate::tray::subscription(),
+            if self.pane_save_deadline.is_some() {
+                iced::time::every(Duration::from_millis(50)).map(|_| Message::PaneSaveTick)
             } else {
                 Subscription::none()
             },
@@ -371,6 +396,25 @@ impl EnvBoxApp {
             self.timezone_lookup.invalidate();
         }
         match msg {
+            Message::WindowResized(size) => {
+                if size.width.is_finite() && size.width > 0.0 {
+                    self.window_width = size.width;
+                    // A smaller window constrains the visible split, without
+                    // overwriting the preferred ratio saved for larger windows.
+                    for (panes, preferred, minimum) in [
+                        (&mut self.content_panes, self.pane_ratios.apps, 0.35),
+                        (&mut self.profile_panes, self.pane_ratios.profiles, 0.32),
+                    ] {
+                        let split = panes.layout().splits().next().copied();
+                        if let Some(split) = split {
+                            panes.resize(
+                                split,
+                                pane_ratio_for_width(preferred, minimum, size.width),
+                            );
+                        }
+                    }
+                }
+            }
             Message::Nav(n) => {
                 if n != self.nav {
                     if self.update_checking {
@@ -381,6 +425,8 @@ impl EnvBoxApp {
                 }
             }
             Message::ContentPaneResized(event) => {
+                let pane_index = usize::from(self.nav == Nav::Profiles);
+                let window_width = self.window_width;
                 let (panes, saved_ratio, minimum) = if self.nav == Nav::Profiles {
                     (
                         &mut self.profile_panes,
@@ -391,19 +437,32 @@ impl EnvBoxApp {
                     (&mut self.content_panes, &mut self.pane_ratios.apps, 0.35)
                 };
                 if event.ratio.is_finite() {
-                    let ratio = event.ratio.clamp(minimum, 0.75);
+                    let ratio = pane_ratio_for_width(event.ratio, minimum, window_width);
                     panes.resize(event.split, ratio);
                     if *saved_ratio != ratio {
                         *saved_ratio = ratio;
-                        if let Err(error) =
-                            close_behavior::save_pane_ratios(self.store.root(), self.pane_ratios)
-                        {
-                            self.set_status(
-                                StatusKind::Error,
-                                format!("保存分栏宽度失败：{error}"),
-                            );
+                        self.pane_save_dirty = true;
+                        let now = Instant::now();
+                        // Save the leading change of each pane immediately, then
+                        // coalesce a drag burst and persist its final position.
+                        if self.pane_last_saved[pane_index].is_none_or(|last| {
+                            now.duration_since(last) >= Duration::from_millis(250)
+                        }) {
+                            if self.flush_pane_ratios() {
+                                self.pane_last_saved[pane_index] = Some(now);
+                            }
+                        } else {
+                            self.pane_save_deadline = Some(now + Duration::from_millis(250));
                         }
                     }
+                }
+            }
+            Message::PaneSaveTick => {
+                if self
+                    .pane_save_deadline
+                    .is_some_and(|due| Instant::now() >= due)
+                {
+                    self.flush_pane_ratios();
                 }
             }
             Message::Search(v) => self.search = v,
@@ -568,6 +627,9 @@ impl EnvBoxApp {
                     .unwrap_or(RunSelection::Host);
                 return self.run_app(id, selection);
             }
+            Message::AppLaunchFinished(request, environment, detection, result) => {
+                return self.finish_app_launch(request, environment, detection, result);
+            }
             Message::ProfileName(v) => self.profile_draft.name = v,
             Message::ProfileComputerName(v) => self.profile_draft.identity.computer_name = v,
             Message::ProfileUserName(v) => self.profile_draft.identity.user_name = v,
@@ -700,11 +762,10 @@ impl EnvBoxApp {
                 }
             }
             Message::AuditRefresh => {
-                self.load_audit();
-                self.set_status(
-                    StatusKind::Success,
-                    format!("已加载 {} 条审计事件", self.audit_events.len()),
-                );
+                return self.load_audit();
+            }
+            Message::AuditLoaded(generation, result) => {
+                return self.finish_audit_load(generation, result);
             }
             Message::AuditFilter(v) => self.audit_filter = v,
             Message::OpenAuditDir => {
@@ -861,15 +922,17 @@ impl EnvBoxApp {
                     }
                 }
             }
-            Message::WindowTrayPoll =>
-            {
-                #[cfg(windows)]
+            #[cfg(windows)]
+            Message::WindowTrayEvent(event) => {
                 if let Some(tray) = &self.tray {
-                    match tray.poll() {
+                    match tray.action(&event) {
                         Some(TrayAction::Restore) => return self.update(Message::WindowRestore),
                         Some(TrayAction::Exit) => {
                             let exit = self.request_exit();
-                            if self.pending_navigation.is_some() {
+                            if self.pending_navigation.is_some()
+                                || !self.pending_launches.is_empty()
+                                || self.pane_save_dirty
+                            {
                                 return self.update(Message::WindowRestore);
                             }
                             return exit;
@@ -900,6 +963,13 @@ impl EnvBoxApp {
         }
         Task::none()
     }
+}
+
+fn pane_ratio_for_width(preferred: f32, minimum: f32, window_width: f32) -> f32 {
+    let grid_width =
+        (window_width - crate::theme::SIDEBAR_WIDTH - crate::theme::PANE_SPACING - 2.0).max(1.0);
+    let maximum = (1.0 - crate::theme::DETAIL_MIN_WIDTH / grid_width).clamp(minimum, 0.75);
+    preferred.clamp(minimum, maximum)
 }
 
 pub fn status_label(s: InstanceStatus) -> &'static str {

@@ -9,6 +9,13 @@
 // Writes one EnvBoxAuditInit event on success. Never fatal.
 void EnvBoxAuditInit(const RuntimeProfile* pfl);
 
+// Summary formatting is optional work. The Profile is immutable, so callers
+// can skip it without acquiring the sink lock when audit was not requested.
+inline bool EnvBoxAuditEnabled() {
+  const RuntimeProfile* profile = EnvBoxProfile();
+  return profile != nullptr && profile->audit != 0;
+}
+
 // Append one Audit Event. No-op when audit is off or sink is unavailable.
 void EnvBoxAuditEvent(const char* api, int virtualized, const char* summary);
 

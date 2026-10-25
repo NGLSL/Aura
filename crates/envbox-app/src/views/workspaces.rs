@@ -2,6 +2,7 @@ use crate::app::EnvBoxApp;
 use crate::font;
 use crate::message::Message;
 use crate::theme::{self, DANGER_TEXT, INK, INK_2, MUTED, SUCCESS_TEXT};
+use crate::theme::{TEXT_BODY, TEXT_CAPTION, TEXT_SECTION};
 use iced::widget::{button, column, container, row, text, tooltip};
 use iced::{Alignment, Element, Fill, Padding};
 
@@ -9,14 +10,14 @@ use iced::{Alignment, Element, Fill, Padding};
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let management = &app.workspace_management;
     let mut runs = column![text("后台管理实例")
-        .size(17)
+        .size(TEXT_SECTION)
         .color(INK)
         .font(font::name_font())]
     .spacing(10);
     if management.busy {
         runs = runs.push(
             text("正在更新运行管理状态…")
-                .size(13)
+                .size(TEXT_BODY)
                 .color(MUTED)
                 .font(font::ui_font()),
         );
@@ -24,14 +25,19 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     if let Some(error) = &management.error {
         runs = runs.push(
             text(format!("运行管理请求失败：{error}"))
-                .size(13)
+                .size(TEXT_BODY)
                 .color(DANGER_TEXT)
                 .font(font::ui_font())
                 .wrapping(iced::widget::text::Wrapping::Glyph),
         );
     }
     if let Some(notice) = &management.notice {
-        runs = runs.push(text(notice).size(13).color(INK_2).font(font::ui_font()));
+        runs = runs.push(
+            text(notice)
+                .size(TEXT_BODY)
+                .color(INK_2)
+                .font(font::ui_font()),
+        );
     }
     if let Some(pending) = &management.pending_run {
         // Recovery is global: an application filter or deleted Profile must not hide it.
@@ -78,7 +84,7 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             })
             .count();
         let mut heading = row![text(format!("环境：{}", profile_label(app, profile_id)))
-            .size(13)
+            .size(TEXT_BODY)
             .color(INK_2)
             .font(font::ui_font())
             .width(Fill)]
@@ -132,18 +138,21 @@ fn instance_card<'a>(
     let profile_name = profile_label(app, result.profile_id);
     let mut card = column![row![
         text(application_name)
-            .size(14)
+            .size(TEXT_SECTION)
             .color(INK)
             .font(font::name_font())
             .width(Fill),
-        text(status).size(13).color(color).font(font::ui_font()),
+        text(status)
+            .size(TEXT_BODY)
+            .color(color)
+            .font(font::ui_font()),
     ]
     .spacing(8)
     .align_y(Alignment::Center),]
     .spacing(10);
     card = card.push(
         text(format!("环境：{profile_name}"))
-            .size(12)
+            .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font()),
     );
@@ -165,11 +174,16 @@ fn instance_card<'a>(
         } else {
             summary.into()
         };
-        card = card.push(text(summary).size(12).color(INK_2).font(font::ui_font()));
+        card = card.push(
+            text(summary)
+                .size(TEXT_BODY)
+                .color(INK_2)
+                .font(font::ui_font()),
+        );
         if observed < result.known_members.len() {
             card = card.push(
                 text("部分子进程尚无环境观测")
-                    .size(12)
+                    .size(TEXT_CAPTION)
                     .color(MUTED)
                     .font(font::ui_font()),
             );
@@ -182,7 +196,7 @@ fn instance_card<'a>(
         };
         card = card.push(
             text(recovery)
-                .size(12)
+                .size(TEXT_BODY)
                 .color(DANGER_TEXT)
                 .font(font::ui_font()),
         );
@@ -231,7 +245,7 @@ fn instance_diagnostics(view: &envbox_supervisor::RunView) -> Element<'_, Messag
             result.mode,
             envbox_supervisor::entry_guarantee_label(&result.entry_guarantee)
         ))
-        .size(12)
+        .size(TEXT_CAPTION)
         .color(INK_2)
         .font(font::ui_font()),
         text(format!(
@@ -240,7 +254,7 @@ fn instance_diagnostics(view: &envbox_supervisor::RunView) -> Element<'_, Messag
             result.known_members.len(),
             view.process_ids
         ))
-        .size(12)
+        .size(TEXT_CAPTION)
         .color(MUTED)
         .font(font::ui_font()),
     ]
@@ -256,16 +270,16 @@ fn instance_diagnostics(view: &envbox_supervisor::RunView) -> Element<'_, Messag
             if facts.config_complete { "是" } else { "否" },
             if facts.profile_matches_snapshot { "是" } else { "否" },
             if hooks.is_empty() { "未报告" } else { &hooks }))
-            .size(12).color(MUTED).font(font::ui_font()));
+            .size(TEXT_CAPTION).color(MUTED).font(font::ui_font()));
     }
     if result.entry_guarantee == envbox_supervisor::ENTRY_CHROME_COMPATIBILITY {
         details = details.push(text("兼容启动核验根进程 Runtime，不使用严格入口门禁。沙箱子进程可能读取本机信息。退出 Aura 界面不会停止浏览器；Supervisor 重启后只观测原 Job，不恢复控制。关闭浏览器并刷新，确认 Job 归零后才解除跟踪中断；服务离线期间 Job 已消失时会保留中断状态。")
-            .size(12).color(MUTED).font(font::ui_font()));
+            .size(TEXT_CAPTION).color(MUTED).font(font::ui_font()));
     }
     if let Some(error) = &result.error {
         details = details.push(
             text(error)
-                .size(12)
+                .size(TEXT_CAPTION)
                 .color(DANGER_TEXT)
                 .font(font::ui_font())
                 .wrapping(iced::widget::text::Wrapping::Glyph),
@@ -274,7 +288,7 @@ fn instance_diagnostics(view: &envbox_supervisor::RunView) -> Element<'_, Messag
     details = details.push(text(format!("根进程 PID：{}\n实例：{}\nApplication：{}\nSupervisor generation：{}\n配置身份：{}\n快照：{}",
         result.root_pid, result.instance_id, result.application_id, result.supervisor_generation,
         result.configuration_id, result.snapshot_digest))
-        .size(12).color(MUTED).font(font::ui_font())
+        .size(TEXT_CAPTION).color(MUTED).font(font::ui_font())
         .wrapping(iced::widget::text::Wrapping::Glyph));
     container(details)
         .padding(Padding::from([10, 0]))
@@ -283,15 +297,21 @@ fn instance_diagnostics(view: &envbox_supervisor::RunView) -> Element<'_, Messag
 }
 
 fn action<'a>(label: &'static str) -> iced::widget::Button<'a, Message> {
-    button(text(label).size(13).font(font::ui_font()))
+    button(text(label).size(TEXT_BODY).font(font::ui_font()))
         .padding(Padding::from([9, 14]))
         .style(theme::secondary_btn)
 }
 
 fn technical_info(label: String, detail: String, color: iced::Color) -> Element<'static, Message> {
     tooltip(
-        text(label).size(12).color(color).font(font::ui_font()),
-        text(detail).size(12).color(INK_2).font(font::ui_font()),
+        text(label)
+            .size(TEXT_CAPTION)
+            .color(color)
+            .font(font::ui_font()),
+        text(detail)
+            .size(TEXT_CAPTION)
+            .color(INK_2)
+            .font(font::ui_font()),
         tooltip::Position::Top,
     )
     .style(theme::inner_card_style)

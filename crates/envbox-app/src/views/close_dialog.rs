@@ -7,6 +7,7 @@ use crate::app::EnvBoxApp;
 use crate::font;
 use crate::message::Message;
 use crate::theme::{BORDER_SOFT, INK, INK_2, MUTED, PANEL};
+use crate::theme::{TEXT_BODY, TEXT_TITLE};
 use crate::widgets::{danger_btn, primary_btn, secondary_btn};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
@@ -28,41 +29,51 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let mut content = column![
         text("关闭 Aura")
-            .size(20)
+            .size(TEXT_TITLE)
             .color(INK)
             .font(font::name_font()),
         text("已启动的应用可以继续运行。你想如何处理 Aura 窗口？")
-            .size(12)
+            .size(TEXT_BODY)
             .color(INK_2)
             .font(font::ui_font()),
         checkbox("记住我的选择，以后不再询问", app.remember_close_choice)
             .on_toggle(Message::WindowRememberChoice)
             .size(14)
-            .text_size(12),
+            .text_size(TEXT_BODY),
     ]
     .spacing(15);
 
     if let Some(error) = &app.close_error {
         content = content.push(
             text(error)
-                .size(12)
+                .size(TEXT_BODY)
                 .color(iced::Color::from_rgb(1.0, 0.45, 0.45)),
         );
     }
 
     content = content.push(
         row![
-            button(text("取消").size(12).color(MUTED).font(font::ui_font()))
-                .on_press(Message::WindowCloseCancel)
-                .padding(Padding::from([8, 14]))
-                .style(secondary_btn),
-            button(text("退出 Aura").size(12).color(INK).font(font::ui_font()))
-                .on_press(Message::WindowExit)
-                .padding(Padding::from([8, 14]))
-                .style(danger_btn),
+            button(
+                text("取消")
+                    .size(TEXT_BODY)
+                    .color(MUTED)
+                    .font(font::ui_font())
+            )
+            .on_press(Message::WindowCloseCancel)
+            .padding(Padding::from([8, 14]))
+            .style(secondary_btn),
+            button(
+                text("退出 Aura")
+                    .size(TEXT_BODY)
+                    .color(INK)
+                    .font(font::ui_font())
+            )
+            .on_press(Message::WindowExit)
+            .padding(Padding::from([8, 14]))
+            .style(danger_btn),
             button(
                 text("最小化到托盘")
-                    .size(12)
+                    .size(TEXT_BODY)
                     .color(INK)
                     .font(font::name_font())
             )

@@ -202,7 +202,7 @@ fn stage_runtime_dll_at(
 struct RuntimeBundleFile {
     source: PathBuf,
     file_name: std::ffi::OsString,
-    fingerprint: (u64, u64),
+    fingerprint: (u64, [u8; 32]),
 }
 
 /// Detours switches `envbox-runtime64.dll` to `envbox-runtime32.dll` (and the
@@ -260,23 +260,23 @@ fn runtime_bundle(
 }
 
 fn runtime_bundle_cache_key(bundle: &[RuntimeBundleFile]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
     let mut total_length = 0u64;
     for file in bundle {
         let name = file.file_name.to_string_lossy().to_ascii_lowercase();
-        for byte in name
-            .as_bytes()
-            .iter()
-            .chain([0xff].iter())
-            .chain(file.fingerprint.0.to_le_bytes().iter())
-            .chain(file.fingerprint.1.to_le_bytes().iter())
-        {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        hash.update(name.as_bytes());
+        hash.update([0xff]);
+        hash.update(file.fingerprint.0.to_le_bytes());
+        hash.update(file.fingerprint.1);
         total_length = total_length.wrapping_add(file.fingerprint.0);
     }
-    format!("bundle-{}-{total_length:016x}-{hash:016x}", bundle.len())
+    // Keep the directory as short as before: native child injection still has
+    // MAX_PATH buffers. Full SHA-256 fingerprints verify the files; a key
+    // collision is isolated by the existing instance-specific fallback.
+    let key = format!("{:x}", hash.finalize());
+    format!("bundle-{}-{total_length:016x}-{}", bundle.len(), &key[..16])
 }
 
 fn runtime_bundle_matches(directory: &Path, bundle: &[RuntimeBundleFile]) -> bool {
@@ -335,11 +335,12 @@ fn stage_runtime_bundle_file(
     Ok(())
 }
 
-fn runtime_fingerprint(path: &Path) -> std::io::Result<(u64, u64)> {
+fn runtime_fingerprint(path: &Path) -> std::io::Result<(u64, [u8; 32])> {
+    use sha2::{Digest, Sha256};
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut hash = Sha256::new();
     let mut length = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -348,12 +349,9 @@ fn runtime_fingerprint(path: &Path) -> std::io::Result<(u64, u64)> {
             break;
         }
         length += read as u64;
-        for byte in &buffer[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        hash.update(&buffer[..read]);
     }
-    Ok((length, hash))
+    Ok((length, hash.finalize().into()))
 }
 
 /// Resolve `envbox-runtime64.dll` / `envbox-runtime32.dll` for the **host** pointer

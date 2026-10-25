@@ -80,9 +80,11 @@ static LCID ProfileLocaleLcid() {
 static LCID WINAPI HookGetUserDefaultLCID() {
   LCID lcid = ProfileLocaleLcid();
   if (lcid != 0) {
-    char buf[16];
-    _snprintf_s(buf, _TRUNCATE, "0x%08x", (unsigned)lcid);
-    EnvBoxAuditEvent("GetUserDefaultLCID", 1, buf);
+    if (EnvBoxAuditEnabled()) {
+      char buf[16];
+      _snprintf_s(buf, _TRUNCATE, "0x%08x", (unsigned)lcid);
+      EnvBoxAuditEvent("GetUserDefaultLCID", 1, buf);
+    }
     return lcid;
   }
   EnvBoxAuditEvent("GetUserDefaultLCID", 0, nullptr);
@@ -92,9 +94,11 @@ static LCID WINAPI HookGetUserDefaultLCID() {
 static LCID WINAPI HookGetSystemDefaultLCID() {
   LCID lcid = ProfileLocaleLcid();
   if (lcid != 0) {
-    char buf[16];
-    _snprintf_s(buf, _TRUNCATE, "0x%08x", (unsigned)lcid);
-    EnvBoxAuditEvent("GetSystemDefaultLCID", 1, buf);
+    if (EnvBoxAuditEnabled()) {
+      char buf[16];
+      _snprintf_s(buf, _TRUNCATE, "0x%08x", (unsigned)lcid);
+      EnvBoxAuditEvent("GetSystemDefaultLCID", 1, buf);
+    }
     return lcid;
   }
   EnvBoxAuditEvent("GetSystemDefaultLCID", 0, nullptr);
@@ -106,9 +110,11 @@ static LANGID WINAPI HookGetUserDefaultLangID() {
   LCID lcid = ProfileLocaleLcid();
   if (lcid != 0) {
     LANGID id = LANGIDFROMLCID(lcid);
-    char value[16];
-    _snprintf_s(value, _TRUNCATE, "0x%04x", (unsigned)id);
-    EnvBoxAuditEvent("GetUserDefaultLangID", 1, value);
+    if (EnvBoxAuditEnabled()) {
+      char value[16];
+      _snprintf_s(value, _TRUNCATE, "0x%04x", (unsigned)id);
+      EnvBoxAuditEvent("GetUserDefaultLangID", 1, value);
+    }
     SetLastError(last_error);
     return id;
   }
@@ -122,9 +128,11 @@ static LANGID WINAPI HookGetSystemDefaultLangID() {
   LCID lcid = ProfileLocaleLcid();
   if (lcid != 0) {
     LANGID id = LANGIDFROMLCID(lcid);
-    char value[16];
-    _snprintf_s(value, _TRUNCATE, "0x%04x", (unsigned)id);
-    EnvBoxAuditEvent("GetSystemDefaultLangID", 1, value);
+    if (EnvBoxAuditEnabled()) {
+      char value[16];
+      _snprintf_s(value, _TRUNCATE, "0x%04x", (unsigned)id);
+      EnvBoxAuditEvent("GetSystemDefaultLangID", 1, value);
+    }
     SetLastError(last_error);
     return id;
   }
@@ -143,9 +151,11 @@ static LCID WINAPI HookGetThreadLocale() {
   // SetThreadLocale is an explicit per-thread choice. Only substitute the
   // inherited host default, preserving a caller-selected thread locale.
   if (lcid != 0 && actual == TrueGetUserDefaultLCID()) {
-    char value[16];
-    _snprintf_s(value, _TRUNCATE, "0x%08x", (unsigned)lcid);
-    EnvBoxAuditEvent("GetThreadLocale", 1, value);
+    if (EnvBoxAuditEnabled()) {
+      char value[16];
+      _snprintf_s(value, _TRUNCATE, "0x%08x", (unsigned)lcid);
+      EnvBoxAuditEvent("GetThreadLocale", 1, value);
+    }
     SetLastError(last_error);
     return lcid;
   }
@@ -298,9 +308,11 @@ static UINT WINAPI HookGetACP() {
   }
   UINT profile = ProfileAnsiCodePage();
   if (profile != 0) {
-    char value[16];
-    _snprintf_s(value, _TRUNCATE, "%u", profile);
-    EnvBoxAuditEvent("GetACP", 1, value);
+    if (EnvBoxAuditEnabled()) {
+      char value[16];
+      _snprintf_s(value, _TRUNCATE, "%u", profile);
+      EnvBoxAuditEvent("GetACP", 1, value);
+    }
     SetLastError(last_error);
     return profile;
   }
@@ -316,9 +328,11 @@ static UINT WINAPI HookGetOEMCP() {
   }
   UINT profile = ProfileOemCodePage();
   if (profile != 0) {
-    char value[16];
-    _snprintf_s(value, _TRUNCATE, "%u", profile);
-    EnvBoxAuditEvent("GetOEMCP", 1, value);
+    if (EnvBoxAuditEnabled()) {
+      char value[16];
+      _snprintf_s(value, _TRUNCATE, "%u", profile);
+      EnvBoxAuditEvent("GetOEMCP", 1, value);
+    }
     SetLastError(last_error);
     return profile;
   }

@@ -8,13 +8,14 @@ use crate::font;
 use crate::icons::{icon, Icon};
 use crate::message::{Message, WebRtcChoice};
 use crate::theme::{self, ACCENT_BG, ACCENT_LINE, ACCENT_TEXT, INK, MUTED};
+use crate::theme::{TEXT_BODY, TEXT_CAPTION, TEXT_PAGE_TITLE, TEXT_SECTION};
 use crate::widgets::{badge, primary_btn};
 
 pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
     let header = column![
         column![
             text("环境配置")
-                .size(26)
+                .size(TEXT_PAGE_TITLE)
                 .color(INK)
                 .font(font::name_font())
                 .width(Fill),
@@ -22,7 +23,7 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                 row![
                     text("+").size(15).color(INK).font(font::name_font()),
                     text("新建环境配置")
-                        .size(13)
+                        .size(TEXT_BODY)
                         .color(INK)
                         .font(font::ui_font()),
                 ]
@@ -35,7 +36,7 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
         ]
         .spacing(12),
         text("地区、语言、时区、DNS 与身份信息")
-            .size(13)
+            .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font()),
     ]
@@ -46,7 +47,7 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
             row![
                 icon(Icon::Play, INK, 11.0),
                 text("新建第一个环境配置")
-                    .size(13)
+                    .size(TEXT_BODY)
                     .color(INK)
                     .font(font::name_font()),
             ]
@@ -136,7 +137,7 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                     ),
                     column![
                         text(&p.name)
-                            .size(15)
+                            .size(TEXT_SECTION)
                             .color(if selected { ACCENT_TEXT } else { INK })
                             .font(font::name_font()),
                         text(format!(
@@ -145,7 +146,7 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                             p.locale.locale_name,
                             p.timezone.windows_id
                         ))
-                        .size(12)
+                        .size(TEXT_CAPTION)
                         .color(MUTED)
                         .font(font::ui_font()),
                     ]

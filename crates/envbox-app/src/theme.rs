@@ -6,43 +6,55 @@
 use iced::widget::{button, container, overlay, pick_list, text, text_input};
 use iced::{Background, Border, Color, Gradient, Radians, Theme};
 
+// One size per text role, including controls that would otherwise default to 16.
+pub const TEXT_BODY: f32 = 13.0;
+pub const TEXT_CAPTION: f32 = 12.0;
+pub const TEXT_SECTION: f32 = 15.0;
+pub const TEXT_TITLE: f32 = 18.0;
+pub const TEXT_PAGE_TITLE: f32 = 22.0;
+pub const FORM_SPACING: f32 = 14.0;
+pub const DEFAULT_WINDOW_WIDTH: f32 = 1400.0;
+pub const SIDEBAR_WIDTH: f32 = 220.0;
+pub const PANE_SPACING: f32 = 6.0;
+pub const DETAIL_MIN_WIDTH: f32 = 360.0;
+
 // Clean dark navy slate theme matching Figure 2
-pub const WINDOW: Color = Color::from_rgb(0.043, 0.059, 0.086);     // #0B0F16
-pub const SIDEBAR: Color = Color::from_rgb(0.035, 0.047, 0.071);    // #090C12
-pub const SIDEBAR_TOP: Color = Color::from_rgb(0.043, 0.059, 0.086);// #0B0F16
-pub const PANEL: Color = Color::from_rgb(0.051, 0.071, 0.102);      // #0D121A
-pub const PANEL_RIGHT: Color = Color::from_rgb(0.043, 0.059, 0.086);// #0B0F16
-pub const INPUT: Color = Color::from_rgb(0.035, 0.047, 0.071);      // #090C12
-pub const CARD: Color = Color::from_rgb(0.075, 0.106, 0.157);       // #131B28
-pub const CARD_IDLE: Color = Color::from_rgb(0.059, 0.082, 0.122);  // #0F151F
+pub const WINDOW: Color = Color::from_rgb(0.043, 0.059, 0.086); // #0B0F16
+pub const SIDEBAR: Color = Color::from_rgb(0.035, 0.047, 0.071); // #090C12
+pub const SIDEBAR_TOP: Color = Color::from_rgb(0.043, 0.059, 0.086); // #0B0F16
+pub const PANEL: Color = Color::from_rgb(0.051, 0.071, 0.102); // #0D121A
+pub const PANEL_RIGHT: Color = Color::from_rgb(0.043, 0.059, 0.086); // #0B0F16
+pub const INPUT: Color = Color::from_rgb(0.035, 0.047, 0.071); // #090C12
+pub const CARD: Color = Color::from_rgb(0.075, 0.106, 0.157); // #131B28
+pub const CARD_IDLE: Color = Color::from_rgb(0.059, 0.082, 0.122); // #0F151F
 pub const CARD_INNER: Color = Color::from_rgb(0.043, 0.059, 0.086); // #0B0F16
-pub const BORDER: Color = Color::from_rgb(0.106, 0.141, 0.196);     // #1B2432
-pub const BORDER_SOFT: Color = Color::from_rgb(0.141, 0.188, 0.259);// #243042
+pub const BORDER: Color = Color::from_rgb(0.106, 0.141, 0.196); // #1B2432
+pub const BORDER_SOFT: Color = Color::from_rgb(0.141, 0.188, 0.259); // #243042
 pub const BORDER_BTN: Color = Color::from_rgb(0.153, 0.208, 0.290); // #27354A
 
 // Accents
-pub const ACCENT: Color = Color::from_rgb(0.114, 0.408, 0.949);     // #1D68F2
-pub const ACCENT_HOVER: Color = Color::from_rgb(0.145, 0.450, 0.980);// #2573FA
+pub const ACCENT: Color = Color::from_rgb(0.114, 0.408, 0.949); // #1D68F2
+pub const ACCENT_HOVER: Color = Color::from_rgb(0.145, 0.450, 0.980); // #2573FA
 pub const ACCENT_SOFT: Color = Color::from_rgb(0.102, 0.278, 0.706); // #1A47B4
 pub const ACCENT_LINE: Color = Color::from_rgb(0.231, 0.510, 0.965); // #3B82F6
 pub const ACCENT_TEXT: Color = Color::from_rgb(0.376, 0.647, 0.980); // #60A5FA
-pub const ACCENT_BG: Color = Color::from_rgb(0.082, 0.153, 0.271);   // #152745
+pub const ACCENT_BG: Color = Color::from_rgb(0.082, 0.153, 0.271); // #152745
 
 // Logos / App marks
-pub const LOGO_A: Color = Color::from_rgb(0.220, 0.741, 0.973);     // #38BDF8
-pub const LOGO_B: Color = Color::from_rgb(0.114, 0.408, 0.949);     // #1D68F2
+pub const LOGO_A: Color = Color::from_rgb(0.220, 0.741, 0.973); // #38BDF8
+pub const LOGO_B: Color = Color::from_rgb(0.114, 0.408, 0.949); // #1D68F2
 
 // Typography
-pub const INK: Color = Color::from_rgb(0.973, 0.980, 0.988);        // #F8FAFC
-pub const INK_2: Color = Color::from_rgb(0.886, 0.910, 0.941);      // #E2E8F0
-pub const MUTED: Color = Color::from_rgb(0.550, 0.612, 0.698);      // #8C9CB2
-pub const FAINT: Color = Color::from_rgb(0.392, 0.455, 0.545);      // #64748B
+pub const INK: Color = Color::from_rgb(0.973, 0.980, 0.988); // #F8FAFC
+pub const INK_2: Color = Color::from_rgb(0.886, 0.910, 0.941); // #E2E8F0
+pub const MUTED: Color = Color::from_rgb(0.550, 0.612, 0.698); // #8C9CB2
+pub const FAINT: Color = Color::from_rgb(0.392, 0.455, 0.545); // #64748B
 
 // Status colors
-pub const SUCCESS: Color = Color::from_rgb(0.133, 0.773, 0.369);     // #22C55E
-pub const SUCCESS_TEXT: Color = Color::from_rgb(0.290, 0.871, 0.502);// #4ADE80
+pub const SUCCESS: Color = Color::from_rgb(0.133, 0.773, 0.369); // #22C55E
+pub const SUCCESS_TEXT: Color = Color::from_rgb(0.290, 0.871, 0.502); // #4ADE80
 pub const SUCCESS_BG: Color = Color::from_rgb(0.059, 0.200, 0.118); // #0F331E
-pub const DANGER: Color = Color::from_rgb(0.937, 0.267, 0.267);      // #EF4444
+pub const DANGER: Color = Color::from_rgb(0.937, 0.267, 0.267); // #EF4444
 pub const DANGER_TEXT: Color = Color::from_rgb(0.996, 0.647, 0.647); // #FEA5A5
 pub const DANGER_BG: Color = Color::from_rgb(0.220, 0.080, 0.080);
 
@@ -199,11 +211,7 @@ pub fn pick_style(_t: &Theme, status: pick_list::Status) -> pick_list::Style {
         text_color: if active { INK } else { INK_2 },
         placeholder_color: FAINT,
         handle_color: if active { ACCENT_TEXT } else { MUTED },
-        background: Background::Color(if active {
-            CARD
-        } else {
-            INPUT
-        }),
+        background: Background::Color(if active { CARD } else { INPUT }),
         border: Border {
             color: if matches!(status, pick_list::Status::Opened { .. }) {
                 ACCENT_LINE
@@ -218,10 +226,7 @@ pub fn pick_style(_t: &Theme, status: pick_list::Status) -> pick_list::Style {
 
 /// Searchable select closed/open header (mirrors pick_list body).
 pub fn combo_btn(_t: &Theme, status: button::Status) -> button::Style {
-    let active = matches!(
-        status,
-        button::Status::Hovered | button::Status::Pressed
-    );
+    let active = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
         background: Some(Background::Color(if active { CARD } else { INPUT })),
         text_color: if active { INK } else { INK_2 },
@@ -502,7 +507,10 @@ pub fn list_card_style(selected: bool) -> button::Style {
         }
     }
 }
-pub fn dark_scrollable(_t: &Theme, status: iced::widget::scrollable::Status) -> iced::widget::scrollable::Style {
+pub fn dark_scrollable(
+    _t: &Theme,
+    status: iced::widget::scrollable::Status,
+) -> iced::widget::scrollable::Style {
     let thumb_alpha = match status {
         iced::widget::scrollable::Status::Hovered { .. } => 0.35,
         iced::widget::scrollable::Status::Dragged { .. } => 0.55,

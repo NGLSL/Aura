@@ -36,7 +36,7 @@ pub use injection::{
     is_elevation_integrity, map_create_process_error, pe_arch, resolve_runtime_dll,
     resolve_runtime_dll_for_target, stage_runtime_dll, InjectError, PeArch,
 };
-pub use instance::{InstanceError, InstanceHandle, InstanceManager, RunTarget};
+pub use instance::{InstanceError, InstanceHandle, InstanceManager, PendingLaunch, RunTarget};
 pub use ipc::{
     message_to_profile, profile_to_message, round_trip, FakeBroker, IpcError, IpcMessage,
     SessionTable, DEFAULT_PIPE_NAME,

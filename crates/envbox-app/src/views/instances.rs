@@ -8,6 +8,7 @@ use crate::font;
 use crate::icons::{icon, Icon};
 use crate::message::{Message, WebRtcChoice};
 use crate::theme::{self, FAINT, INK, INK_2, MUTED, SUCCESS};
+use crate::theme::{TEXT_BODY, TEXT_CAPTION, TEXT_PAGE_TITLE, TEXT_SECTION};
 use crate::widgets::{secondary_btn, short_id, status_dot};
 
 pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
@@ -56,13 +57,16 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let header = row![
         column![
-            text("运行实例").size(24).color(INK).font(font::name_font()),
+            text("运行实例")
+                .size(TEXT_PAGE_TITLE)
+                .color(INK)
+                .font(font::name_font()),
             text(format!(
                 "共 {} 个实例 · 运行中 {} 个",
                 instances.len() + managed.len(),
                 active_count
             ))
-            .size(12)
+            .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font()),
         ]
@@ -72,7 +76,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
             row![
                 icon(Icon::Monitor, INK_2, 12.0),
                 text("刷新实例状态")
-                    .size(12)
+                    .size(TEXT_BODY)
                     .color(INK_2)
                     .font(font::ui_font())
             ]
@@ -92,7 +96,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
             row![
                 icon(Icon::Play, INK, 11.0),
                 text("前往应用列表启动")
-                    .size(13)
+                    .size(TEXT_BODY)
                     .color(INK)
                     .font(font::name_font()),
             ]
@@ -110,11 +114,16 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                 "当前应用暂无实例",
                 "可以切换到其他应用，或查看全部实例。",
                 Some(
-                    button(text("查看全部").size(13).color(INK).font(font::name_font()))
-                        .padding(Padding::from([9, 20]))
-                        .style(primary_btn)
-                        .on_press(Message::InstanceFilter(None))
-                        .into(),
+                    button(
+                        text("查看全部")
+                            .size(TEXT_BODY)
+                            .color(INK)
+                            .font(font::name_font()),
+                    )
+                    .padding(Padding::from([9, 20]))
+                    .style(primary_btn)
+                    .on_press(Message::InstanceFilter(None))
+                    .into(),
                 ),
             )
         } else {
@@ -170,9 +179,12 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                 };
 
                 let mut name_row = row![
-                    text(app_name).size(15).color(INK).font(font::name_font()),
+                    text(app_name)
+                        .size(TEXT_SECTION)
+                        .color(INK)
+                        .font(font::name_font()),
                     text(format!("PID {}", inst.root_pid))
-                        .size(12)
+                        .size(TEXT_CAPTION)
                         .color(theme::ACCENT_TEXT)
                         .font(font::ui_font()),
                     status_badge,
@@ -189,7 +201,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                         row![
                             icon(Icon::Stop, theme::DANGER_TEXT, 11.0),
                             text("终止进程树")
-                                .size(12)
+                                .size(TEXT_BODY)
                                 .color(theme::DANGER_TEXT)
                                 .font(font::ui_font())
                         ]
@@ -200,7 +212,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                     .style(danger_btn)
                     .on_press(Message::InstanceStop(inst.id))
                 } else {
-                    button(text("已结束").size(12).color(FAINT))
+                    button(text("已结束").size(TEXT_BODY).color(FAINT))
                         .padding(Padding::from([6, 14]))
                         .style(secondary_btn)
                 };
@@ -213,7 +225,10 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                         button(
                             row![
                                 icon(Icon::ExternalLink, INK_2, 11.0),
-                                text("打开位置").size(11).color(INK_2).font(font::ui_font()),
+                                text("打开位置")
+                                    .size(TEXT_BODY)
+                                    .color(INK_2)
+                                    .font(font::ui_font()),
                             ]
                             .spacing(4)
                             .align_y(Alignment::Center),
@@ -232,12 +247,12 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
                             name_row,
                             row![
                                 text(format!("衍生子进程: {} 个", count))
-                                    .size(12)
+                                    .size(TEXT_CAPTION)
                                     .color(MUTED)
                                     .font(font::ui_font()),
-                                text("·").size(12).color(FAINT),
+                                text("·").size(TEXT_CAPTION).color(FAINT),
                                 text(format!("实例 ID: {}", short_id(inst.id)))
-                                    .size(11)
+                                    .size(TEXT_CAPTION)
                                     .color(FAINT)
                                     .font(font::ui_font()),
                             ]
@@ -260,7 +275,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
 
         column![
             text("本次会话实例")
-                .size(17)
+                .size(TEXT_SECTION)
                 .color(INK)
                 .font(font::name_font()),
             rows
@@ -284,7 +299,7 @@ fn instance_filter_bar<'a>(
     selected_name: Option<&'a str>,
 ) -> Element<'a, Message> {
     let all_selected = app.instance_filter.is_none();
-    let mut filters = row![button(text("全部").size(11).font(font::ui_font()))
+    let mut filters = row![button(text("全部").size(TEXT_BODY).font(font::ui_font()))
         .padding(Padding::from([5, 10]))
         .style(move |_theme, _status| theme::tab_btn_style(all_selected))
         .on_press(Message::InstanceFilter(None)),]
@@ -297,9 +312,11 @@ fn instance_filter_bar<'a>(
         filters = filters.push(
             button(
                 row![
-                    text(&application.name).size(11).font(font::ui_font()),
+                    text(&application.name)
+                        .size(TEXT_BODY)
+                        .font(font::ui_font()),
                     text(format!("{count}"))
-                        .size(10)
+                        .size(TEXT_CAPTION)
                         .color(if selected { theme::ACCENT_TEXT } else { FAINT })
                         .font(font::ui_font()),
                 ]
@@ -324,11 +341,14 @@ fn instance_filter_bar<'a>(
 
     container(
         column![
-            text(label).size(11).color(MUTED).font(font::ui_font()),
+            text(label)
+                .size(TEXT_CAPTION)
+                .color(MUTED)
+                .font(font::ui_font()),
             scrollable(filters)
                 .direction(scrollable::Direction::Horizontal(Default::default()))
                 .width(Fill)
-                .height(Length::Fixed(30.0))
+                .height(Length::Fixed(42.0))
                 .style(theme::dark_scrollable),
         ]
         .spacing(4),
@@ -348,9 +368,12 @@ fn instance_empty_state<'a>(
 ) -> Element<'a, Message> {
     let mut body = column![
         icon(Icon::Monitor, theme::ACCENT_LINE, 28.0),
-        text(title).size(17).color(INK).font(font::name_font()),
+        text(title)
+            .size(TEXT_SECTION)
+            .color(INK)
+            .font(font::name_font()),
         text(description)
-            .size(13)
+            .size(TEXT_BODY)
             .color(MUTED)
             .font(font::ui_font()),
     ]

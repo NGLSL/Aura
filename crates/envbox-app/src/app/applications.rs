@@ -204,6 +204,10 @@ impl EnvBoxApp {
         sel: RunSelection,
         detection: Option<envbox_core::DetectionSite>,
     ) -> Task<Message> {
+        if self.update_checking {
+            self.set_status(StatusKind::Info, "更新正在进行，请完成后再启动应用");
+            return Task::none();
+        }
         let Some(app) = self.applications.iter().find(|a| a.id == app_id).cloned() else {
             self.set_status(StatusKind::Error, "应用不存在");
             return Task::none();
@@ -249,13 +253,49 @@ impl EnvBoxApp {
             RunTarget::Host => "本机 Host".into(),
             RunTarget::Profile(profile) => profile.name.clone(),
         };
-        let result = if let Some(site) = detection {
-            self.instances.run_detection(&app, target, site)
-        } else {
-            self.instances.run(&app, target)
-        };
+        let request = Uuid::new_v4();
+        self.pending_launches.insert(request);
+        self.set_status(
+            StatusKind::Info,
+            format!("正在使用 {environment} 启动「{}」…", app.name),
+        );
+        Task::perform(
+            async move {
+                let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                let worker = std::thread::Builder::new()
+                    .name("aura-application-launch".into())
+                    .spawn(move || {
+                        let result =
+                            envbox_launcher::InstanceManager::launch(&app, target, detection)
+                                .map_err(|error| error.to_string());
+                        let _ = sender.send(result);
+                    });
+                worker.map_err(|error| format!("无法启动应用任务：{error}"))?;
+                receiver
+                    .await
+                    .map_err(|_| "应用启动任务意外结束".to_string())?
+            },
+            move |result| {
+                Message::AppLaunchFinished(request, environment.clone(), detection, result)
+            },
+        )
+    }
+
+    pub(super) fn finish_app_launch(
+        &mut self,
+        request: Uuid,
+        environment: String,
+        detection: Option<envbox_core::DetectionSite>,
+        result: Result<envbox_launcher::instance::PendingLaunch, String>,
+    ) -> Task<Message> {
+        if !self.pending_launches.remove(&request) {
+            return Task::none();
+        }
         match result {
-            Ok(id) => {
+            Ok(pending) => {
+                let Some(id) = self.instances.accept_launch(pending) else {
+                    return Task::none();
+                };
                 self.set_status(
                     StatusKind::Success,
                     if let Some(site) = detection {
@@ -264,8 +304,6 @@ impl EnvBoxApp {
                         format!("已启动实例 {id}")
                     },
                 );
-                self.nav = Nav::Apps;
-                self.instances.refresh_all();
             }
             Err(err) => self.set_status(StatusKind::Error, format!("启动失败: {err}")),
         }

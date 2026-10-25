@@ -135,6 +135,38 @@ struct TrackedKey {
 static CRITICAL_SECTION g_lock;
 static int g_lock_ready = 0;
 static TrackedKey g_keys[ENVBOX_REG_TRACK];
+// Links use slot + 1 so zero-initialized storage is an empty index. Keep
+// them separate from the large path entries for compact bucket traversal.
+static int g_key_buckets[ENVBOX_REG_TRACK];
+static int g_key_next[ENVBOX_REG_TRACK];
+static int g_first_free = 0;
+
+static size_t KeyBucket(HKEY key) {
+  size_t value = reinterpret_cast<size_t>(key) >> 2;
+  value ^= value >> 16;
+  return value % ENVBOX_REG_TRACK;
+}
+
+// The key slots retain their existing capacity, first-free allocation and
+// slot-zero eviction policy. Only the handle-to-slot lookup is indexed.
+static int FindKeyLocked(HKEY key) {
+  for (int link = g_key_buckets[KeyBucket(key)]; link;
+       link = g_key_next[link - 1]) {
+    if (g_keys[link - 1].handle == key) return link - 1;
+  }
+  return -1;
+}
+
+static void RemoveKeyIndexLocked(int slot) {
+  int* link = &g_key_buckets[KeyBucket(g_keys[slot].handle)];
+  while (*link) {
+    if (*link == slot + 1) {
+      *link = g_key_next[slot];
+      return;
+    }
+    link = &g_key_next[*link - 1];
+  }
+}
 
 static void EnsureLock() {
   if (!g_lock_ready) {
@@ -195,16 +227,10 @@ static void RootLabel(HKEY k, wchar_t* out, size_t cap) {
 static int LookupPath(HKEY hk, wchar_t* out, size_t cap) {
   EnsureLock();
   EnterCriticalSection(&g_lock);
-  int found = 0;
-  for (int i = 0; i < ENVBOX_REG_TRACK; i++) {
-    if (g_keys[i].handle == hk) {
-      wcsncpy_s(out, cap, g_keys[i].path, _TRUNCATE);
-      found = 1;
-      break;
-    }
-  }
+  const int slot = FindKeyLocked(hk);
+  if (slot >= 0) wcsncpy_s(out, cap, g_keys[slot].path, _TRUNCATE);
   LeaveCriticalSection(&g_lock);
-  return found;
+  return slot >= 0;
 }
 
 static void TrackKey(HKEY hk, const wchar_t* path) {
@@ -213,21 +239,19 @@ static void TrackKey(HKEY hk, const wchar_t* path) {
   }
   EnsureLock();
   EnterCriticalSection(&g_lock);
-  // Reuse slot if handle recycled; else first free; else evict slot 0.
-  int slot = -1;
-  for (int i = 0; i < ENVBOX_REG_TRACK; i++) {
-    if (g_keys[i].handle == hk) {
-      slot = i;
-      break;
-    }
-    if (slot < 0 && g_keys[i].handle == nullptr) {
-      slot = i;
-    }
-  }
+  int slot = FindKeyLocked(hk);
   if (slot < 0) {
-    slot = 0;
+    slot = g_first_free < ENVBOX_REG_TRACK ? g_first_free : 0;
+    if (g_keys[slot].handle != nullptr) RemoveKeyIndexLocked(slot);
+    g_keys[slot].handle = hk;
+    const size_t bucket = KeyBucket(hk);
+    g_key_next[slot] = g_key_buckets[bucket];
+    g_key_buckets[bucket] = slot + 1;
+    while (g_first_free < ENVBOX_REG_TRACK &&
+           g_keys[g_first_free].handle != nullptr) {
+      ++g_first_free;
+    }
   }
-  g_keys[slot].handle = hk;
   wcsncpy_s(g_keys[slot].path, path, _TRUNCATE);
   LeaveCriticalSection(&g_lock);
 }
@@ -235,12 +259,13 @@ static void TrackKey(HKEY hk, const wchar_t* path) {
 static void UntrackKey(HKEY hk) {
   EnsureLock();
   EnterCriticalSection(&g_lock);
-  for (int i = 0; i < ENVBOX_REG_TRACK; i++) {
-    if (g_keys[i].handle == hk) {
-      g_keys[i].handle = nullptr;
-      g_keys[i].path[0] = L'\0';
-      break;
-    }
+  const int slot = FindKeyLocked(hk);
+  if (slot >= 0) {
+    RemoveKeyIndexLocked(slot);
+    g_keys[slot].handle = nullptr;
+    g_keys[slot].path[0] = L'\0';
+    g_key_next[slot] = 0;
+    if (slot < g_first_free) g_first_free = slot;
   }
   LeaveCriticalSection(&g_lock);
 }
@@ -248,12 +273,8 @@ static void UntrackKey(HKEY hk) {
 // Full path = parent path (tracked or predefined root) + relative subkey.
 static int JoinPath(HKEY parent, LPCWSTR subkey, wchar_t* out, size_t cap) {
   wchar_t base[260];
-  if (!LookupPath(parent, base, 260)) {
-    RootLabel(parent, base, 260);
-    if (base[0] == L'\0') {
-      return 0;
-    }
-  }
+  RootLabel(parent, base, 260);
+  if (base[0] == L'\0' && !LookupPath(parent, base, 260)) return 0;
   if (subkey == nullptr || subkey[0] == L'\0') {
     wcsncpy_s(out, cap, base, _TRUNCATE);
     return 1;
@@ -455,8 +476,8 @@ static LSTATUS WINAPI HookRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey,
                                         DWORD ulOptions, REGSAM samDesired,
                                         PHKEY phkResult) {
   wchar_t path[260];
-  if (phkResult != nullptr && JoinPath(hKey, lpSubKey, path, 260) &&
-      IsHiddenDnsTree(path)) {
+  const int has_path = phkResult != nullptr && JoinPath(hKey, lpSubKey, path, 260);
+  if (has_path && IsHiddenDnsTree(path)) {
     *phkResult = nullptr;
     EnvBoxAuditEventW("RegOpenKeyExW", 1, path);
     return ERROR_FILE_NOT_FOUND;
@@ -465,9 +486,7 @@ static LSTATUS WINAPI HookRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey,
       TrueRegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
   if (st == ERROR_SUCCESS && phkResult != nullptr && *phkResult != nullptr) {
     // Track every open so nested relative opens resolve (Hard #1).
-    if (JoinPath(hKey, lpSubKey, path, 260)) {
-      TrackKey(*phkResult, path);
-    }
+    if (has_path) TrackKey(*phkResult, path);
   }
   return st;
 }
@@ -477,9 +496,9 @@ static LSTATUS WINAPI HookRegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey,
                                         PHKEY phkResult) {
   std::wstring subkey;
   wchar_t path[260];
-  if (phkResult != nullptr && AnsiToWide(lpSubKey, &subkey) &&
-      JoinPath(hKey, lpSubKey ? subkey.c_str() : nullptr, path, 260) &&
-      IsHiddenDnsTree(path)) {
+  const int has_path = phkResult != nullptr && AnsiToWide(lpSubKey, &subkey) &&
+      JoinPath(hKey, lpSubKey ? subkey.c_str() : nullptr, path, 260);
+  if (has_path && IsHiddenDnsTree(path)) {
     *phkResult = nullptr;
     EnvBoxAuditEventW("RegOpenKeyExA", 1, path);
     return ERROR_FILE_NOT_FOUND;
@@ -487,10 +506,7 @@ static LSTATUS WINAPI HookRegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey,
   LSTATUS st =
       TrueRegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult);
   if (st == ERROR_SUCCESS && phkResult != nullptr && *phkResult != nullptr) {
-    if (AnsiToWide(lpSubKey, &subkey) &&
-        JoinPath(hKey, lpSubKey ? subkey.c_str() : nullptr, path, 260)) {
-      TrackKey(*phkResult, path);
-    }
+    if (has_path) TrackKey(*phkResult, path);
   }
   return st;
 }
@@ -521,12 +537,12 @@ static LSTATUS WINAPI HookRegQueryValueExA(HKEY hKey, LPCSTR lpValueName,
     VirtualResult v = VirtualValueA(path, lpValueName, lpType, lpData, lpcbData);
     std::wstring name;
     if (v != kVirtualMiss) {
-      if (AnsiToWide(lpValueName, &name))
+      if (EnvBoxAuditEnabled() && AnsiToWide(lpValueName, &name))
         EnvBoxAuditEventW("RegQueryValueExA", 1,
                           lpValueName ? name.c_str() : L"(default)");
       return VirtualToStatus(v);
     }
-    if (AnsiToWide(lpValueName, &name))
+    if (EnvBoxAuditEnabled() && AnsiToWide(lpValueName, &name))
       EnvBoxAuditEventW("RegQueryValueExA", 0,
                         lpValueName ? name.c_str() : L"(default)");
   }
@@ -600,7 +616,7 @@ static LSTATUS WINAPI HookRegGetValueA(HKEY hkey, LPCSTR lpSubKey,
     std::wstring name;
     if (v != kVirtualMiss) {
       if (v == kVirtualHidden) {
-        if (AnsiToWide(lpValue, &name))
+        if (EnvBoxAuditEnabled() && AnsiToWide(lpValue, &name))
           EnvBoxAuditEventW("RegGetValueA", 1,
                             lpValue ? name.c_str() : L"(default)");
         return HiddenRegGetValueStatus(dwFlags, pvData, pcbData);
@@ -611,12 +627,12 @@ static LSTATUS WINAPI HookRegGetValueA(HKEY hkey, LPCSTR lpSubKey,
       if (st != ERROR_SUCCESS && (dwFlags & RRF_ZEROONFAILURE) && pvData &&
           pcbData)
         memset(pvData, 0, original_capacity);
-      if (AnsiToWide(lpValue, &name))
+      if (EnvBoxAuditEnabled() && AnsiToWide(lpValue, &name))
         EnvBoxAuditEventW("RegGetValueA", 1,
                           lpValue ? name.c_str() : L"(default)");
       return st;
     }
-    if (AnsiToWide(lpValue, &name))
+    if (EnvBoxAuditEnabled() && AnsiToWide(lpValue, &name))
       EnvBoxAuditEventW("RegGetValueA", 0,
                         lpValue ? name.c_str() : L"(default)");
   }

@@ -82,7 +82,11 @@ fn main() -> iced::Result {
         app::EnvBoxApp::view,
     )
     .theme(|_| iced::Theme::Dark)
-    .default_font(ui_font)
+    .settings(iced::Settings {
+        default_font: ui_font,
+        default_text_size: iced::Pixels(theme::TEXT_BODY),
+        ..Default::default()
+    })
     .window(iced::window::Settings {
         size: iced::Size::new(width, 880.0),
         decorations: false,

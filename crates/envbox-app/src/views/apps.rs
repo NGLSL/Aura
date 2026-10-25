@@ -20,9 +20,12 @@ fn ellipsize(s: &str, max: usize) -> String {
 
 pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
     let title = column![
-        text("应用").size(24).color(INK).font(font::name_font()),
+        text("应用")
+            .size(TEXT_PAGE_TITLE)
+            .color(INK)
+            .font(font::name_font()),
         text("为每次启动选择环境配置，应用仍在本机正常运行。")
-            .size(12)
+            .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font()),
     ]
@@ -31,7 +34,10 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
     let add_btn = button(
         row![
             text("+").size(15).color(INK).font(font::name_font()),
-            text("添加应用").size(13).color(INK).font(font::ui_font()),
+            text("添加应用")
+                .size(TEXT_BODY)
+                .color(INK)
+                .font(font::ui_font()),
         ]
         .spacing(4)
         .align_y(Alignment::Center),
@@ -45,6 +51,7 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
             icon(Icon::Search, MUTED, 13.0),
             text_input("搜索应用...", &app.search)
                 .on_input(Message::Search)
+                .size(TEXT_BODY)
                 .padding(Padding::from([3, 5]))
                 .style(borderless_input)
                 .font(font::ui_font()),
@@ -71,7 +78,7 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                 row![
                     icon(Icon::Play, INK, 11.0),
                     text("添加第一个应用")
-                        .size(13)
+                        .size(TEXT_BODY)
                         .color(INK)
                         .font(font::name_font()),
                 ]
@@ -93,11 +100,11 @@ pub fn view_center(app: &EnvBoxApp) -> Element<'_, Message> {
                 column![
                     icon(Icon::Search, MUTED, 24.0),
                     text("未找到匹配的应用")
-                        .size(13)
+                        .size(TEXT_BODY)
                         .color(INK_2)
                         .font(font::name_font()),
                     text("请检查搜索关键字或尝试其他应用名称")
-                        .size(12)
+                        .size(TEXT_CAPTION)
                         .color(MUTED)
                         .font(font::ui_font()),
                 ]
@@ -139,7 +146,7 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
         } else {
             "未运行".to_string()
         })
-        .size(12)
+        .size(TEXT_CAPTION)
         .color(if running_count > 0 { SUCCESS } else { MUTED })
         .font(font::ui_font()),
     ]
@@ -177,7 +184,7 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
         .unwrap_or_else(|| app_icon_badge(&a.name, 40.0));
 
     let mut heading = row![text(&a.name)
-        .size(15)
+        .size(TEXT_SECTION)
         .color(INK)
         .font(font::name_font())
         .width(Fill)]
@@ -196,7 +203,7 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
         heading = heading.push(
             tooltip(
                 icon(Icon::Info, MUTED, 12.0),
-                container(text(warning).size(12).font(font::ui_font()))
+                container(text(warning).size(TEXT_CAPTION).font(font::ui_font()))
                     .width(260)
                     .padding(10),
                 tooltip::Position::Right,
@@ -207,7 +214,7 @@ fn app_card<'a>(app: &'a EnvBoxApp, a: &'a envbox_core::Application) -> Element<
     let profile = ellipsize(&app.profile_name(a.default_profile_id), 32);
     let metadata = row![
         text(profile)
-            .size(12)
+            .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font())
             .width(Fill),

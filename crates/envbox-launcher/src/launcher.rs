@@ -100,6 +100,10 @@ pub mod win {
     #[derive(Debug)]
     pub struct SafeHandle(pub HANDLE);
 
+    // These owned process/thread handles have no thread affinity. Moving the
+    // owner transfers the sole CloseHandle obligation; it does not share it.
+    unsafe impl Send for SafeHandle {}
+
     impl Drop for SafeHandle {
         fn drop(&mut self) {
             if !self.0.is_invalid() {

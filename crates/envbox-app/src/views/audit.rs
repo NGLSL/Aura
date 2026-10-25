@@ -7,7 +7,10 @@ use crate::app::EnvBoxApp;
 use crate::font;
 use crate::icons::{icon, Icon};
 use crate::message::Message;
-use crate::theme::{self, pick_menu, pick_style, BORDER, FAINT, INK, INK_2, MUTED, SUCCESS_BG, SUCCESS_TEXT};
+use crate::theme::{
+    self, pick_menu, pick_style, BORDER, FAINT, INK, INK_2, MUTED, SUCCESS_BG, SUCCESS_TEXT,
+};
+use crate::theme::{TEXT_BODY, TEXT_CAPTION, TEXT_PAGE_TITLE};
 use crate::widgets::{badge, empty_state, primary_btn, secondary_btn};
 
 /// `2026-09-25T15:08:59.877Z` → `2026-09-25 15:08:59`.
@@ -37,12 +40,16 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let header = row![
         column![
-            text("安全审计").size(24).color(INK).font(font::name_font()),
-            text(format!(
-                "审计记录 · 显示 {} / 共捕获 {} 条 · 点击刷新更新记录",
-                shown, total
-            ))
-            .size(12)
+            text("安全审计")
+                .size(TEXT_PAGE_TITLE)
+                .color(INK)
+                .font(font::name_font()),
+            text(if app.audit_loading {
+                format!("正在加载审计记录… · 当前显示 {shown} / 共捕获 {total} 条")
+            } else {
+                format!("审计记录 · 显示 {shown} / 共捕获 {total} 条 · 点击刷新更新记录")
+            })
+            .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font()),
         ]
@@ -50,17 +57,25 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
         .width(Fill),
         row![
             pick_list(soft_opts, Some(filter_sel), |s: String| {
-                Message::AuditFilter(if s == "全部软件" { String::new() } else { s })
+                Message::AuditFilter(if s == "全部软件" {
+                    String::new()
+                } else {
+                    s
+                })
             })
             .style(pick_style)
             .menu_style(pick_menu)
+            .text_size(TEXT_BODY)
             .padding(Padding::from([7, 10]))
             .font(font::ui_font())
             .width(Length::Fixed(180.0)),
             button(
                 row![
                     icon(Icon::Folder, INK_2, 12.0),
-                    text("打开日志目录").size(12).color(INK_2).font(font::ui_font())
+                    text("打开日志目录")
+                        .size(TEXT_BODY)
+                        .color(INK_2)
+                        .font(font::ui_font())
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -71,26 +86,40 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
             button(
                 row![
                     icon(Icon::Document, INK_2, 12.0),
-                    text("刷新日志").size(12).color(INK_2).font(font::ui_font())
+                    text(if app.audit_loading {
+                        "加载中…"
+                    } else {
+                        "刷新日志"
+                    })
+                    .size(TEXT_BODY)
+                    .color(INK_2)
+                    .font(font::ui_font())
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
             )
             .padding(Padding::from([7, 14]))
             .style(secondary_btn)
-            .on_press(Message::AuditRefresh),
+            .on_press_maybe((!app.audit_loading).then_some(Message::AuditRefresh)),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
     ]
     .align_y(Alignment::Center);
 
-    let content: Element<_> = if shown == 0 {
+    let content: Element<_> = if app.audit_loading && shown == 0 {
+        empty_state(
+            Icon::Document,
+            "正在加载审计记录",
+            "日志在后台读取，您可以继续使用其他页面。",
+            None,
+        )
+    } else if shown == 0 {
         let guide_btn = button(
             row![
                 icon(Icon::Play, INK, 11.0),
                 text("前往应用配置开启审计")
-                    .size(13)
+                    .size(TEXT_BODY)
                     .color(INK)
                     .font(font::name_font()),
             ]
@@ -115,27 +144,27 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
         let table_header = container(
             row![
                 text("时间 (UTC)")
-                    .size(11)
+                    .size(TEXT_CAPTION)
                     .color(FAINT)
                     .font(font::ui_font())
                     .width(Length::Fixed(140.0)),
                 text("软件")
-                    .size(11)
+                    .size(TEXT_CAPTION)
                     .color(FAINT)
                     .font(font::ui_font())
                     .width(Length::Fixed(120.0)),
                 text("PID")
-                    .size(11)
+                    .size(TEXT_CAPTION)
                     .color(FAINT)
                     .font(font::ui_font())
                     .width(Length::Fixed(64.0)),
                 text("系统 API 拦截调用与虚拟化返回结果")
-                    .size(11)
+                    .size(TEXT_CAPTION)
                     .color(FAINT)
                     .font(font::ui_font())
                     .width(Fill),
                 text("判定状态")
-                    .size(11)
+                    .size(TEXT_CAPTION)
                     .color(FAINT)
                     .font(font::ui_font())
                     .width(Length::Fixed(90.0)),
@@ -170,22 +199,22 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
             let card = container(
                 row![
                     text(format_ts(&ev.ts_utc))
-                        .size(11)
+                        .size(TEXT_CAPTION)
                         .color(MUTED)
                         .font(font::ui_font())
                         .width(Length::Fixed(140.0)),
                     text(soft)
-                        .size(11)
+                        .size(TEXT_CAPTION)
                         .color(theme::ACCENT_TEXT)
                         .font(font::ui_font())
                         .width(Length::Fixed(120.0)),
                     text(format!("#{}", ev.pid))
-                        .size(11)
+                        .size(TEXT_CAPTION)
                         .color(MUTED)
                         .font(font::ui_font())
                         .width(Length::Fixed(64.0)),
                     text(call_str)
-                        .size(12)
+                        .size(TEXT_BODY)
                         .color(INK_2)
                         .font(font::name_font())
                         .width(Fill),
@@ -203,9 +232,7 @@ pub fn view_full(app: &EnvBoxApp) -> Element<'_, Message> {
 
         column![
             table_header,
-            scrollable(rows)
-                .height(Fill)
-                .style(theme::dark_scrollable)
+            scrollable(rows).height(Fill).style(theme::dark_scrollable)
         ]
         .spacing(6)
         .into()

@@ -7,6 +7,7 @@ use crate::app::EnvBoxApp;
 use crate::font;
 use crate::message::Message;
 use crate::theme::{BORDER_SOFT, DANGER_TEXT, INK, INK_2, MUTED, PANEL};
+use crate::theme::{TEXT_BODY, TEXT_TITLE};
 use crate::widgets::{primary_btn, secondary_btn};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
@@ -26,31 +27,31 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let mut content = column![
         text("有未保存的修改")
-            .size(20)
+            .size(TEXT_TITLE)
             .color(INK)
             .font(font::name_font()),
         text("离开前要保存当前编辑的内容吗？")
-            .size(12)
+            .size(TEXT_BODY)
             .color(INK_2)
             .font(font::ui_font()),
     ]
     .spacing(14);
 
     if let Some(error) = &app.unsaved_error {
-        content = content.push(text(error).size(12).color(DANGER_TEXT));
+        content = content.push(text(error).size(TEXT_BODY).color(DANGER_TEXT));
     }
 
     content = content.push(
         row![
-            button(text("继续编辑").size(12).color(MUTED))
+            button(text("继续编辑").size(TEXT_BODY).color(MUTED))
                 .on_press(Message::UnsavedCancel)
                 .padding(Padding::from([8, 14]))
                 .style(secondary_btn),
-            button(text("放弃修改").size(12).color(INK_2))
+            button(text("放弃修改").size(TEXT_BODY).color(INK_2))
                 .on_press(Message::UnsavedDiscard)
                 .padding(Padding::from([8, 14]))
                 .style(secondary_btn),
-            button(text("保存并继续").size(12).color(INK))
+            button(text("保存并继续").size(TEXT_BODY).color(INK))
                 .on_press(Message::UnsavedSave)
                 .padding(Padding::from([8, 14]))
                 .style(primary_btn),

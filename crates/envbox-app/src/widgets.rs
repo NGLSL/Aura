@@ -12,26 +12,39 @@ use crate::theme::{
 
 pub fn field_label(s: &str) -> Element<'static, Message> {
     text(s.to_string())
-        .size(12)
+        .size(theme::TEXT_BODY)
         .color(INK_2)
         .font(font::name_font())
         .into()
 }
 
-pub fn form_row<'a>(
+pub fn form_field<'a>(
     label: &'a str,
     field: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    row![
-        text(label.to_string())
-            .size(12)
-            .color(MUTED)
-            .font(font::ui_font())
-            .width(Length::Fixed(88.0)),
-        field.into(),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Start)
+    column![field_label(label), field.into()]
+        .spacing(6)
+        .width(Fill)
+        .into()
+}
+
+pub fn form_section<'a>(
+    title: &'a str,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(
+        column![
+            text(title)
+                .size(theme::TEXT_SECTION)
+                .color(INK)
+                .font(font::name_font()),
+            content.into(),
+        ]
+        .spacing(theme::FORM_SPACING),
+    )
+    .padding(12)
+    .width(Fill)
+    .style(theme::panel_card_style)
     .into()
 }
 
@@ -47,10 +60,10 @@ pub fn searchable_select(
     _on_query: fn(String) -> Message,
     on_pick: fn(crate::message::ComboField, String) -> Message,
 ) -> Element<'static, Message> {
-    use iced::widget::{scrollable, text_input};
     use crate::icons::Icon;
     use crate::message::ComboField;
     use crate::options::{option_label, OptionKind};
+    use iced::widget::{scrollable, text_input};
 
     let kind = match field {
         ComboField::Region => OptionKind::Region,
@@ -76,17 +89,21 @@ pub fn searchable_select(
     let header = button(
         row![
             text(display)
-                .size(12)
+                .size(theme::TEXT_BODY)
                 .color(display_color)
                 .font(font::ui_font()),
             iced::widget::Space::new(Fill, 1.0),
-            icon(Icon::ChevronDown, if open { ACCENT_LINE } else { MUTED }, 11.0),
+            icon(
+                Icon::ChevronDown,
+                if open { ACCENT_LINE } else { MUTED },
+                11.0
+            ),
         ]
         .spacing(4)
         .align_y(Alignment::Center),
     )
     .width(Fill)
-    .padding(Padding::from([5, 8]))
+    .padding(Padding::from([8, 10]))
     .style(theme::combo_btn)
     .on_press(Message::ComboToggle(field));
 
@@ -99,7 +116,7 @@ pub fn searchable_select(
     if filtered.is_empty() {
         list = list.push(
             text("无匹配项")
-                .size(11)
+                .size(theme::TEXT_CAPTION)
                 .color(MUTED)
                 .font(font::ui_font())
                 .width(Fill),
@@ -113,17 +130,25 @@ pub fn searchable_select(
                 button(
                     row![
                         text(label)
-                            .size(12)
+                            .size(theme::TEXT_BODY)
                             .color(if selected { ACCENT_LINE } else { INK_2 })
                             .font(font::ui_font()),
                         iced::widget::Space::new(Fill, 1.0),
-                        icon(Icon::Check, if selected { ACCENT_LINE } else { Color::TRANSPARENT }, 11.0),
+                        icon(
+                            Icon::Check,
+                            if selected {
+                                ACCENT_LINE
+                            } else {
+                                Color::TRANSPARENT
+                            },
+                            11.0
+                        ),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
                 )
                 .width(Fill)
-                .padding(Padding::from([6, 8]))
+                .padding(Padding::from([8, 10]))
                 .style(theme::combo_option)
                 .on_press(on_pick(field, raw)),
             );
@@ -134,7 +159,8 @@ pub fn searchable_select(
         column![
             text_input("输入以搜索…", &query)
                 .on_input(Message::ComboQuery)
-                .padding(Padding::from([5, 8]))
+                .size(theme::TEXT_BODY)
+                .padding(Padding::from([8, 10]))
                 .style(input_style)
                 .font(font::ui_font())
                 .width(Fill),
@@ -154,14 +180,15 @@ pub fn searchable_select(
 pub fn kv_row(label: &str, value: &str) -> Element<'static, Message> {
     row![
         text(label.to_string())
-            .size(12)
+            .size(theme::TEXT_BODY)
             .color(MUTED)
             .font(font::ui_font())
-            .width(Length::Fixed(90.0)),
+            .width(Length::Fixed(100.0)),
         text(value.to_string())
-            .size(12)
+            .size(theme::TEXT_BODY)
             .color(INK_2)
-            .font(font::ui_font()),
+            .font(font::ui_font())
+            .width(Fill),
     ]
     .spacing(12)
     .into()
@@ -169,19 +196,22 @@ pub fn kv_row(label: &str, value: &str) -> Element<'static, Message> {
 
 pub fn status_dot(color: Color) -> Element<'static, Message> {
     // Pure geometric circular status indicator (exact pixel-centered dot).
-    container(iced::widget::Space::new(Length::Fixed(7.0), Length::Fixed(7.0)))
-        .width(Length::Fixed(7.0))
-        .height(Length::Fixed(7.0))
-        .style(move |_| container::Style {
-            background: Some(iced::Background::Color(color)),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 3.5.into(),
-            },
-            ..Default::default()
-        })
-        .into()
+    container(iced::widget::Space::new(
+        Length::Fixed(7.0),
+        Length::Fixed(7.0),
+    ))
+    .width(Length::Fixed(7.0))
+    .height(Length::Fixed(7.0))
+    .style(move |_| container::Style {
+        background: Some(iced::Background::Color(color)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 3.5.into(),
+        },
+        ..Default::default()
+    })
+    .into()
 }
 
 pub fn toggle(on: bool, msg: fn(bool) -> Message) -> Element<'static, Message> {
@@ -237,7 +267,7 @@ pub fn toggle(on: bool, msg: fn(bool) -> Message) -> Element<'static, Message> {
 pub fn badge(label: &str, bg: Color, fg: Color) -> Element<'static, Message> {
     container(
         text(label.to_string())
-            .size(11)
+            .size(theme::TEXT_CAPTION)
             .color(fg)
             .font(font::ui_font()),
     )
@@ -378,7 +408,7 @@ pub fn underline_tab_button<T: Copy + PartialEq + 'static>(
     }
     row_items = row_items.push(
         text(label.to_string())
-            .size(12)
+            .size(theme::TEXT_BODY)
             .color(color)
             .font(font::ui_font()),
     );
@@ -444,11 +474,11 @@ pub fn empty_state<'a, Message: 'static>(
     let mut col = column![
         icon_circle,
         text(title)
-            .size(17)
+            .size(theme::TEXT_TITLE)
             .color(INK)
             .font(font::name_font()),
         text(desc)
-            .size(13)
+            .size(theme::TEXT_BODY)
             .color(MUTED)
             .font(font::ui_font()),
     ]
