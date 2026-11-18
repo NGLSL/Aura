@@ -190,6 +190,7 @@ pub struct AppPickerState {
     pub scanned: bool,
     pub loading: bool,
     pub icon_requests: HashSet<String>,
+    pub terminal_shells: Option<Vec<crate::discover_commands::TerminalShell>>,
 }
 
 impl EnvBoxApp {
@@ -548,6 +549,14 @@ impl EnvBoxApp {
             Message::AppPickerUseSelected => {
                 return self.apply_picker_selection();
             }
+            Message::AppPickerUseTerminalShell(index) => {
+                return self.apply_terminal_shell_selection(index);
+            }
+            Message::AppPickerBack => {
+                if let Some(picker) = self.app_picker.as_mut() {
+                    picker.terminal_shells = None;
+                }
+            }
             Message::AppPickerManual => {
                 self.app_picker = None;
                 self.app_draft =
@@ -886,17 +895,17 @@ impl EnvBoxApp {
                 return Task::batch([save_task, self.perform_navigation(action)]);
             }
             Message::WindowDrag => {
-                return iced::window::get_latest()
+                return iced::window::latest()
                     .then(|id| id.map(iced::window::drag).unwrap_or_else(Task::none))
             }
             Message::WindowMinimize => {
-                return iced::window::get_latest().then(|id| {
+                return iced::window::latest().then(|id| {
                     id.map(|id| iced::window::minimize(id, true))
                         .unwrap_or_else(Task::none)
                 })
             }
             Message::WindowToggleMaximize => {
-                return iced::window::get_latest().then(|id| {
+                return iced::window::latest().then(|id| {
                     id.map(iced::window::toggle_maximize)
                         .unwrap_or_else(Task::none)
                 })
@@ -945,10 +954,10 @@ impl EnvBoxApp {
                 #[cfg(windows)]
                 {
                     let was_hidden = self.tray.take().is_some();
-                    return iced::window::get_latest().then(move |id| {
+                    return iced::window::latest().then(move |id| {
                         id.map(|id| {
                             let reveal = if was_hidden {
-                                iced::window::change_mode(id, iced::window::Mode::Windowed)
+                                iced::window::set_mode(id, iced::window::Mode::Windowed)
                             } else {
                                 Task::none()
                             };
@@ -979,6 +988,69 @@ pub fn status_label(s: InstanceStatus) -> &'static str {
         InstanceStatus::Stopping => "Stopping",
         InstanceStatus::Exited => "Exited",
         InstanceStatus::Failed => "Failed",
+    }
+}
+
+#[cfg(test)]
+mod picker_ime_tests {
+    use super::*;
+    use iced::advanced::{clipboard, input_method, layout, widget::Tree, InputMethod, Layout, Shell};
+    use iced::{mouse, Event, Pixels, Point, Rectangle, Size};
+
+    #[test]
+    fn picker_search_accepts_committed_chinese_without_searching_preedit() {
+        let root = std::env::temp_dir().join(format!("aura-picker-ime-{}", Uuid::new_v4()));
+        let (mut app, _) = EnvBoxApp::new_with_store(ConfigStore::new(&root));
+        app.app_picker = Some(AppPickerState::default());
+
+        let renderer = iced::Renderer::new(crate::font::install(), Pixels(16.0));
+        let size = Size::new(1000.0, 700.0);
+        let viewport = Rectangle::with_size(size);
+        let mut picker = app.view();
+        let mut tree = Tree::new(&picker);
+        let node = picker
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+        let layout = Layout::new(&node);
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        let cursor = mouse::Cursor::Available(Point::new(500.0, 164.0));
+        let mut dispatch = |event, shell: &mut Shell<'_, Message>| {
+            picker.as_widget_mut().update(
+                &mut tree,
+                &event,
+                layout,
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                shell,
+                &viewport,
+            );
+        };
+        dispatch(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), &mut shell);
+        dispatch(Event::InputMethod(input_method::Event::Opened), &mut shell);
+        dispatch(
+            Event::InputMethod(input_method::Event::Preedit("zhong".into(), Some(0..5))),
+            &mut shell,
+        );
+        dispatch(
+            Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now())),
+            &mut shell,
+        );
+        assert!(matches!(shell.input_method(), InputMethod::Enabled { preedit: Some(preedit), .. } if preedit.content == "zhong"));
+        assert!(shell.is_empty());
+
+        dispatch(
+            Event::InputMethod(input_method::Event::Commit("中文".into())),
+            &mut shell,
+        );
+        drop(picker);
+        let [Message::AppPickerQuery(query)] = messages.as_slice() else {
+            panic!("IME must produce exactly one picker search update");
+        };
+        let _ = app.update(Message::AppPickerQuery(query.clone()));
+        assert_eq!(app.app_picker.as_ref().unwrap().query, "中文");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

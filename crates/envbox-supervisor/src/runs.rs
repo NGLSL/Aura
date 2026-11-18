@@ -749,6 +749,13 @@ impl Runs {
             }
         }
     }
+
+    pub(crate) fn has_tracked_jobs(&self) -> bool {
+        self.running
+            .values()
+            .any(|run| run.job.is_some() || run.observation_job.is_some())
+    }
+
     pub(crate) fn control(
         &mut self,
         request_id: &str,

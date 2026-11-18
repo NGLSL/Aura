@@ -14,7 +14,7 @@
 #include "ipc_bootstrap.h"
 #include "startup_gate.h"
 
-static int g_hook_counts[11] = {};
+static int g_hook_counts[12] = {};
 
 static int InstallAllHooks() {
   DetourTransactionBegin();
@@ -73,6 +73,7 @@ static int InstallAllHooks() {
     // Commit already ended the transaction. Run un-hooked (Fail Open).
     return 0;
   }
+  ok += g_hook_counts[11] = EnvBoxInstallUserLanguageHooks();
   char msg[128];
   _snprintf_s(msg, sizeof(msg), _TRUNCATE,
               "EnvBox Runtime hooks attached=%d (required policies validated)\n", ok);
@@ -103,7 +104,8 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
       return FALSE;
     }
     SetEnvironmentVariableA("ENVBOX_RUNTIME_LOADED", "1");
-    if (!EnvBoxIpcNotifyRuntimeIdentity(instance, g_hook_counts, 11)) {
+    if (!EnvBoxIpcNotifyRuntimeIdentity(instance, g_hook_counts,
+                                        ARRAYSIZE(g_hook_counts))) {
       EnvBoxRecoveryJobClose();
       return FALSE;
     }

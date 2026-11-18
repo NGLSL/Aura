@@ -28,6 +28,18 @@ impl DiscoveredApp {
         !matches!(self.capability.packaging, Packaging::Win32)
     }
 
+    pub fn is_windows_terminal_package(&self) -> bool {
+        if let Some(aumid) = envbox_launcher::extract_aumid(&self.path) {
+            return [
+                "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App",
+                "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe!App",
+            ]
+            .iter()
+            .any(|terminal| aumid.eq_ignore_ascii_case(terminal));
+        }
+        self.source == "windows-apps" && self.name.eq_ignore_ascii_case("wt")
+    }
+
     pub fn icon_key(&self) -> String {
         format!("{}|{}", self.path.to_lowercase(), self.icon_src.to_lowercase())
     }

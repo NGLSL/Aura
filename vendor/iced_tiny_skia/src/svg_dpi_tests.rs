@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::{Radians, Size, Svg};
 
-const SCALES: [f64; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
+const SCALES: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
 const BOUNDS: Rectangle = Rectangle {
     x: 40.0,
     y: 32.0,
@@ -15,25 +15,29 @@ fn svg() -> Svg {
     ))
 }
 
-fn render(scale: f64, svg: Svg, clip: Option<Rectangle>) -> tiny_skia::Pixmap {
+fn render(scale: f32, svg: Svg, clip: Option<Rectangle>) -> tiny_skia::Pixmap {
     let viewport = Viewport::with_physical_size(Size::new(256, 256), scale);
     let mut renderer = Renderer::new(Font::default(), Pixels(16.0));
     if let Some(clip) = clip {
         core::Renderer::start_layer(&mut renderer, clip);
     }
-    core::svg::Renderer::draw_svg(&mut renderer, svg, BOUNDS);
+    core::svg::Renderer::draw_svg(
+        &mut renderer,
+        svg,
+        BOUNDS,
+        Rectangle::with_size(viewport.logical_size()),
+    );
     if clip.is_some() {
         core::Renderer::end_layer(&mut renderer);
     }
     let mut pixels = tiny_skia::Pixmap::new(256, 256).unwrap();
     let mut mask = tiny_skia::Mask::new(256, 256).unwrap();
-    renderer.draw::<&str>(
+    renderer.draw(
         &mut pixels.as_mut(),
         &mut mask,
         &viewport,
         &[Rectangle::with_size(viewport.logical_size())],
         Color::TRANSPARENT,
-        &[],
     );
     pixels
 }
@@ -58,7 +62,6 @@ fn alpha_bounds(pixels: &tiny_skia::Pixmap) -> (u32, u32, u32, u32) {
 fn svg_pixels_match_physical_bounds_at_each_dpi() {
     for scale in SCALES {
         let pixels = render(scale, svg(), None);
-        let scale = scale as f32;
         let expected = (
             (BOUNDS.x * scale) as u32,
             (BOUNDS.y * scale) as u32,
@@ -90,7 +93,6 @@ fn svg_rotation_tint_and_opacity_survive_dpi_scaling() {
                 .opacity(0.5_f32),
             None,
         );
-        let scale = scale as f32;
         let expected = (
             (44.0 * scale) as u32,
             (28.0 * scale) as u32,
@@ -128,7 +130,6 @@ fn svg_layer_clip_stays_in_physical_coordinates() {
     };
     for scale in SCALES {
         let pixels = render(scale, svg(), Some(clip));
-        let scale = scale as f32;
         assert_eq!(
             alpha_bounds(&pixels),
             (

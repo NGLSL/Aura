@@ -19,6 +19,46 @@ use crate::discover::DiscoveredApp;
 const MAX_PATH_ROOTS: usize = 128;
 const COMMAND_SOURCE: &str = "commands";
 
+#[derive(Debug, Clone)]
+pub struct TerminalShell {
+    pub name: &'static str,
+    pub command: String,
+}
+
+pub fn installed_terminal_shells() -> Vec<TerminalShell> {
+    let system = std::env::var_os("SystemRoot").map(|root| PathBuf::from(root).join("System32"));
+    [
+        (
+            "PowerShell 7",
+            envbox_launcher::instance::resolve_powershell7(None).ok(),
+        ),
+        (
+            "Windows PowerShell",
+            system
+                .as_ref()
+                .map(|root| root.join(r"WindowsPowerShell\v1.0\powershell.exe")),
+        ),
+        (
+            "命令提示符",
+            system.as_ref().map(|root| root.join("cmd.exe")),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| {
+        let path = path?;
+        let command = path.to_str()?;
+        if !path.is_absolute() || !path.is_file() || envbox_launcher::is_windows_apps_path(command)
+        {
+            return None;
+        }
+        Some(TerminalShell {
+            name,
+            command: command.to_string(),
+        })
+    })
+    .collect()
+}
+
 pub fn collect_command_apps(
     seen: &mut HashSet<String>,
     out: &mut Vec<DiscoveredApp>,

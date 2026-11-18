@@ -1,12 +1,14 @@
 //! Local installed-app picker overlay (search + icons + capability badges).
 
 use iced::widget::{
-    button, column, container, image, mouse_area, row, scrollable, text, text_input, Space,
+    button, column, container, image, mouse_area, row, scrollable, text, text_input, Container, Row,
+    Space,
 };
 use iced::{Alignment, Element, Fill, Length, Padding};
 
-use crate::app::EnvBoxApp;
+use crate::app::{AppPickerState, EnvBoxApp};
 use crate::discover::DiscoveredApp;
+use crate::discover_commands::TerminalShell;
 use crate::font;
 use crate::icons::{icon, Icon};
 use crate::message::Message;
@@ -16,11 +18,11 @@ use crate::widgets::{badge, primary_btn, secondary_btn};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let Some(state) = app.app_picker.as_ref() else {
-        return Space::new(Length::Fill, Length::Fill).into();
+        return Space::new().width(Fill).height(Fill).into();
     };
 
     let dim = mouse_area(
-        container(Space::new(Length::Fill, Length::Fill))
+        container(Space::new().width(Fill).height(Fill))
             .width(Fill)
             .height(Fill)
             .style(|_| container::Style {
@@ -35,12 +37,45 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     )
     .on_press(Message::AppPickerClose);
 
+    let panel = match &state.terminal_shells {
+        Some(shells) => terminal_shell_picker(shells),
+        None => application_picker(app, state),
+    }
+    .style(|_| container::Style {
+        background: Some(iced::Background::Color(PANEL)),
+        text_color: Some(INK),
+        border: iced::Border {
+            color: BORDER_SOFT,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Default::default()
+    });
+
+    container(
+        iced::widget::stack![
+            dim,
+            container(panel)
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill),
+        ]
+        .width(Fill)
+        .height(Fill),
+    )
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn picker_header(title: &'static str, subtitle: &'static str) -> Row<'static, Message> {
     let title = column![
-        text("选择应用")
+        text(title)
             .size(TEXT_TITLE)
             .color(INK)
             .font(font::name_font()),
-        text("从本机应用或命令行工具中选择。商店 / AppContainer 目标可能无法注入 Runtime。")
+        text(subtitle)
             .size(TEXT_CAPTION)
             .color(MUTED)
             .font(font::ui_font()),
@@ -52,10 +87,16 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         .style(secondary_btn)
         .on_press(Message::AppPickerClose);
 
-    let header = row![title.width(Fill), close_btn]
+    row![title.width(Fill), close_btn]
         .spacing(12)
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+}
 
+fn application_picker<'a>(app: &'a EnvBoxApp, state: &'a AppPickerState) -> Container<'a, Message> {
+    let header = picker_header(
+        "选择应用",
+        "从本机应用或命令行工具中选择。商店 / AppContainer 目标可能无法注入 Runtime。",
+    );
     let search = container(
         row![
             icon(Icon::Search, MUTED, 13.0),
@@ -140,10 +181,19 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     .style(secondary_btn)
     .on_press(Message::AppPickerManual);
 
+    let use_label = if state
+        .selected
+        .and_then(|index| state.items.get(index))
+        .is_some_and(DiscoveredApp::is_windows_terminal_package)
+    {
+        "选择 Shell"
+    } else {
+        "使用所选"
+    };
     let use_btn = button(
         row![
             icon(Icon::Play, INK, 11.0),
-            text("使用所选")
+            text(use_label)
                 .size(TEXT_BODY)
                 .color(INK)
                 .font(font::name_font()),
@@ -159,39 +209,61 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
         .spacing(10)
         .align_y(Alignment::Center);
 
-    let panel = container(
+    container(
         column![header, search, list, footer]
             .spacing(12)
             .padding(Padding::from([18, 20])),
     )
     .width(Length::Fixed(720.0))
     .height(Length::Fixed(560.0))
-    .style(|_| container::Style {
-        background: Some(iced::Background::Color(PANEL)),
-        text_color: Some(INK),
-        border: iced::Border {
-            color: BORDER_SOFT,
-            width: 1.0,
-            radius: 12.0.into(),
-        },
-        ..Default::default()
-    });
+}
 
-    container(
-        iced::widget::stack![
-            dim,
-            container(panel)
+fn terminal_shell_picker(shells: &[TerminalShell]) -> Container<'_, Message> {
+    let choices = shells.iter().enumerate().fold(
+        column![].spacing(6),
+        |choices, (index, shell)| {
+            let label = column![
+                text(shell.name)
+                    .size(TEXT_BODY)
+                    .color(INK)
+                    .font(font::name_font()),
+                text(ellipsize(&shell.command, 65))
+                    .size(TEXT_CAPTION)
+                    .color(MUTED)
+                    .font(font::ui_font()),
+            ]
+            .spacing(4);
+            choices.push(
+                button(
+                    row![icon(Icon::Terminal, MUTED, 18.0), label]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([9, 12]))
                 .width(Fill)
-                .height(Fill)
-                .center_x(Fill)
-                .center_y(Fill),
+                .style(secondary_btn)
+                .on_press(Message::AppPickerUseTerminalShell(Some(index))),
+            )
+        },
+    );
+    let back = button(text("返回").size(TEXT_BODY).font(font::name_font()))
+        .padding(Padding::from([8, 14]))
+        .style(secondary_btn)
+        .on_press(Message::AppPickerBack);
+    let manual = button(text("填写其他 Shell").size(TEXT_BODY).font(font::name_font()))
+        .padding(Padding::from([8, 14]))
+        .style(secondary_btn)
+        .on_press(Message::AppPickerUseTerminalShell(None));
+    container(
+        column![
+            picker_header("选择要托管的 Shell", "在 Windows Terminal 中打开所选 Shell。"),
+            choices,
+            row![back, Space::new().width(Fill), manual].spacing(8),
         ]
-        .width(Fill)
-        .height(Fill),
+        .spacing(12)
+        .padding(Padding::from([18, 20])),
     )
-    .width(Fill)
-    .height(Fill)
-    .into()
+    .width(Length::Fixed(520.0))
 }
 
 fn item_row<'a>(idx: usize, item: &'a DiscoveredApp, selected: bool) -> Element<'a, Message> {

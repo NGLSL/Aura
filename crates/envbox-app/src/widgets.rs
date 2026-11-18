@@ -92,7 +92,7 @@ pub fn searchable_select(
                 .size(theme::TEXT_BODY)
                 .color(display_color)
                 .font(font::ui_font()),
-            iced::widget::Space::new(Fill, 1.0),
+            iced::widget::Space::new().width(Fill).height(1.0),
             icon(
                 Icon::ChevronDown,
                 if open { ACCENT_LINE } else { MUTED },
@@ -133,7 +133,7 @@ pub fn searchable_select(
                             .size(theme::TEXT_BODY)
                             .color(if selected { ACCENT_LINE } else { INK_2 })
                             .font(font::ui_font()),
-                        iced::widget::Space::new(Fill, 1.0),
+                        iced::widget::Space::new().width(Fill).height(1.0),
                         icon(
                             Icon::Check,
                             if selected {
@@ -196,10 +196,7 @@ pub fn kv_row(label: &str, value: &str) -> Element<'static, Message> {
 
 pub fn status_dot(color: Color) -> Element<'static, Message> {
     // Pure geometric circular status indicator (exact pixel-centered dot).
-    container(iced::widget::Space::new(
-        Length::Fixed(7.0),
-        Length::Fixed(7.0),
-    ))
+    container(iced::widget::Space::new().width(7.0).height(7.0))
     .width(Length::Fixed(7.0))
     .height(Length::Fixed(7.0))
     .style(move |_| container::Style {
@@ -369,7 +366,7 @@ pub fn app_icon_badge(name: &str, size: f32) -> Element<'static, Message> {
         let (ga, gb) = theme::app_gradient(name);
         container(
             text(app_initials(name))
-                .size((size * 0.38) as u16)
+                .size((size * 0.38).trunc())
                 .color(INK)
                 .font(font::name_font()),
         )

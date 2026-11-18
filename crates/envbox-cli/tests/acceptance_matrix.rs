@@ -110,6 +110,8 @@ fn host_probe_fields() -> Vec<(String, String)> {
         "GetUserDefaultGeoName:",
         "GetUserDefaultLocaleName:",
         "GetUserDefaultUILanguage:",
+        "GetUserLanguages:",
+        "GetUserLanguageInputMethods_First:",
         "GetNetworkParams:",
     ];
     keys.iter()
@@ -144,6 +146,11 @@ fn acceptance_host_and_us_probe_values() {
     assert_eq!(field_after(&run_out, "GetUserDefaultGeoName:"), "US");
     assert_eq!(field_after(&run_out, "GetUserDefaultLocaleName:"), "en-US");
     assert_eq!(field_after(&run_out, "GetUserDefaultUILanguage:"), "0x0409");
+    assert_eq!(field_after(&run_out, "GetUserLanguages:"), "en-US");
+    assert_eq!(
+        field_after(&run_out, "GetUserLanguageInputMethods_First:"),
+        "0409:00000409"
+    );
     assert_eq!(
         field_after(&run_out, "GetDynamicTimeZoneInformation:"),
         "Pacific Standard Time"

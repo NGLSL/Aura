@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -51,6 +51,42 @@ fn pause(end: Instant, cancel: Option<&AtomicBool>) -> io::Result<()> {
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const EXIT_WITH_GUI: &str = "--exit-with-gui";
+
+fn gui_mutex_name() -> Vec<u16> {
+    wide(&format!("{GUI_SINGLETON_NAME}.Mutex"))
+}
+
+fn mutex_exists(name: &[u16]) -> io::Result<bool> {
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => {
+            drop(Handle(handle));
+            Ok(true)
+        }
+        Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct SupervisorLifetime {
+    gui_mutex: Vec<u16>,
+    saw_gui: bool,
+    managers: HashMap<u32, Handle>,
+}
+
+impl SupervisorLifetime {
+    fn idle_after_gui(&mut self) -> bool {
+        self.managers.retain(|_, process| {
+            let wait = unsafe { WaitForSingleObject(process.0, 0) };
+            wait != WAIT_OBJECT_0
+        });
+        let Ok(gui_open) = mutex_exists(&self.gui_mutex) else {
+            return false;
+        };
+        self.saw_gui |= gui_open;
+        self.saw_gui && !gui_open && self.managers.is_empty()
+    }
+}
 
 // The server owns an overlapped pipe; clients retain the existing NOWAIT
 // handle. Every server operation has its own stable OVERLAPPED and event.
@@ -183,11 +219,10 @@ unsafe fn token_data(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Resul
     }?;
     Ok(data)
 }
-fn principal(pid: u32) -> io::Result<Principal> {
+fn principal(process: HANDLE) -> io::Result<Principal> {
     unsafe {
-        let process = Handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
         let mut token = HANDLE::default();
-        OpenProcessToken(process.0, TOKEN_QUERY, &mut token)?;
+        OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
         let token = Handle(token);
         let user = token_data(token.0, TokenUser)?;
         let sid = (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid;
@@ -218,13 +253,16 @@ fn pipe_name(owner: &Principal) -> String {
     format!(r"\\.\pipe\aura-supervisor-{}", scope(owner))
 }
 
-fn image(pid: u32) -> io::Result<PathBuf> {
+fn supervisor_mutex_name(owner: &Principal) -> Vec<u16> {
+    wide(&format!(r"Local\AuraSupervisor-{}", scope(owner)))
+}
+
+fn image(process: HANDLE) -> io::Result<PathBuf> {
     unsafe {
-        let process = Handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
         let mut buffer = vec![0u16; 32768];
         let mut size = buffer.len() as u32;
         QueryFullProcessImageNameW(
-            process.0,
+            process,
             PROCESS_NAME_WIN32,
             PWSTR(buffer.as_mut_ptr()),
             &mut size,
@@ -283,13 +321,17 @@ pub struct ManagedTarget {
 }
 impl ManagedTarget {
     pub fn observe(pid: u32) -> io::Result<Self> {
+        let process = Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }?);
+        Self::from_process(pid, process.0)
+    }
+
+    fn from_process(pid: u32, process: HANDLE) -> io::Result<Self> {
         unsafe {
-            let process = Handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
             let mut creation = FILETIME::default();
             let mut exit = FILETIME::default();
             let mut kernel = FILETIME::default();
             let mut user = FILETIME::default();
-            GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user)?;
+            GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user)?;
             Ok(Self {
                 pid,
                 creation_time: (u64::from(creation.dwHighDateTime) << 32)
@@ -318,22 +360,25 @@ impl ServerConfig {
     }
 }
 
-fn authenticate(pipe: HANDLE, owner: &Principal, config: &ServerConfig) -> io::Result<()> {
+fn authenticate(pipe: HANDLE, owner: &Principal, config: &ServerConfig) -> io::Result<(u32, Handle)> {
     let mut pid = 0;
     unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }?;
-    if principal(pid)? != *owner {
+    let process = Handle(unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid)
+    }?);
+    if principal(process.0)? != *owner {
         return Err(denied("owner/integrity mismatch"));
     }
     if config
         .managed_targets
         .lock()
         .map_err(|_| denied("target registry unavailable"))?
-        .contains(&ManagedTarget::observe(pid)?)
+        .contains(&ManagedTarget::from_process(pid, process.0)?)
         || has_runtime(pid)?
     {
         return Err(denied("Runtime targets cannot manage Supervisor"));
     }
-    let path = image(pid)?;
+    let path = image(process.0)?;
     let hash = file_hash(&path)?;
     if !config
         .approved_managers
@@ -342,7 +387,7 @@ fn authenticate(pipe: HANDLE, owner: &Principal, config: &ServerConfig) -> io::R
     {
         return Err(denied("unapproved management image"));
     }
-    Ok(())
+    Ok((pid, process))
 }
 
 fn receive(
@@ -447,17 +492,22 @@ fn send<T: Serialize>(
 }
 
 pub fn run_default() -> io::Result<()> {
-    serve(ServerConfig::production()?)
+    let exit_with_gui = std::env::args_os().skip(1).any(|arg| arg == EXIT_WITH_GUI);
+    serve_inner(ServerConfig::production()?, exit_with_gui)
 }
 
-/// Runs until `stop` is set. Client disconnects never stop the owner process.
+/// Serves until explicitly stopped or the GUI has closed and all tracked work has ended.
 pub fn serve(config: ServerConfig) -> io::Result<()> {
+    serve_inner(config, false)
+}
+
+fn serve_inner(config: ServerConfig, exit_with_gui: bool) -> io::Result<()> {
     if has_runtime(std::process::id())? {
         return Err(denied("Runtime cannot host Supervisor management"));
     }
-    let owner = principal(std::process::id())?;
-    let mutex_name = wide(&format!(r"Local\AuraSupervisor-{}", scope(&owner)));
-    let lock = Handle(unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) }?);
+    let owner = principal(unsafe { GetCurrentProcess() })?;
+    let mutex_name = supervisor_mutex_name(&owner);
+    let _lock = Handle(unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) }?);
     // Last-error is read immediately; an existing owner (including an abandoned
     // mutex that remains open) is not taken over by a second server.
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -479,6 +529,12 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
     if pipe.0 == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
+    let gui_mutex = gui_mutex_name();
+    let mut lifetime = SupervisorLifetime {
+        saw_gui: exit_with_gui || mutex_exists(&gui_mutex).unwrap_or(false),
+        gui_mutex,
+        managers: HashMap::new(),
+    };
     let generation = uuid::Uuid::new_v4().to_string();
     let mut runs = crate::runs::Runs::new(
         config.store.clone(),
@@ -489,6 +545,7 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
     'accept: while !config.stop.load(Ordering::Acquire) {
         if refreshed.elapsed() >= REFRESH_INTERVAL {
             runs.refresh();
+            lifetime.idle_after_gui();
             refreshed = Instant::now();
         }
         let mut operation = PipeOperation::new(pipe.0)?;
@@ -502,14 +559,18 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
                         if config.stop.load(Ordering::Acquire) {
                             return Ok(());
                         }
-                        if refreshed.elapsed() >= REFRESH_INTERVAL {
-                            runs.refresh();
-                            refreshed = Instant::now();
-                        }
                         let wait = REFRESH_INTERVAL.saturating_sub(refreshed.elapsed());
                         match operation.wait(wait) {
                             Ok(Some(_)) => break,
-                            Ok(None) => {}
+                            Ok(None) => {
+                                runs.refresh();
+                                refreshed = Instant::now();
+                                // Prefer a waiting connection over idle
+                                // shutdown and finish accepted work first.
+                                if lifetime.idle_after_gui() && !runs.has_tracked_jobs() {
+                                    return Ok(());
+                                }
+                            }
                             Err(error)
                                 if error.raw_os_error().is_some_and(|code| {
                                     matches!(
@@ -548,7 +609,15 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
         let request = receive(pipe.0, end, Some(&config.stop), PipeMode::Overlapped)
             .and_then(|bytes| serde_json::from_slice::<Request>(&bytes).map_err(Into::into));
         if let Ok(request) = request {
-            let status = if authenticated.is_err() {
+            let is_authenticated = authenticated.is_ok();
+            if request.version == PROTOCOL_VERSION {
+                if let Ok((pid, process)) = authenticated {
+                    // Keep an approved manager alive between Ping and its next
+                    // request, even if Aura closes between the two connections.
+                    lifetime.managers.insert(pid, process);
+                }
+            }
+            let status = if !is_authenticated {
                 "AuthenticationDenied"
             } else if request.version != PROTOCOL_VERSION {
                 "VersionMismatch"
@@ -569,7 +638,7 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
             } else {
                 "Unsupported"
             };
-            let (status, run, instances) = if authenticated.is_ok()
+            let (status, run, instances) = if is_authenticated
                 && request.version == PROTOCOL_VERSION
                 && request
                     .generation
@@ -598,7 +667,7 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
                     }
                     None => ("InvalidRequest".into(), None, vec![]),
                 }
-            } else if authenticated.is_ok()
+            } else if is_authenticated
                 && request.version == PROTOCOL_VERSION
                 && request
                     .generation
@@ -645,7 +714,6 @@ pub fn serve(config: ServerConfig) -> io::Result<()> {
             let _ = DisconnectNamedPipe(pipe.0);
         }
     }
-    drop(lock);
     Ok(())
 }
 
@@ -657,7 +725,7 @@ pub struct SupervisorClient {
 impl SupervisorClient {
     /// Diagnostic endpoint, derived exclusively from the caller's OS token.
     pub fn endpoint(&self) -> io::Result<String> {
-        Ok(pipe_name(&principal(std::process::id())?))
+        Ok(pipe_name(&principal(unsafe { GetCurrentProcess() })?))
     }
     pub fn beside_current_executable() -> io::Result<Self> {
         let executable = std::env::current_exe()?.with_file_name("envbox-supervisor.exe");
@@ -675,31 +743,38 @@ impl SupervisorClient {
             return Err(denied("Runtime targets cannot start management Supervisor"));
         }
         let end = Instant::now() + self.timeout;
-        let owner = principal(std::process::id())?;
-        // Avoid spawning for authentication/version failures.
-        match connect_until(&owner, &self.executable, end, cancel) {
-            Ok(pipe) => return exchange(pipe, self.ping_request(None), end, cancel),
-            Err(error) if retryable(&error) => {}
-            Err(error) => return Err(error),
-        }
-        let mut child = std::process::Command::new(&self.executable)
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+        let owner = principal(unsafe { GetCurrentProcess() })?;
+        let mutex_name = supervisor_mutex_name(&owner);
+        let mut child: Option<std::process::Child> = None;
         loop {
-            match connect_until(&owner, &self.executable, end, cancel) {
-                Ok(pipe) => return exchange(pipe, self.ping_request(None), end, cancel),
+            let ping = connect_until(&owner, &self.executable, end, cancel)
+                .and_then(|pipe| exchange(pipe, self.ping_request(None), end, cancel));
+            match ping {
+                Ok(response) => return Ok(response),
                 Err(error) if retryable(&error) => {}
                 Err(error) => return Err(error),
             }
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    return Err(io::Error::other(format!("Supervisor exited: {status}")));
+            if let Some(process) = &mut child {
+                if let Some(status) = process.try_wait()? {
+                    if !status.success() {
+                        return Err(io::Error::other(format!("Supervisor exited: {status}")));
+                    }
+                    child = None;
                 }
-                // A concurrent startup loser exits successfully; the winning
-                // server may still be creating its pipe.
+            }
+            // While a previous owner is closing its pipe (or a concurrent
+            // starter owns the mutex), wait for that transition to finish.
+            if child.is_none() && !mutex_exists(&mutex_name)? {
+                let exit_with_gui = mutex_exists(&gui_mutex_name()).unwrap_or(false);
+                child = Some(
+                    std::process::Command::new(&self.executable)
+                        .args(exit_with_gui.then_some(EXIT_WITH_GUI))
+                        .creation_flags(CREATE_NO_WINDOW.0)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()?,
+                );
             }
             pause(end, cancel)?;
         }
@@ -727,7 +802,7 @@ impl SupervisorClient {
         let end = Instant::now() + self.timeout;
         exchange(
             connect_until(
-                &principal(std::process::id())?,
+                &principal(unsafe { GetCurrentProcess() })?,
                 &self.executable,
                 end,
                 cancel,
@@ -739,10 +814,16 @@ impl SupervisorClient {
     }
 }
 fn retryable(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::NotFound
+    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::BrokenPipe)
         || error.raw_os_error().is_some_and(|code| {
-            (code as u32 & 0xffff) == ERROR_PIPE_BUSY.0
-                || (code as u32 & 0xffff) == ERROR_FILE_NOT_FOUND.0
+            matches!(
+                WIN32_ERROR(code as u32 & 0xffff),
+                ERROR_FILE_NOT_FOUND
+                    | ERROR_PIPE_BUSY
+                    | ERROR_BROKEN_PIPE
+                    | ERROR_NO_DATA
+                    | ERROR_PIPE_NOT_CONNECTED
+            )
         })
 }
 fn connect_until(
@@ -783,19 +864,37 @@ fn connect(owner: &Principal, expected_server: &Path) -> io::Result<Handle> {
     // A rogue server cannot return a believable authenticated response.
     let mut pid = 0;
     unsafe { GetNamedPipeServerProcessId(pipe.0, &mut pid) }?;
-    if principal(pid)? != *owner {
-        return Err(denied("Supervisor owner mismatch"));
-    }
-    if has_runtime(pid)? {
-        return Err(denied(
-            "injected process cannot serve Supervisor management",
-        ));
-    }
-    let path = image(pid)?;
-    if path != std::fs::canonicalize(expected_server)?
-        || file_hash(&path)? != file_hash(expected_server)?
-    {
-        return Err(denied("Supervisor artifact mismatch"));
+    let server = match unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid)
+    } {
+        Ok(handle) => Handle(handle),
+        Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+            return Err(io::Error::from_raw_os_error(ERROR_BROKEN_PIPE.0 as i32));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let authentication = (|| {
+        if principal(server.0)? != *owner {
+            return Err(denied("Supervisor owner mismatch"));
+        }
+        if has_runtime(pid)? {
+            return Err(denied(
+                "injected process cannot serve Supervisor management",
+            ));
+        }
+        let path = image(server.0)?;
+        if path != std::fs::canonicalize(expected_server)?
+            || file_hash(&path)? != file_hash(expected_server)?
+        {
+            return Err(denied("Supervisor artifact mismatch"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = authentication {
+        if unsafe { WaitForSingleObject(server.0, 0) } == WAIT_OBJECT_0 {
+            return Err(io::Error::from_raw_os_error(ERROR_BROKEN_PIPE.0 as i32));
+        }
+        return Err(error);
     }
     Ok(pipe)
 }
@@ -839,4 +938,41 @@ fn exchange(
         ));
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_gui_waits_for_managers_and_reopening_keeps_supervisor() {
+        let name = wide(&format!(r"Local\AuraGuiLifecycleTest-{}", uuid::Uuid::new_v4()));
+        let open_gui = || {
+            Handle(unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.unwrap())
+        };
+        let mut lifetime = SupervisorLifetime {
+            gui_mutex: name.clone(),
+            saw_gui: false,
+            managers: HashMap::new(),
+        };
+        assert!(!lifetime.idle_after_gui(), "standalone CLI lifetime");
+        let gui = open_gui();
+        assert!(!lifetime.idle_after_gui());
+
+        // A process handle becomes signaled on exit. A manually signaled
+        // event exercises the same wait semantics without starting a manager.
+        let manager = Handle(unsafe { CreateEventW(None, true, false, None) }.unwrap());
+        let manager_exit = manager.0;
+        lifetime.managers.insert(1, manager);
+        drop(gui);
+        assert!(!lifetime.idle_after_gui(), "manager is between requests");
+        unsafe { SetEvent(manager_exit) }.unwrap();
+        assert!(lifetime.idle_after_gui());
+        assert!(lifetime.managers.is_empty());
+
+        let gui = open_gui();
+        assert!(!lifetime.idle_after_gui());
+        drop(gui);
+        assert!(lifetime.idle_after_gui());
+    }
 }

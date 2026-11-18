@@ -808,8 +808,11 @@ extern "C" DWORD WINAPI EnvBoxRuntimeReconnect(void* parameter) {
 
 int EnvBoxIpcNotifyRuntimeIdentity(HINSTANCE module, const int* counts,
                                     size_t count) {
+  constexpr const char* groups[] = {
+      "time", "winrt_time", "geo", "locale", "crt_locale", "language", "dns",
+      "registry", "process", "network_policy", "identity", "user_language"};
   const RuntimeProfile* p = EnvBoxProfile();
-  if (p == nullptr || counts == nullptr || count != 11) return 0;
+  if (p == nullptr || counts == nullptr || count != ARRAYSIZE(groups)) return 0;
   // Serialize actual immutable Runtime values, not a supplied snapshot token.
   auto wide = [](const wchar_t* value) {
     int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1,
@@ -889,8 +892,6 @@ int EnvBoxIpcNotifyRuntimeIdentity(HINSTANCE module, const int* counts,
   AppendKv(&body, "module_path", path_utf8.c_str());
   AppendKv(&body, "actual_profile", actual.c_str());
   AppendKvU32(&body, "config_complete", complete ? 1 : 0);
-  const char* groups[] = {"time", "winrt_time", "geo", "locale", "crt_locale",
-                          "language", "dns", "registry", "process", "network_policy", "identity"};
   for (size_t i = 0; i < count; ++i) {
     std::string entry = groups[i]; entry += ":"; entry += std::to_string(counts[i]);
     AppendKv(&body, "hook", entry.c_str());

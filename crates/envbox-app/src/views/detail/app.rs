@@ -146,7 +146,7 @@ pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
 
     let action_row = row![
         open_loc_btn,
-        iced::widget::Space::with_width(Fill),
+        iced::widget::Space::new().width(Fill),
         header_action,
     ]
     .spacing(6)

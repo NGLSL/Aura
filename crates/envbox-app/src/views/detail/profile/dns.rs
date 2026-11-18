@@ -52,7 +52,8 @@ pub(super) fn view(editor: &DnsEditor, mode: envbox_core::DnsMode) -> Element<'_
         ]
         .spacing(8)
         .align_y(Alignment::Center),
-        checkbox("禁止回退宿主 DNS（严格模式）", editor.strict)
+        checkbox(editor.strict)
+            .label("禁止回退宿主 DNS（严格模式）")
             .on_toggle(Message::ProfileDnsStrict)
             .text_size(TEXT_BODY)
             .font(font::ui_font())
@@ -117,7 +118,7 @@ pub(super) fn view(editor: &DnsEditor, mode: envbox_core::DnsMode) -> Element<'_
                         (index + 1 < editor.upstreams.len())
                             .then_some(Message::ProfileDnsMove(index, false))
                     ),
-                Space::new(Fill, 1),
+                Space::new().width(Fill).height(1),
                 button(text("移除").size(TEXT_BODY).font(font::ui_font()))
                     .padding(Padding::from([6, 10]))
                     .style(secondary_btn)
@@ -247,7 +248,7 @@ pub(super) fn view(editor: &DnsEditor, mode: envbox_core::DnsMode) -> Element<'_
             .on_press(Message::ProfileDnsAdd),
     );
     content
-        .push(column![iced::widget::horizontal_rule(1), draft].spacing(14))
+        .push(column![iced::widget::rule::horizontal(1), draft].spacing(14))
         .into()
 }
 

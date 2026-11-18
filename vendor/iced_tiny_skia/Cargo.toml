@@ -10,11 +10,12 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition = "2024"
 name = "iced_tiny_skia"
-version = "0.13.0"
+version = "0.14.1"
 authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
 build = false
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false
@@ -33,6 +34,26 @@ categories = ["gui"]
 license = "MIT"
 repository = "https://github.com/iced-rs/iced"
 
+[features]
+default = [
+    "x11",
+    "wayland",
+]
+geometry = ["iced_graphics/geometry"]
+image = ["iced_graphics/image"]
+svg = [
+    "iced_graphics/svg",
+    "resvg",
+]
+wayland = [
+    "softbuffer/wayland",
+    "softbuffer/wayland-dlopen",
+]
+x11 = [
+    "softbuffer/x11",
+    "softbuffer/x11-dlopen",
+]
+
 [lib]
 name = "iced_tiny_skia"
 path = "src/lib.rs"
@@ -42,10 +63,13 @@ version = "1.0"
 features = ["derive"]
 
 [dependencies.cosmic-text]
-version = "0.12"
+version = "0.15"
+
+[dependencies.iced_debug]
+version = "0.14.0"
 
 [dependencies.iced_graphics]
-version = "0.13.0"
+version = "0.14.0"
 
 [dependencies.kurbo]
 version = "0.10"
@@ -54,7 +78,7 @@ version = "0.10"
 version = "0.4"
 
 [dependencies.resvg]
-version = "0.42"
+version = "0.45"
 optional = true
 
 [dependencies.rustc-hash]
@@ -62,27 +86,28 @@ version = "2.0"
 
 [dependencies.softbuffer]
 version = "0.4"
+default-features = false
 
 [dependencies.tiny-skia]
 version = "0.11"
-
-[features]
-geometry = ["iced_graphics/geometry"]
-image = ["iced_graphics/image"]
-svg = [
-    "iced_graphics/svg",
-    "resvg",
+features = [
+    "std",
+    "simd",
 ]
+default-features = false
 
 [lints.clippy]
 default_trait_access = "deny"
 filter_map_next = "deny"
 from_over_into = "deny"
+large-enum-variant = "allow"
 manual_let_else = "deny"
+map-entry = "allow"
 match-wildcard-for-single-variants = "deny"
 needless_borrow = "deny"
 new_without_default = "deny"
 redundant-closure-for-method-calls = "deny"
+result_large_err = "allow"
 semicolon_if_nothing_returned = "deny"
 trivially-copy-pass-by-ref = "deny"
 type-complexity = "allow"
@@ -90,13 +115,12 @@ unused_async = "deny"
 useless_conversion = "deny"
 
 [lints.rust]
-missing_debug_implementations = "deny"
 missing_docs = "deny"
 unsafe_code = "deny"
 unused_results = "deny"
 
 [lints.rust.rust_2018_idioms]
-level = "forbid"
+level = "deny"
 priority = -1
 
 [lints.rustdoc]

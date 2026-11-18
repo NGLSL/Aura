@@ -5,7 +5,7 @@ use iced::advanced::overlay;
 use iced::advanced::renderer;
 use iced::advanced::widget::Tree;
 use iced::advanced::{Clipboard, Shell, Widget};
-use iced::event::{self, Event};
+use iced::Event;
 use iced::mouse;
 use iced::{Element, Length, Point, Rectangle, Size, Vector};
 
@@ -70,28 +70,28 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut Tree,
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         self.content
-            .as_widget()
+            .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
 
-    fn on_event(
+    fn update(
         &mut self,
         tree: &mut Tree,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
-    ) -> event::Status {
-        self.content.as_widget_mut().on_event(
+    ) {
+        self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
             layout,
@@ -144,8 +144,9 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'_>,
+        layout: Layout<'b>,
         renderer: &Renderer,
+        viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let mut kids = tree.children.iter_mut();
@@ -154,6 +155,7 @@ where
             kids.next().unwrap(),
             layout,
             renderer,
+            viewport,
             translation,
         );
 
@@ -216,7 +218,7 @@ where
             Size::new(self.content_bounds.width, 0.0),
             Size::new(self.content_bounds.width, 280.0),
         );
-        let mut node = self.panel.as_widget().layout(self.state, renderer, &limits);
+        let mut node = self.panel.as_widget_mut().layout(self.state, renderer, &limits);
         // Force full field width so the list aligns with the combo header.
         let mut size = node.size();
         size.width = self.content_bounds.width;
@@ -227,17 +229,17 @@ where
         ))
     }
 
-    fn on_event(
+    fn update(
         &mut self,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-    ) -> event::Status {
+    ) {
         let bounds = layout.bounds();
-        self.panel.as_widget_mut().on_event(
+        self.panel.as_widget_mut().update(
             self.state,
             event,
             layout,
@@ -253,16 +255,18 @@ where
         &self,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.panel.as_widget().mouse_interaction(
-            self.state,
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        )
+        let bounds = layout.bounds();
+        let interaction =
+            self.panel
+                .as_widget()
+                .mouse_interaction(self.state, layout, cursor, &bounds, renderer);
+        if interaction == mouse::Interaction::None && cursor.is_over(bounds) {
+            mouse::Interaction::Idle
+        } else {
+            interaction
+        }
     }
 
     fn draw(
@@ -283,15 +287,6 @@ where
             cursor,
             &bounds,
         );
-    }
-
-    fn is_over(
-        &self,
-        layout: Layout<'_>,
-        _renderer: &Renderer,
-        cursor_position: Point,
-    ) -> bool {
-        layout.bounds().contains(cursor_position)
     }
 }
 

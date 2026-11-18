@@ -7,7 +7,7 @@ use crate::{
 };
 use std::ffi::{c_char, CStr, CString, OsString};
 use std::os::windows::ffi::OsStringExt;
-use windows::core::{Interface, HSTRING, PWSTR};
+use windows::core::{Interface, HRESULT, HSTRING, PCWSTR, PWSTR};
 use windows::Globalization::Calendar;
 use windows::Win32::Foundation::FreeLibrary;
 use windows::Win32::Globalization::{
@@ -24,7 +24,9 @@ use windows::Win32::Globalization::{
 use windows::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GetNetworkParams, GET_ADAPTERS_ADDRESSES_FLAGS,
 };
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LoadLibraryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
 use windows::Win32::System::Time::{
     GetDynamicTimeZoneInformation, GetTimeZoneInformation, GetTimeZoneInformationForYear,
@@ -381,9 +383,50 @@ fn collect_language() -> Section {
             },
         );
     }
+    let (languages, input_methods) =
+        user_language_profile().unwrap_or_else(|| ("<unavailable>".into(), "<unavailable>".into()));
+    fields.push(field("GetUserLanguages", languages));
+    fields.push(field("GetUserLanguageInputMethods_First", input_methods));
     Section {
         title: SECTION_LANGUAGE.to_string(),
         fields,
+    }
+}
+
+fn user_language_profile() -> Option<(String, String)> {
+    type GetLanguages = unsafe extern "system" fn(u16, *mut HSTRING) -> HRESULT;
+    type GetInputMethods = unsafe extern "system" fn(PCWSTR, u16, *mut HSTRING) -> HRESULT;
+    const SEPARATOR: u16 = b';' as u16;
+
+    unsafe {
+        let module = LoadLibraryExW(
+            windows::core::w!("bcp47langs.dll"),
+            None,
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+        .ok()?;
+        let snapshot = (|| {
+            let get_languages: GetLanguages = std::mem::transmute(GetProcAddress(
+                module,
+                windows::core::s!("GetUserLanguages"),
+            )?);
+            let get_input_methods: GetInputMethods = std::mem::transmute(GetProcAddress(
+                module,
+                windows::core::s!("GetUserLanguageInputMethods"),
+            )?);
+            let mut languages = HSTRING::new();
+            get_languages(SEPARATOR, &mut languages).ok().ok()?;
+            let languages = languages.to_string_lossy();
+            let first = languages.split(';').next()?;
+            let first = HSTRING::from(first);
+            let mut input_methods = HSTRING::new();
+            get_input_methods(PCWSTR(first.as_ptr()), SEPARATOR, &mut input_methods)
+                .ok()
+                .ok()?;
+            Some((languages, input_methods.to_string_lossy()))
+        })();
+        let _ = FreeLibrary(module);
+        snapshot
     }
 }
 

@@ -115,7 +115,7 @@ pub(super) fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             .padding(Padding::from([8, 10]))
             .style(primary_btn)
             .on_press_maybe(result.can_fill.then_some(Message::TimezoneFill));
-        body = body.push(iced::widget::horizontal_rule(1));
+        body = body.push(iced::widget::rule::horizontal(1));
         body = body.push(
             column![
                 kv_row("查询来源", &result.source),

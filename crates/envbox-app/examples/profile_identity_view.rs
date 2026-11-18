@@ -76,23 +76,7 @@ fn main() -> iced::Result {
         .filter(|value| *value >= 800.0 && *value <= 1800.0)
         .unwrap_or(1400.0);
     let ui_font = font::install();
-    iced::application(
-        "Aura Profile acceptance fixture",
-        app::EnvBoxApp::update,
-        app::EnvBoxApp::view,
-    )
-    .theme(|_| iced::Theme::Dark)
-    .settings(iced::Settings {
-        default_font: ui_font,
-        default_text_size: iced::Pixels(theme::TEXT_BODY),
-        ..Default::default()
-    })
-    .window(iced::window::Settings {
-        size: iced::Size::new(width, 880.0),
-        decorations: false,
-        ..Default::default()
-    })
-    .run_with(move || {
+    let boot = move || {
         let (mut app, _) = app::EnvBoxApp::new();
         if std::env::var_os("ENVBOX_UI_FIXTURE_APPS").is_some() {
             app.applications = ["Google Chrome", "ChatGPT"]
@@ -159,5 +143,19 @@ fn main() -> iced::Result {
         // The fixture deliberately does not execute Supervisor requests.
         app.workspace_management.busy = false;
         (app, iced::Task::none())
-    })
+    };
+    iced::application(boot, app::EnvBoxApp::update, app::EnvBoxApp::view)
+        .title("Aura Profile acceptance fixture")
+        .theme(|_: &app::EnvBoxApp| iced::Theme::Dark)
+        .settings(iced::Settings {
+            default_font: ui_font,
+            default_text_size: iced::Pixels(theme::TEXT_BODY),
+            ..Default::default()
+        })
+        .window(iced::window::Settings {
+            size: iced::Size::new(width, 880.0),
+            decorations: false,
+            ..Default::default()
+        })
+        .run()
 }

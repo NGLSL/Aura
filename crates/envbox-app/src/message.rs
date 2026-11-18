@@ -214,6 +214,8 @@ pub enum Message {
     AppPickerQuery(String),
     AppPickerSelect(usize),
     AppPickerUseSelected,
+    AppPickerUseTerminalShell(Option<usize>),
+    AppPickerBack,
     AppPickerManual,
     AppPickerClose,
     /// Background discovery finished (items already icon-cached).

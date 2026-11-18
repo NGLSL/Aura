@@ -26,6 +26,9 @@ int EnvBoxInstallLocaleHooks();
 // query calls remain untouched.
 int EnvBoxInstallCrtLocaleHooks();
 int EnvBoxInstallLanguageHooks();
+// Optional account-language readers reported separately from the six required
+// Win32 language hooks. Owns its Detours transaction.
+int EnvBoxInstallUserLanguageHooks();
 // Returns the attached count, or -1 for an invalid startup policy flag.
 int EnvBoxInstallProcessHooks();
 // Latched once during process-hook installation, before application entry.

@@ -7,6 +7,10 @@ use std::time::Duration;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Windows session-local name shared by the GUI singleton and Supervisor.
+#[cfg(windows)]
+pub const GUI_SINGLETON_NAME: &str = "Local\\Aura.GUI.7d9c7d34-087e-4d41-a3e8-7e9d34fc8d51";
+
 /// Chrome's TLS callbacks exclude it from the verified no-TLS entry gate.
 /// This token records a different startup contract, never a retry fallback.
 pub const ENTRY_CHROME_COMPATIBILITY: &str = "chrome_compatibility_root_runtime";

@@ -845,18 +845,23 @@ fn console_host_target_with_path(
     }
 }
 
-/// Resolve the selected shell independently of the inner command. A Profile
-/// may replace PATH, so also check the normal machine-wide installation roots.
-fn resolve_powershell7(path_env: Option<&str>) -> Result<PathBuf, InstanceError> {
+/// Resolve the selected shell independently of the inner command. An explicit
+/// PATH wins. With no explicit PATH, prefer the machine-registered PowerShell.
+pub fn resolve_powershell7(path_env: Option<&str>) -> Result<PathBuf, InstanceError> {
     let host_path = std::env::var_os("PATH");
     let search_path = path_env.map(std::ffi::OsStr::new).or(host_path.as_deref());
-    if let Some(search_path) = search_path {
-        for directory in std::env::split_paths(search_path) {
-            let candidate = directory.join("pwsh.exe");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
+    let from_path = || {
+        std::env::split_paths(search_path?)
+            .map(|directory| directory.join("pwsh.exe"))
+            .find(|candidate| candidate.is_file())
+    };
+    let shell = if path_env.is_some() {
+        from_path().or_else(registered_powershell7)
+    } else {
+        registered_powershell7().or_else(from_path)
+    };
+    if let Some(shell) = shell {
+        return Ok(shell);
     }
     for key in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
         if let Some(root) = std::env::var_os(key) {
@@ -870,6 +875,44 @@ fn resolve_powershell7(path_env: Option<&str>) -> Result<PathBuf, InstanceError>
         }
     }
     Err(InstanceError::PowerShell7NotFound)
+}
+
+fn registered_powershell7() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Registry::{
+            RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        };
+
+        let read = |buffer: Option<&mut [u16]>, bytes: &mut u32| unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\pwsh.exe"),
+                PCWSTR::null(),
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                None,
+                buffer.map(|buffer| buffer.as_mut_ptr().cast()),
+                Some(bytes),
+            ) == ERROR_SUCCESS
+        };
+        let mut bytes = 0;
+        if !read(None, &mut bytes) {
+            return None;
+        }
+        let mut value = vec![0u16; (bytes as usize).div_ceil(2)];
+        if !read(Some(&mut value), &mut bytes) {
+            return None;
+        }
+        let end = value.iter().position(|&unit| unit == 0).unwrap_or(value.len());
+        let path = PathBuf::from(OsString::from_wide(&value[..end]));
+        (path.is_absolute() && path.is_file()).then_some(path)
+    }
+    #[cfg(not(windows))]
+    None
 }
 
 fn target_path_environment(target: &RunTarget) -> Option<String> {

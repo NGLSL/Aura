@@ -110,8 +110,8 @@ impl EnvBoxApp {
             self.close_dialog = false;
             self.remember_close_choice = false;
             self.close_error = None;
-            return iced::window::get_latest().then(|id| {
-                id.map(|id| iced::window::change_mode(id, iced::window::Mode::Hidden))
+            return iced::window::latest().then(|id| {
+                id.map(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
                     .unwrap_or_else(Task::none)
             });
         }

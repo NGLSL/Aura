@@ -286,6 +286,7 @@ pub fn pick_menu(_t: &Theme) -> overlay::menu::Style {
         text_color: INK_2,
         selected_text_color: INK,
         selected_background: Background::Color(ACCENT_BG),
+        shadow: Default::default(),
     }
 }
 
@@ -508,7 +509,7 @@ pub fn list_card_style(selected: bool) -> button::Style {
     }
 }
 pub fn dark_scrollable(
-    _t: &Theme,
+    theme: &Theme,
     status: iced::widget::scrollable::Status,
 ) -> iced::widget::scrollable::Style {
     let thumb_alpha = match status {
@@ -520,7 +521,7 @@ pub fn dark_scrollable(
         background: Some(iced::Background::Color(Color::TRANSPARENT)),
         border: Border::default(),
         scroller: iced::widget::scrollable::Scroller {
-            color: Color::from_rgba(1.0, 1.0, 1.0, thumb_alpha),
+            background: Background::Color(Color::from_rgba(1.0, 1.0, 1.0, thumb_alpha)),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
@@ -533,13 +534,14 @@ pub fn dark_scrollable(
         vertical_rail: rail,
         horizontal_rail: rail,
         gap: None,
+        ..iced::widget::scrollable::default(theme, status)
     }
 }
 /// Title text with product font.
 #[allow(dead_code)]
 pub fn title(s: &str, size: u16) -> text::Text<'static, Theme, iced::Renderer> {
     text(s.to_string())
-        .size(size)
+        .size(f32::from(size))
         .color(INK)
         .font(crate::font::name_font())
 }
@@ -547,7 +549,7 @@ pub fn title(s: &str, size: u16) -> text::Text<'static, Theme, iced::Renderer> {
 #[allow(dead_code)]
 pub fn body(s: &str, size: u16) -> text::Text<'static, Theme, iced::Renderer> {
     text(s.to_string())
-        .size(size)
+        .size(f32::from(size))
         .color(INK_2)
         .font(crate::font::ui_font())
 }
@@ -555,7 +557,7 @@ pub fn body(s: &str, size: u16) -> text::Text<'static, Theme, iced::Renderer> {
 #[allow(dead_code)]
 pub fn muted(s: &str, size: u16) -> text::Text<'static, Theme, iced::Renderer> {
     text(s.to_string())
-        .size(size)
+        .size(f32::from(size))
         .color(MUTED)
         .font(crate::font::ui_font())
 }
@@ -563,7 +565,7 @@ pub fn muted(s: &str, size: u16) -> text::Text<'static, Theme, iced::Renderer> {
 #[allow(dead_code)]
 pub fn faint(s: &str, size: u16) -> text::Text<'static, Theme, iced::Renderer> {
     text(s.to_string())
-        .size(size)
+        .size(f32::from(size))
         .color(FAINT)
         .font(crate::font::ui_font())
 }

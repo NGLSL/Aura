@@ -410,7 +410,7 @@ fn profile_editor(app: &EnvBoxApp) -> (Element<'_, Message>, Element<'_, Message
                     &app.profile_draft.dns_editor,
                     app.profile_draft.dns_mode.to_mode()
                 ),
-                iced::widget::horizontal_rule(1),
+                iced::widget::rule::horizontal(1),
                 form_field(
                     "WebRTC",
                     pick_list(

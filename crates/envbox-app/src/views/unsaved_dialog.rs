@@ -11,7 +11,7 @@ use crate::theme::{TEXT_BODY, TEXT_TITLE};
 use crate::widgets::{primary_btn, secondary_btn};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
-    let dim = container(Space::new(Length::Fill, Length::Fill))
+    let dim = container(Space::new().width(Fill).height(Fill))
         .width(Fill)
         .height(Fill)
         .style(|_| container::Style {

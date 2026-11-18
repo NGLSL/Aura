@@ -17,8 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::message::Message;
-
-const NAME: &str = "Local\\Aura.GUI.7d9c7d34-087e-4d41-a3e8-7e9d34fc8d51";
+use envbox_supervisor::GUI_SINGLETON_NAME;
 
 pub enum Claim {
     Primary,
@@ -63,7 +62,7 @@ pub fn claim() -> Result<Claim, String> {
         return Ok(Claim::Primary);
     }
 
-    match claim_named(NAME)? {
+    match claim_named(GUI_SINGLETON_NAME)? {
         NamedClaim::AlreadyRunning => {
             activate_matching_window();
             Ok(Claim::AlreadyRunning)

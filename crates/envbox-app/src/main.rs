@@ -50,10 +50,11 @@ fn main() -> iced::Result {
     }
 
     let ui_font = font::install();
-    iced::application("Aura", app::EnvBoxApp::update, app::EnvBoxApp::view)
+    iced::application(app::EnvBoxApp::new, app::EnvBoxApp::update, app::EnvBoxApp::view)
+        .title("Aura")
         .subscription(app::EnvBoxApp::subscription)
         .exit_on_close_request(false)
-        .theme(|_| Theme::Dark)
+        .theme(|_: &app::EnvBoxApp| Theme::Dark)
         .settings(iced::Settings {
             default_font: ui_font,
             default_text_size: iced::Pixels(theme::TEXT_BODY),
@@ -68,7 +69,7 @@ fn main() -> iced::Result {
             icon: window_icon(),
             ..Default::default()
         })
-        .run_with(app::EnvBoxApp::new)
+        .run()
 }
 
 #[cfg(windows)]

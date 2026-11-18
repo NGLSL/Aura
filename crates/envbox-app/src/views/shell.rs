@@ -136,7 +136,7 @@ fn title_bar() -> Element<'static, Message> {
     ]
     .spacing(2);
 
-    let bar = row![Space::with_width(Length::Fill), controls,]
+    let bar = row![Space::new().width(Length::Fill), controls,]
         .align_y(iced::Alignment::Center)
         .padding(Padding::from([6, 8]));
 

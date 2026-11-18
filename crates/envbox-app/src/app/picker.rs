@@ -1,8 +1,11 @@
 //! Installed application picker and icon loading.
 
-use std::path::PathBuf;
+use envbox_core::ConsoleHost;
 use iced::Task;
+use std::path::PathBuf;
+
 use crate::message::{LaunchKind, Message, StatusKind};
+
 use super::{AppDraft, EnvBoxApp};
 
 impl EnvBoxApp {
@@ -168,9 +171,16 @@ impl EnvBoxApp {
             return Task::none();
         };
 
+        if item.is_windows_terminal_package() {
+            if let Some(picker) = self.app_picker.as_mut() {
+                picker.terminal_shells = Some(crate::discover_commands::installed_terminal_shells());
+            }
+            return Task::none();
+        }
+
         let profile_id = self.profiles.first().map(|p| p.id).unwrap_or_default();
         let cap = item.capability;
-        self.app_draft = AppDraft {
+        let draft = AppDraft {
             id: None,
             name: item.name.clone(),
             kind: if item.source == "commands" {
@@ -188,7 +198,7 @@ impl EnvBoxApp {
             },
             path: item.path.clone(),
             chrome_independent_data: false,
-            console_host: envbox_core::ConsoleHost::Direct,
+            console_host: ConsoleHost::Direct,
             args: item.args.clone(),
             work_dir: item.work_dir.clone(),
             profile_id,
@@ -196,10 +206,7 @@ impl EnvBoxApp {
             audit: false,
             icon_src: item.icon_src.clone(),
         };
-        self.app_saved_draft = self.app_draft.clone();
-        self.app_edit_mode = true;
-        self.app_advanced = false;
-        self.app_picker = None;
+        self.open_picked_application(draft);
         match cap.injection {
             crate::package::InjectionSupport::Supported => {
                 self.set_status(
@@ -223,4 +230,132 @@ impl EnvBoxApp {
         Task::none()
     }
 
+    pub(super) fn apply_terminal_shell_selection(&mut self, index: Option<usize>) -> Task<Message> {
+        let Some(shells) = self
+            .app_picker
+            .as_ref()
+            .and_then(|picker| picker.terminal_shells.as_ref())
+        else {
+            return Task::none();
+        };
+        let profile_id = self.profiles.first().map(|p| p.id).unwrap_or_default();
+        let mut draft = AppDraft::blank(profile_id);
+        draft.console_host = ConsoleHost::WindowsTerminal;
+        if let Some(index) = index {
+            let Some(shell) = shells.get(index) else {
+                return Task::none();
+            };
+            draft.name = shell.name.to_string();
+            draft.path = shell.command.clone();
+            draft.icon_src = shell.command.clone();
+        }
+        let status = if index.is_some() {
+            "已填入 Shell 和终端宿主，请确认默认环境后保存"
+        } else {
+            "请填写 Shell 名称和启动命令"
+        };
+        self.open_picked_application(draft);
+        self.set_status(StatusKind::Info, status);
+        Task::none()
+    }
+
+    fn open_picked_application(&mut self, draft: AppDraft) {
+        self.app_saved_draft = draft.clone();
+        self.app_draft = draft;
+        self.app_edit_mode = true;
+        self.app_advanced = false;
+        self.app_picker = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::AppPickerState;
+    use crate::discover::DiscoveredApp;
+    use crate::discover_commands::TerminalShell;
+    use envbox_core::{DnsMode, DnsProfile, EnvironmentProfile, LaunchTarget, LocaleProfile, TimezoneProfile};
+    use envbox_storage::{ConfigStore, ProfileDocument};
+    use uuid::Uuid;
+
+    #[test]
+    fn store_terminal_selection_saves_a_command_with_the_terminal_host() {
+        let root = std::env::temp_dir().join(format!("aura-terminal-picker-{}", Uuid::new_v4()));
+        let store = ConfigStore::new(&root);
+        let profile_id = Uuid::new_v4();
+        store
+            .save_profiles(&ProfileDocument {
+                profiles: vec![EnvironmentProfile {
+                    id: profile_id,
+                    name: "US".into(),
+                    locale: LocaleProfile {
+                        locale_name: "en-US".into(),
+                        ui_language: "en-US".into(),
+                        region: "US".into(),
+                    },
+                    timezone: TimezoneProfile {
+                        windows_id: "Pacific Standard Time".into(),
+                        iana_id: "America/Los_Angeles".into(),
+                    },
+                    dns: DnsProfile::from_servers(DnsMode::Host, vec![]),
+                    identity: Default::default(),
+                    environment: Default::default(),
+                    registry: Default::default(),
+                    browser: Default::default(),
+                }],
+            })
+            .unwrap();
+        let (mut app, _) = EnvBoxApp::new_with_store(store.clone());
+        let terminal = r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App";
+        app.app_picker = Some(AppPickerState {
+            items: vec![DiscoveredApp {
+                name: "终端".into(),
+                path: terminal.into(),
+                args: String::new(),
+                work_dir: String::new(),
+                icon_src: terminal.into(),
+                source: "apps-folder",
+                capability: crate::package::classify_target(terminal, ""),
+                icon_png: None,
+            }],
+            query: "terminal".into(),
+            selected: Some(0),
+            ..AppPickerState::default()
+        });
+
+        let _ = app.update(Message::AppPickerUseSelected);
+        assert!(app.app_picker.as_ref().unwrap().terminal_shells.is_some());
+        assert!(app.app_draft.path.is_empty());
+        let _ = app.update(Message::AppPickerBack);
+        let picker = app.app_picker.as_ref().unwrap();
+        assert!(picker.terminal_shells.is_none());
+        assert_eq!(picker.query, "terminal");
+        assert_eq!(picker.selected, Some(0));
+
+        let _ = app.update(Message::AppPickerUseSelected);
+        let command = r"D:\Program Files\PowerShell\7\pwsh.exe";
+        app.app_picker.as_mut().unwrap().terminal_shells = Some(vec![TerminalShell {
+            name: "PowerShell 7",
+            command: command.into(),
+        }]);
+        let _ = app.update(Message::AppPickerUseTerminalShell(Some(0)));
+        assert!(app.app_picker.is_none());
+        assert!(app.app_edit_mode);
+        let _ = app.update(Message::AppSave);
+
+        let saved = store.load_applications().unwrap();
+        let [application] = saved.applications.as_slice() else {
+            panic!("expected one saved PowerShell application, status was {}", app.status);
+        };
+        assert_eq!(application.name, "PowerShell 7");
+        assert_eq!(
+            application.launch,
+            LaunchTarget::Command {
+                command: command.into(),
+            }
+        );
+        assert_eq!(application.console_host, ConsoleHost::WindowsTerminal);
+        assert_eq!(application.default_profile_id, profile_id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

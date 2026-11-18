@@ -12,7 +12,7 @@ use crate::widgets::{danger_btn, primary_btn, secondary_btn};
 
 pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
     let dim = mouse_area(
-        container(Space::new(Length::Fill, Length::Fill))
+        container(Space::new().width(Fill).height(Fill))
             .width(Fill)
             .height(Fill)
             .style(|_| container::Style {
@@ -36,7 +36,8 @@ pub fn view(app: &EnvBoxApp) -> Element<'_, Message> {
             .size(TEXT_BODY)
             .color(INK_2)
             .font(font::ui_font()),
-        checkbox("记住我的选择，以后不再询问", app.remember_close_choice)
+        checkbox(app.remember_close_choice)
+            .label("记住我的选择，以后不再询问")
             .on_toggle(Message::WindowRememberChoice)
             .size(14)
             .text_size(TEXT_BODY),

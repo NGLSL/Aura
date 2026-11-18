@@ -179,13 +179,13 @@ mod tests {
             for nav in [Nav::Apps, Nav::Audit, Nav::Settings] {
                 use iced::advanced::Renderer as _;
                 app.nav = nav;
-                renderer.clear();
                 let viewport =
                     iced_graphics::Viewport::with_physical_size(Size::new(2560, 1440), scale);
                 let bounds = Rectangle::with_size(viewport.logical_size());
-                let element = app.view();
+                renderer.reset(bounds);
+                let mut element = app.view();
                 let mut tree = Tree::new(&element);
-                let node = element.as_widget().layout(
+                let node = element.as_widget_mut().layout(
                     &mut tree,
                     &renderer,
                     &layout::Limits::new(viewport.logical_size(), viewport.logical_size()),
@@ -207,7 +207,6 @@ mod tests {
                     &viewport,
                     &[bounds],
                     crate::theme::WINDOW,
-                    &[] as &[&str],
                 );
                 // The CPU renderer presents BGR to softbuffer; PNG expects RGB.
                 for pixel in pixels.data_mut().chunks_exact_mut(4) {
@@ -237,11 +236,12 @@ mod tests {
                 (Icon::Play, 11.0),
             ] {
                 use iced::advanced::Renderer as _;
-                renderer.clear();
-                let element: Element<'_, ()> = icon(name, Color::WHITE, size).into();
+                let viewport_bounds = Rectangle::with_size(Size::new(320.0, 240.0));
+                renderer.reset(viewport_bounds);
+                let mut element: Element<'_, ()> = icon(name, Color::WHITE, size).into();
                 let mut tree = Tree::new(&element);
                 let node = element
-                    .as_widget()
+                    .as_widget_mut()
                     .layout(
                         &mut tree,
                         &renderer,
@@ -249,7 +249,6 @@ mod tests {
                     )
                     .move_to(Point::new(80.0, 100.0));
                 let bounds = node.bounds();
-                let viewport_bounds = Rectangle::with_size(Size::new(320.0, 240.0));
                 element.as_widget().draw(
                     &tree,
                     &mut renderer,
@@ -271,7 +270,6 @@ mod tests {
                     &viewport,
                     &[viewport_bounds],
                     Color::TRANSPARENT,
-                    &[] as &[&str],
                 );
                 let expected = bounds * scale as f32;
                 let mut visible = 0;

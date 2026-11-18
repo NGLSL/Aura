@@ -17,8 +17,8 @@ envbox-supervisor = { workspace = true }
 uuid = { workspace = true }
 # CPU rendering avoids the GPU backend's device and driver overhead for this UI.
 # Keep the existing font/theme defaults while selecting only tiny-skia.
-iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "image", "svg", "advanced", "fira-sans", "auto-detect-theme"] }
-iced_graphics = "0.13"
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "image", "svg", "advanced", "advanced-shaping", "fira-sans"] }
+iced_graphics = "0.14"
 image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
